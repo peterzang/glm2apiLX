@@ -1,5 +1,10 @@
 import json
+import threading
+import time
+import urllib.request
+from types import SimpleNamespace
 
+from glm2api import server as server_module
 from glm2api.services.anthropic_adapter import anthropic_to_openai
 from glm2api.services.glm_auth import GLMAccessTokenManager
 from glm2api.services.glm_client import GLMWebClient, UpstreamAPIError
@@ -109,14 +114,105 @@ def test_responses_stream_uses_openai_event_envelope():
         )
     )
 
-    payloads = [json.loads(event.split("data: ", 1)[1]) for event in events]
+    payloads = [
+        json.loads(event.split("data: ", 1)[1])
+        for event in events
+        if event.startswith("event: ")
+    ]
 
     assert payloads[0]["type"] == "response.created"
     assert payloads[0]["sequence_number"] == 0
     assert payloads[0]["response"]["object"] == "response"
-    assert any(payload["type"] == "response.output_text.delta" and payload["delta"] == "hi" for payload in payloads)
+    assert payloads[0]["response"]["usage"] is None
+    assert payloads[0]["response"]["parallel_tool_calls"] is True
+    text_delta = next(payload for payload in payloads if payload["type"] == "response.output_text.delta")
+    assert text_delta["delta"] == "hi"
+    assert text_delta["response_id"] == payloads[0]["response"]["id"]
     assert payloads[-1]["type"] == "response.completed"
     assert payloads[-1]["response"]["status"] == "completed"
+    assert payloads[-1]["response"]["completed_at"] is not None
+    assert payloads[-1]["response"]["usage"]["total_tokens"] == 0
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_responses_stream_buffers_split_sse_blocks_until_done():
+    accumulator = ResponsesStreamAccumulator(model="glm-4")
+
+    events = accumulator.feed_chunk(
+        b'data: {"choices":[{"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}\n'
+    )
+    events.extend(accumulator.feed_chunk(b"\ndata: [DO"))
+    events.extend(accumulator.feed_chunk(b"NE]\n\n"))
+
+    payload_events = [event for event in events if event.startswith("event: ")]
+    payloads = [json.loads(event.split("data: ", 1)[1]) for event in payload_events]
+
+    assert any(payload["type"] == "response.output_text.delta" and payload["delta"] == "hi" for payload in payloads)
+    assert payloads[-1]["type"] == "response.completed"
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_responses_stream_completes_on_finish_reason_without_done_sentinel():
+    accumulator = ResponsesStreamAccumulator(model="glm-4")
+
+    events = accumulator.feed_chunk(
+        b'data: {"choices":[{"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}\n\n'
+    )
+
+    payload_events = [event for event in events if event.startswith("event: ")]
+    payloads = [json.loads(event.split("data: ", 1)[1]) for event in payload_events]
+
+    assert payloads[-1]["type"] == "response.completed"
+    assert payloads[-1]["response"]["usage"]["input_tokens"] == 2
+    assert payloads[-1]["response"]["usage"]["output_tokens"] == 3
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_responses_http_stream_sends_keepalive_while_upstream_is_idle(monkeypatch):
+    monkeypatch.setattr(server_module, "RESPONSES_STREAM_HEARTBEAT_SECONDS", 0.01)
+
+    class FakeGLM:
+        def stream_chat_completion(self, payload):
+            yield b'data: {"choices":[{"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}\n\n'
+            time.sleep(0.05)
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+
+    class FakeLogger:
+        def debug(self, *args, **kwargs): pass
+        def info(self, *args, **kwargs): pass
+        def warning(self, *args, **kwargs): pass
+        def error(self, *args, **kwargs): pass
+
+    config = SimpleNamespace(
+        host="127.0.0.1",
+        port=0,
+        api_prefix="/v1",
+        cors_allow_origin="*",
+        server_api_keys=[],
+        debug_dump_all=False,
+        exposed_models=["glm-4"],
+    )
+    server = server_module.GLM2APIServer(config, FakeGLM(), FakeLogger())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server._server.server_address[1]
+    try:
+        body = json.dumps({"model": "glm-4", "input": "hi", "stream": True}).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/responses",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            stream_text = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=1)
+
+    assert ": keep-alive\n\n" in stream_text
+    assert "response.completed" in stream_text
 
 
 def test_anthropic_to_openai_maps_tool_choice_variants():

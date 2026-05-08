@@ -312,20 +312,42 @@ class ResponsesStreamAccumulator:
         self._completed_output: list[dict[str, object]] = []
         self._finished = False
         self.sequence_number = 0
+        self._pending_sse = ""
 
     def _base_response(self, status: str = "in_progress") -> dict[str, object]:
+        usage: dict[str, object] | None = None
+        if status == "completed":
+            usage = {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": self.input_tokens + self.output_tokens,
+            }
         return {
             "id": self.response_id,
             "object": "response",
             "created_at": self.created,
             "status": status,
+            "completed_at": int(time.time()) if status == "completed" else None,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "max_output_tokens": None,
             "model": self.model,
             "output": list(self._completed_output),
-            "usage": {
-                "input_tokens": self.input_tokens,
-                "output_tokens": self.output_tokens,
-                "total_tokens": self.input_tokens + self.output_tokens,
-            },
+            "parallel_tool_calls": True,
+            "previous_response_id": None,
+            "reasoning": {"effort": None, "summary": None},
+            "store": False,
+            "temperature": 1,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1,
+            "truncation": "disabled",
+            "usage": usage,
+            "user": None,
+            "metadata": {},
         }
 
     def start_response(self) -> list[str]:
@@ -336,9 +358,13 @@ class ResponsesStreamAccumulator:
         return events
 
     def feed_chunk(self, chunk: bytes) -> list[str]:
-        text = chunk.decode("utf-8", errors="ignore")
+        text = self._pending_sse + chunk.decode("utf-8", errors="ignore")
+        self._pending_sse = ""
         events: list[str] = []
-        for line in text.split("\n\n"):
+        blocks = text.split("\n\n")
+        if not text.endswith("\n\n"):
+            self._pending_sse = blocks.pop()
+        for line in blocks:
             line = line.strip()
             if not line:
                 continue
@@ -476,6 +502,9 @@ class ResponsesStreamAccumulator:
             self.input_tokens = usage.get("prompt_tokens", self.input_tokens)  # type: ignore
             self.output_tokens = usage.get("completion_tokens", self.output_tokens)  # type: ignore
 
+        if finish_reason:
+            events.extend(self._finish())
+
         return events
 
     def _start_message_output(self) -> list[str]:
@@ -582,14 +611,17 @@ class ResponsesStreamAccumulator:
         self._pending_tool_calls.clear()
 
         events.append(self._sse("response.completed", self._base_response("completed")))
+        events.append("data: [DONE]\n\n")
         return events
 
     def _sse(self, event_type: str, data: dict[str, object]) -> str:
         if data.get("object") == "response":
-            event_payload: dict[str, object] = {"type": event_type, "response": data}
+            event_payload: dict[str, object] = {"type": event_type, "response": data, "response_id": self.response_id}
         else:
             event_payload = dict(data)
             event_payload["type"] = event_type
+            event_payload.setdefault("response_id", self.response_id)
+        event_payload["model"] = self.model
         event_payload["sequence_number"] = self.sequence_number
         self.sequence_number += 1
         return f"event: {event_type}\ndata: {_safe_json(event_payload)}\n\n"

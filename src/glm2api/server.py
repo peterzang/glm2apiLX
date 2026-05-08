@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import socket
+import threading
 import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +26,7 @@ from .services.responses_adapter import (
 
 
 _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)
+RESPONSES_STREAM_HEARTBEAT_SECONDS = 5.0
 
 
 class GLM2APIServer:
@@ -294,8 +297,34 @@ class GLM2APIServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
                 try:
-                    for chunk in stream_iter:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
                         if not chunk:
                             continue
                         if not accumulator.started:
@@ -303,7 +332,7 @@ class GLM2APIServer:
                             for event in start_events:
                                 self.wfile.write(event.encode("utf-8"))
                             self.wfile.flush()
-                        events = accumulator.feed_chunk(chunk)
+                        events = accumulator.feed_chunk(chunk)  # type: ignore[arg-type]
                         for event in events:
                             self.wfile.write(event.encode("utf-8"))
                             self.wfile.flush()
