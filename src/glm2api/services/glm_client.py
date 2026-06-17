@@ -198,6 +198,80 @@ class GLMWebClient:
         if n_value > 1:
             return self._chat_completion_n(payload, n_value)
 
+        # 复读检测：第一次失败（触发复读）时自动重试 1 次
+        # 审核报告 P1 问题：GLM-5.1 在长 prompt + 工具调用场景下偶发复读模式
+        last_exc: Exception | None = None
+        for attempt in range(2):  # 最多 2 次尝试（1 次正常 + 1 次重试）
+            try:
+                result, conv_id = self._chat_completion_single(payload)
+                # 复读检测：检查响应是否陷入复读模式
+                if attempt == 0 and self._is_repetition_loop(result):
+                    self.logger.warning(
+                        "检测到 GLM 响应复读循环 model=%s 重试中 (attempt=2/2)",
+                        payload.get("model", "unknown"),
+                    )
+                    continue  # 重试一次
+                return result, conv_id
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    self.logger.warning(
+                        "GLM 请求失败 重试中 model=%s error=%s",
+                        payload.get("model", "unknown"), exc,
+                    )
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        # 兜底（理论上不会到达）
+        return self._chat_completion_single(payload)
+
+    def _is_repetition_loop(self, result: dict[str, object]) -> bool:
+        """检测响应是否陷入复读模式（同一句话重复 N 次以上）。
+        
+        判定规则：
+          - 提取 choices[0].message.content 文本
+          - 按句号/换行切分为句子
+          - 如果存在连续 5 句相同（或同一句重复超过 5 次），判定为复读
+          - 文本长度 < 100 字符不判定（避免误杀短回复）
+        """
+        try:
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return False
+            msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if not isinstance(msg, dict):
+                return False
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) < 100:
+                return False
+            # 切句子：按。. ! ? \n 切
+            import re
+            sentences = [s.strip() for s in re.split(r'[。.!！?？\n]+', content) if len(s.strip()) > 8]
+            if len(sentences) < 6:
+                return False
+            # 检测连续重复
+            from collections import Counter
+            counter = Counter(sentences)
+            most_common_count = counter.most_common(1)[0][1] if counter else 0
+            # 同一句子重复 5 次以上判定为复读
+            if most_common_count >= 5:
+                return True
+            # 检测连续 3 句相同
+            consecutive = 1
+            for i in range(1, len(sentences)):
+                if sentences[i] == sentences[i-1]:
+                    consecutive += 1
+                    if consecutive >= 3:
+                        return True
+                else:
+                    consecutive = 1
+            return False
+        except Exception:
+            return False
+
+    def _chat_completion_single(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
+        """单次 chat_completion 调用（无重试逻辑，由 chat_completion 包装重试）。"""
         _, allowed_tool_names = self._resolve_tools(payload)
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
         try:
@@ -427,6 +501,19 @@ class GLMWebClient:
             with self._call_with_account_failover("delete_conversation", send_request) as response: # type: ignore
                 payload = self.auth.read_json_response(response)
             status = payload.get("status", payload.get("code"))
+            # 静默"conversation 不存在"类响应（并发场景下另一请求可能已删除同一会话）
+            # 这是非致命的（请求本身已成功），不应产生 WARNING 噪声
+            payload_msg = str(payload.get("message", "")) + str(payload.get("result", ""))
+            is_already_deleted = (
+                "conversation" in payload_msg and "不存在" in payload_msg
+            ) or status == 404
+            if is_already_deleted:
+                self.logger.debug(
+                    "GLM 会话已被并发删除（静默忽略）conversation_id=%s assistant_id=%s",
+                    conversation_id,
+                    actual_assistant_id,
+                )
+                return
             if status not in {0, None}:
                 self.logger.warning(
                     "GLM 会话删除返回非成功状态 conversation_id=%s assistant_id=%s payload=%s",
@@ -441,12 +528,21 @@ class GLMWebClient:
                 actual_assistant_id,
             )
         except Exception as exc:
-            self.logger.warning(
-                "删除 GLM 会话失败 conversation_id=%s assistant_id=%s error=%s",
-                conversation_id,
-                actual_assistant_id,
-                exc,
-            )
+            # 异常时也区分"已不存在"场景，避免日志噪声
+            exc_msg = str(exc)
+            if "不存在" in exc_msg or "404" in exc_msg:
+                self.logger.debug(
+                    "GLM 会话删除时已不存在（静默忽略）conversation_id=%s assistant_id=%s",
+                    conversation_id,
+                    actual_assistant_id,
+                )
+            else:
+                self.logger.warning(
+                    "删除 GLM 会话失败 conversation_id=%s assistant_id=%s error=%s",
+                    conversation_id,
+                    actual_assistant_id,
+                    exc,
+                )
 
     def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))

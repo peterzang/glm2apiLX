@@ -107,7 +107,7 @@ class GLM2APIServer:
                             {
                                 "object": "list",
                                 "data": [
-                                    self._model_info(model) for model in config.exposed_models
+                                    self._model_info(model) for model in self._get_effective_exposed_models()
                                 ],
                             },
                         )
@@ -116,7 +116,7 @@ class GLM2APIServer:
                     # GET /v1/models/{model} - retrieve model info (OpenAI-compatible)
                     if path.startswith(f"{config.api_prefix}/models/"):
                         model_id = path[len(f"{config.api_prefix}/models/"):]
-                        if model_id in config.exposed_models:
+                        if model_id in self._get_effective_exposed_models():
                             self._write_json(HTTPStatus.OK, self._model_info(model_id))
                             return
                         self._write_json(
@@ -405,7 +405,7 @@ class GLM2APIServer:
 
                     # Validate model exists
                     model_id = str(payload.get("model", ""))
-                    if model_id not in config.exposed_models:
+                    if model_id not in self._get_effective_exposed_models():
                         self._write_json(
                             HTTPStatus.NOT_FOUND,
                             make_error(
@@ -426,6 +426,9 @@ class GLM2APIServer:
                     result, conversation_id = glm_client.chat_completion(payload)
                     # 记录 token 使用量到 admin store（用于仪表盘 KPI）
                     self._record_token_usage(result)
+                    # 动态模型发现：从上游响应提取真实模型名，加入动态注册表
+                    # 用户核心诉求：未来 chatglm.cn 升级到 GLM-5.3 时无需改代码，自动显示
+                    self._discover_dynamic_model(result)
                     self._write_json(HTTPStatus.OK, result)
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)
@@ -549,6 +552,7 @@ class GLM2APIServer:
                 result, _ = glm_client.chat_completion(openai_payload)
                 response = openai_to_anthropic_response(result, model)
                 self._record_token_usage(result)
+                self._discover_dynamic_model(result)
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
@@ -605,6 +609,7 @@ class GLM2APIServer:
                 result, _ = glm_client.chat_completion(openai_payload)
                 response = openai_to_responses(result, model)
                 self._record_token_usage(result)
+                self._discover_dynamic_model(result)
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
@@ -744,6 +749,40 @@ class GLM2APIServer:
                     )
                 except Exception:
                     pass  # 永不让 metrics 影响主请求
+
+            def _discover_dynamic_model(self, result: object) -> None:
+                """从上游响应中提取真实模型名，加入动态注册表。
+
+                用户核心诉求：未来 chatglm.cn 升级到 GLM-5.3 时无需改代码，
+                只要发一次请求，新模型就自动出现在 /v1/models 列表里。
+
+                提取来源：result["model"]（如 "GLM-5.2"）
+                归一化：GLM-5.2 → glm-5.2
+                派生：自动加 -think / -search / -think-search 变体
+                """
+                try:
+                    if not isinstance(result, dict):
+                        return
+                    raw_model = result.get("model")
+                    if not isinstance(raw_model, str) or not raw_model:
+                        return
+                    from .services.dynamic_models import get_dynamic_registry
+                    registry = get_dynamic_registry()
+                    if registry.discover_from_response(raw_model):
+                        logger.info(
+                            "动态发现新模型 raw=%s 已加入 exposed_models（无需改代码）",
+                            raw_model,
+                        )
+                except Exception:
+                    pass  # 永不让动态发现影响主请求
+
+            def _get_effective_exposed_models(self) -> list[str]:
+                """获取当前生效的模型列表（builtin + 动态发现）。
+
+                所有需要校验或返回模型列表的地方都应使用此方法，而不是 config.exposed_models。
+                """
+                from .services.dynamic_models import merge_with_builtin
+                return merge_with_builtin(list(config.exposed_models))
 
             def _model_info(self, model_id: str) -> dict[str, object]:
                 """Build OpenAI-format model info object.

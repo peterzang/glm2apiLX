@@ -42,6 +42,7 @@ from ..services.models_registry import (
     get_orphan_assistants,
     to_dict as unified_model_to_dict,
 )
+from ..services.dynamic_models import merge_with_builtin, get_dynamic_registry
 from .store import (
     GLOBAL_STORE,
     RequestRecord,
@@ -364,17 +365,24 @@ def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger:
     """
     # 拉取探针缓存
     probe_cache = get_store().get_model_probe_cache()
+    # 获取合并后的模型列表（builtin + 动态发现）
+    # 这是关键：用户原话"未来升级模型我们不需要再添加代码会自动获取到的"
+    # 动态发现的模型来自 chat_completion 响应的 model 字段
+    effective_models = merge_with_builtin(list(config.exposed_models))
     # 构造统一模型列表（内部会拉取真实助手元数据）
     models = get_unified_models(
         config, logger, glm_client.auth,
         probe_cache=probe_cache,
         fetch_upstream=True,
+        effective_models=effective_models,
     )
     # 获取孤儿助手（未映射的真实助手）
     orphans = get_orphan_assistants(config, logger, glm_client.auth)
     # 上游缓存信息
     discovery = get_upstream_discovery(config, logger, glm_client.auth)
     upstream_cache = discovery.get_cache_info()
+    # 动态发现注册表统计
+    dynamic_stats = get_dynamic_registry().get_stats()
     # 统计
     base_count = len({m.base for m in models})
 
@@ -384,6 +392,7 @@ def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger:
         "models": [unified_model_to_dict(m) for m in models],
         "orphan_assistants": [upstream_assistant_to_dict(a) for a in orphans],
         "upstream_cache": upstream_cache,
+        "dynamic_discovery": dynamic_stats,
     }, config)
 
 
@@ -397,17 +406,21 @@ def _handle_upstream_refresh(handler, config: AppConfig, glm_client: GLMWebClien
     cache_info = discovery.get_cache_info()
     # 顺便返回新的统一模型列表（前端刷新后立即更新 UI）
     probe_cache = get_store().get_model_probe_cache()
+    effective_models = merge_with_builtin(list(config.exposed_models))
     models = get_unified_models(
         config, logger, glm_client.auth,
         probe_cache=probe_cache,
         fetch_upstream=True,
+        effective_models=effective_models,
     )
     orphans = get_orphan_assistants(config, logger, glm_client.auth)
+    dynamic_stats = get_dynamic_registry().get_stats()
     _send_json(handler, HTTPStatus.OK, {
         "ok": True,
         "cache": cache_info,
         "models": [unified_model_to_dict(m) for m in models],
         "orphan_assistants": [upstream_assistant_to_dict(a) for a in orphans],
+        "dynamic_discovery": dynamic_stats,
     }, config)
 
 
@@ -439,7 +452,9 @@ def _handle_probe_model(handler, config: AppConfig, glm_client: GLMWebClient, lo
     if not model:
         _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_model"}, config)
         return
-    if model not in config.exposed_models:
+    # 校验模型存在（builtin + 动态发现）
+    effective_models = merge_with_builtin(list(config.exposed_models))
+    if model not in effective_models:
         _send_json(handler, HTTPStatus.NOT_FOUND, {
             "error": "model_not_found",
             "model": model,
@@ -546,7 +561,9 @@ def _handle_probe(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
     if not model:
         _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_model"}, config)
         return
-    if model not in config.exposed_models:
+    # 校验模型存在（builtin + 动态发现）
+    effective_models = merge_with_builtin(list(config.exposed_models))
+    if model not in effective_models:
         _send_json(handler, HTTPStatus.NOT_FOUND, {
             "error": "model_not_found",
             "model": model,

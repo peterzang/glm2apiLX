@@ -327,6 +327,12 @@ class ResponsesStreamAccumulator:
     def _base_response(self, status: str = "in_progress") -> dict[str, object]:
         usage: dict[str, object] | None = None
         if status == "completed":
+            # 兜底：如果上游 usage chunk 没正确解析（流式 usage=0 是已知缺陷），
+            # 从已累积的文本长度估算 token 数（每 ~4 字符 1 token 近似）
+            if self.input_tokens == 0 and self.output_tokens == 0:
+                estimated_output = max(1, len(self._full_text) // 4)
+                self.input_tokens = max(1, len(self._full_text) // 8)  # 输入近似为输出的一半
+                self.output_tokens = estimated_output
             usage = {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,

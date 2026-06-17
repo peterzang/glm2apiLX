@@ -57,6 +57,7 @@ def get_unified_models(
     auth: GLMAccessTokenManager,
     probe_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     fetch_upstream: bool = True,
+    effective_models: Optional[List[str]] = None,
 ) -> List[UnifiedModel]:
     """获取统一模型列表。
 
@@ -66,10 +67,15 @@ def get_unified_models(
       auth: GLMAccessTokenManager（用于 upstream_discovery）
       probe_cache: 探针结果缓存（来自 admin store）。如果为 None，last_probe 字段为 None
       fetch_upstream: 是否拉取真实上游助手元数据。False 时只返回本地模型（upstream_* 字段为空）
+      effective_models: 传入的模型列表（builtin + 动态发现）。
+        如果为 None，则用 config.exposed_models。
 
     返回：
-      UnifiedModel 列表，按 config.exposed_models 顺序
+      UnifiedModel 列表，按 effective_models 顺序
     """
+    # Step 0: 确定要遍历的模型列表
+    models_to_iterate = effective_models if effective_models is not None else list(config.exposed_models)
+
     # Step 1: 拉取真实上游助手（可选）
     assistant_map: Dict[str, UpstreamAssistant] = {}
     if fetch_upstream:
@@ -91,7 +97,7 @@ def get_unified_models(
         probe_cache = {}
 
     models: List[UnifiedModel] = []
-    for model_id in config.exposed_models:
+    for model_id in models_to_iterate:
         base, features = split_model_features(model_id)
         profile = get_model_profile(base)
         is_image = model_id == image_model_name

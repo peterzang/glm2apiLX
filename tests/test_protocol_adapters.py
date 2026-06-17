@@ -134,7 +134,10 @@ def test_responses_stream_uses_openai_event_envelope():
     assert payloads[-1]["type"] == "response.completed"
     assert payloads[-1]["response"]["status"] == "completed"
     assert payloads[-1]["response"]["completed_at"] is not None
-    assert payloads[-1]["response"]["usage"]["total_tokens"] == 0
+    # P4 fix: 流式 usage 兜底估算（上游未传 usage 时从文本长度估算，不再为 0）
+    # "hi" 2 字符 → output_tokens 估算为 max(1, 2//4) = 1
+    assert payloads[-1]["response"]["usage"]["total_tokens"] >= 1
+    assert payloads[-1]["response"]["usage"]["total_tokens"] == payloads[-1]["response"]["usage"]["input_tokens"] + payloads[-1]["response"]["usage"]["output_tokens"]
     assert events[-1] == "data: [DONE]\n\n"
 
 
