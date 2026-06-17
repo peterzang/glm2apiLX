@@ -91,6 +91,16 @@ class AdminStore:
         # Model probe cache: model_id -> { ts, ok, latency_ms, status, error, content_preview, account_index }
         # 用于 admin 面板「模型」页显示每个模型最近一次探针结果
         self._model_probe_cache: Dict[str, Dict[str, Any]] = {}
+        # Token 累计（用于仪表盘 KPI）
+        self._token_totals = {"prompt": 0, "completion": 0, "total": 0}
+        # 每分钟请求计数：{ minute_epoch: count }，保留最近 60 分钟
+        self._rpm_buckets: Dict[int, int] = collections.defaultdict(int)
+        # 历史 RPM 峰值
+        self._peak_rpm = 0
+        # 30 分钟滚动窗口 token 累计（用于仪表盘 KPI）
+        self._token_30m_buckets: Dict[int, Dict[str, int]] = collections.defaultdict(
+            lambda: {"prompt": 0, "completion": 0, "total": 0}
+        )
 
     # -----------------------------------------------------------------
     # Recording
@@ -119,6 +129,44 @@ class AdminStore:
                     stats["error"] += 1
                 stats["last_used_ts"] = rec.ts
             self._hourly_append(rec)
+            # 更新 RPM bucket
+            minute = int(rec.ts // 60) * 60
+            self._rpm_buckets[minute] = self._rpm_buckets.get(minute, 0) + 1
+            # 清理超过 60 分钟的旧 bucket
+            cutoff = minute - 60 * 60
+            for k in list(self._rpm_buckets.keys()):
+                if k < cutoff:
+                    del self._rpm_buckets[k]
+            # 更新 peak_rpm
+            current_rpm = self._rpm_buckets.get(minute, 0)
+            if current_rpm > self._peak_rpm:
+                self._peak_rpm = current_rpm
+
+    def record_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """记录一次成功 chat 请求的 token 使用量（用于仪表盘 KPI）。
+        
+        在 server.py 的 chat_completion 成功返回后调用。
+        """
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            return
+        pt = max(0, int(prompt_tokens))
+        ct = max(0, int(completion_tokens))
+        tt = pt + ct
+        now = time.time()
+        minute = int(now // 60) * 60
+        with self._lock:
+            self._token_totals["prompt"] += pt
+            self._token_totals["completion"] += ct
+            self._token_totals["total"] += tt
+            bucket = self._token_30m_buckets[minute]
+            bucket["prompt"] += pt
+            bucket["completion"] += ct
+            bucket["total"] += tt
+            # 清理超过 30 分钟的旧 bucket
+            cutoff = minute - 30 * 60
+            for k in list(self._token_30m_buckets.keys()):
+                if k < cutoff:
+                    del self._token_30m_buckets[k]
 
     def _hourly_append(self, rec: RequestRecord) -> None:
         hour = int(rec.ts // 3600) * 3600
@@ -195,6 +243,33 @@ class AdminStore:
             top_models = self._model_counter.most_common(_TOP_N_MODELS)
             # Protocols
             protocols = dict(self._protocol_counter)
+            # RPM（最近 1 分钟的请求数）
+            current_minute = int(now // 60) * 60
+            rpm = self._rpm_buckets.get(current_minute, 0)
+            # 30 分钟平均 RPM
+            cutoff_30m = now - 30 * 60
+            rpm_30m_total = sum(c for m, c in self._rpm_buckets.items() if m * 60 >= cutoff_30m)
+            avg_rpm = round(rpm_30m_total / 30.0, 1) if rpm_30m_total else 0.0
+            # 30 分钟请求总数
+            requests_30m = sum(1 for r in self._request_log if r.ts >= cutoff_30m)
+            # 30 分钟 token 累计
+            token_30m = {"prompt": 0, "completion": 0, "total": 0}
+            for m, bucket in self._token_30m_buckets.items():
+                if m * 60 >= cutoff_30m:
+                    for k in token_30m:
+                        token_30m[k] += bucket[k]
+            # 活跃账号数（success > 0 或 last_used_ts > 0）
+            accounts_active = sum(1 for s in self._account_stats.values() if s.get("last_used_ts", 0) > 0)
+            accounts_total = len(self._account_stats)
+            # 协议分类（chat / models / images / admin / meta / other）
+            proto_breakdown = {
+                "chat": sum(c for p, c in protocols.items() if p == "openai-chat" or p == "anthropic" or p == "openai-responses" or p == "openai-legacy"),
+                "models": protocols.get("meta", 0),  # /v1/models / /health 都算 meta
+                "images": protocols.get("openai-images", 0),
+                "embeddings": protocols.get("openai-embeddings", 0),
+                "moderations": protocols.get("openai-moderations", 0),
+                "other": sum(c for p, c in protocols.items() if p == "other"),
+            }
             return {
                 "now": now,
                 "uptime_seconds": now - self._started_at,
@@ -216,6 +291,16 @@ class AdminStore:
                 "hourly": hourly,
                 "top_models": [{"model": m, "count": c} for m, c in top_models],
                 "protocols": protocols,
+                # === 新增字段（参考 Qwen2API_Go 仪表盘）===
+                "rpm": rpm,
+                "avg_rpm": avg_rpm,
+                "peak_rpm": self._peak_rpm,
+                "requests_30m": requests_30m,
+                "token_totals": dict(self._token_totals),
+                "token_30m": token_30m,
+                "accounts_active": accounts_active,
+                "accounts_total": accounts_total,
+                "proto_breakdown": proto_breakdown,
             }
 
     def recent_logs(self, limit: int = 100, only_errors: bool = False) -> List[Dict[str, Any]]:

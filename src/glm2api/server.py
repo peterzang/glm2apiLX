@@ -424,6 +424,17 @@ class GLM2APIServer:
 
                     logger.info("收到 chat 请求 model=%s", payload.get("model"))
                     result, conversation_id = glm_client.chat_completion(payload)
+                    # 记录 token 使用量到 admin store（用于仪表盘 KPI）
+                    try:
+                        usage = result.get("usage") if isinstance(result, dict) else None
+                        if usage and isinstance(usage, dict):
+                            from .admin.store import get_store as _get_admin_store
+                            _get_admin_store().record_token_usage(
+                                int(usage.get("prompt_tokens", 0) or 0),
+                                int(usage.get("completion_tokens", 0) or 0),
+                            )
+                    except Exception:
+                        pass
                     self._write_json(HTTPStatus.OK, result)
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)

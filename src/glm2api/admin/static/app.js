@@ -180,7 +180,7 @@ async function refresh() {
 }
 
 // =========================================================================
-// Dashboard view
+// Dashboard view（参考 Qwen2API_Go overview-tab 重写：2 行 4 列 KPI + 主图表 + 侧边卡片 + 底部 4 卡）
 // =========================================================================
 
 async function refreshDashboard() {
@@ -190,28 +190,33 @@ async function refreshDashboard() {
   const r5 = d.recent_5m;
   const successRateColor = r5.success_rate >= 95 ? 'success'
                          : r5.success_rate >= 80 ? 'warning' : 'error';
+  const rpm = d.rpm || 0;
+  const avgRpm = d.avg_rpm || 0;
+  const peakRpm = d.peak_rpm || 0;
+  const requests30m = d.requests_30m || 0;
+  const tokenTotals = d.token_totals || { prompt: 0, completion: 0, total: 0 };
+  const token30m = d.token_30m || { prompt: 0, completion: 0, total: 0 };
+  const accountsActive = d.accounts_active || 0;
+  const accountsTotal = d.accounts_total || 0;
+  const protoBreakdown = d.proto_breakdown || {};
 
-  const html = `
+  // === KPI Row 1 ===
+  const kpiRow1 = `
     <div class="kpi-grid">
       <div class="kpi-card info">
         <div class="kpi-label">总请求数</div>
-        <div class="kpi-value">${all.total.toLocaleString()}</div>
+        <div class="kpi-value">${(all.total || 0).toLocaleString()}</div>
         <div class="kpi-sub">成功 ${all.success} · 4xx ${all.client_errors} · 5xx ${all.server_errors}</div>
       </div>
       <div class="kpi-card ${successRateColor}">
         <div class="kpi-label">5分钟成功率</div>
-        <div class="kpi-value">${r5.success_rate.toFixed(1)}%</div>
+        <div class="kpi-value">${(r5.success_rate || 0).toFixed(1)}%</div>
         <div class="kpi-sub">${r5.success}/${r5.total} 请求</div>
       </div>
-      <div class="kpi-card">
-        <div class="kpi-label">P95 延迟</div>
-        <div class="kpi-value">${r5.p95_ms}ms</div>
-        <div class="kpi-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
-      </div>
       <div class="kpi-card success">
-        <div class="kpi-label">全局成功率</div>
-        <div class="kpi-value">${all.success_rate.toFixed(1)}%</div>
-        <div class="kpi-sub">历史累计</div>
+        <div class="kpi-label">活跃账号</div>
+        <div class="kpi-value">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
+        <div class="kpi-sub">已使用过的账号</div>
       </div>
       <div class="kpi-card warning">
         <div class="kpi-label">运行时长</div>
@@ -219,97 +224,352 @@ async function refreshDashboard() {
         <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
       </div>
     </div>
+  `;
 
-    <div class="panel">
-      <div class="panel-header">
-        <div class="panel-title">近 48 小时请求量</div>
-        <div class="panel-meta">绿=成功 · 红=5xx错误</div>
+  // === KPI Row 2 ===
+  const kpiRow2 = `
+    <div class="kpi-grid">
+      <div class="kpi-card info">
+        <div class="kpi-label">当前 RPM</div>
+        <div class="kpi-value">${rpm}</div>
+        <div class="kpi-sub">30m 平均 ${avgRpm} rpm · 峰值 ${peakRpm}</div>
       </div>
-      <div class="panel-body">
-        ${renderHourlyBar(d.hourly)}
+      <div class="kpi-card">
+        <div class="kpi-label">P95 延迟</div>
+        <div class="kpi-value">${r5.p95_ms}ms</div>
+        <div class="kpi-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
       </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
-      <div class="panel">
-        <div class="panel-header"><div class="panel-title">模型使用分布 (Top 8)</div></div>
-        <div class="panel-body">${renderModelList(d.top_models)}</div>
+      <div class="kpi-card warning">
+        <div class="kpi-label">Prompt Tokens</div>
+        <div class="kpi-value">${fmtCompactNum(tokenTotals.prompt)}</div>
+        <div class="kpi-sub">30m ${fmtCompactNum(token30m.prompt)}</div>
       </div>
-      <div class="panel">
-        <div class="panel-header"><div class="panel-title">协议分布</div></div>
-        <div class="panel-body">${renderProtocolList(d.protocols)}</div>
+      <div class="kpi-card" style="border-left:3px solid var(--purple);">
+        <div class="kpi-label">Completion Tokens</div>
+        <div class="kpi-value">${fmtCompactNum(tokenTotals.completion)}</div>
+        <div class="kpi-sub">总计 ${fmtCompactNum(tokenTotals.total)}</div>
       </div>
     </div>
   `;
-  document.getElementById('view-dashboard').innerHTML = html;
+
+  // === 主图表 + 侧边卡片 ===
+  const mainArea = `
+    <div class="dashboard-grid-3">
+      <div class="dashboard-col-2">
+        ${renderRequestTrendCard(d.hourly)}
+        ${renderTokenThroughputCard(d.hourly)}
+      </div>
+      <div class="dashboard-col-1">
+        ${renderProtoBreakdownCard(protoBreakdown)}
+        ${renderAccountHealthCard(accountsActive, accountsTotal, all)}
+      </div>
+    </div>
+  `;
+
+  // === 底部 4 卡 ===
+  const bottomCards = `
+    <div class="kpi-grid">
+      ${renderTrafficSplitCard(protoBreakdown, all.total)}
+      ${renderServiceParamsCard(d)}
+      ${renderModelSupplyCard(d.top_models)}
+      ${renderOpsMetricsCard(d, requests30m, peakRpm)}
+    </div>
+  `;
+
+  document.getElementById('view-dashboard').innerHTML = kpiRow1 + kpiRow2 + mainArea + bottomCards;
 }
 
-function renderHourlyBar(hourly) {
-  if (!hourly || hourly.length === 0) {
-    return `<div class="empty-state">暂无数据</div>`;
+// 紧凑数字格式：1234 → 1.2K，1234567 → 1.2M
+function fmtCompactNum(n) {
+  n = Number(n || 0);
+  if (n < 1000) return String(n);
+  if (n < 1000000) return (n / 1000).toFixed(1) + 'K';
+  return (n / 1000000).toFixed(1) + 'M';
+}
+
+// === SVG 图表：48h 请求趋势 ===
+function renderRequestTrendCard(hourly) {
+  const data = (hourly || []).slice(-48);
+  const maxTotal = Math.max(1, ...data.map(h => h.total));
+  const W = 600, H = 180, P = 28;
+  const innerW = W - P * 2, innerH = H - P * 2;
+  // 构造区域路径
+  if (data.length === 0) {
+    return `
+      <div class="panel">
+        <div class="panel-header"><div class="panel-title">请求趋势（48 小时）</div><div class="panel-meta">绿=成功 · 红=5xx</div></div>
+        <div class="panel-body"><div class="empty-state">暂无数据</div></div>
+      </div>
+    `;
   }
-  const maxTotal = Math.max(1, ...hourly.map(h => h.total));
-  const bars = hourly.map(h => {
-    const totalH = (h.total / maxTotal) * 100;
-    const errH = h.error > 0 ? (h.error / maxTotal) * 100 : 0;
+  const points = data.map((h, i) => {
+    const x = P + (i / Math.max(1, data.length - 1)) * innerW;
+    const y = P + innerH - (h.total / maxTotal) * innerH;
+    return { x, y, h };
+  });
+  const linePath = points.map((p, i) => (i === 0 ? `M ${p.x} ${p.y}` : `L ${p.x} ${p.y}`)).join(' ');
+  const areaPath = linePath + ` L ${points[points.length-1].x} ${P + innerH} L ${points[0].x} ${P + innerH} Z`;
+  // Y 轴刻度
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(t => ({
+    y: P + innerH - t * innerH,
+    val: Math.round(t * maxTotal),
+  }));
+  // X 轴标签（每 6 小时一个）
+  const xLabels = points.filter((_, i) => i % 6 === 0).map(p => ({
+    x: p.x,
+    label: fmtTimeShort(p.h.hour).slice(0, 5),
+  }));
+  return `
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">请求趋势（48 小时）</div>
+        <div class="panel-meta">峰值 ${maxTotal} · 绿=成功 · 红=5xx</div>
+      </div>
+      <div class="panel-body">
+        <svg viewBox="0 0 ${W} ${H}" class="dashboard-svg" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="reqGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stop-color="#3b82f6" stop-opacity="0.35"/>
+              <stop offset="95%" stop-color="#3b82f6" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          ${yTicks.map(t => `
+            <line x1="${P}" y1="${t.y}" x2="${W - P}" y2="${t.y}" stroke="var(--border)" stroke-dasharray="3 3" stroke-width="0.5"/>
+            <text x="${P - 6}" y="${t.y + 3}" text-anchor="end" font-size="10" fill="var(--text-muted)">${t.val}</text>
+          `).join('')}
+          <path d="${areaPath}" fill="url(#reqGrad)"/>
+          <path d="${linePath}" fill="none" stroke="#3b82f6" stroke-width="2"/>
+          ${points.map(p => `
+            <circle cx="${p.x}" cy="${p.y}" r="2" fill="#3b82f6">
+              <title>${fmtTimeShort(p.h.hour)} · 总 ${p.h.total} · 成功 ${p.h.success} · 错误 ${p.h.error}</title>
+            </circle>
+          `).join('')}
+          ${xLabels.map(l => `<text x="${l.x}" y="${H - 8}" text-anchor="middle" font-size="10" fill="var(--text-muted)">${l.label}</text>`).join('')}
+        </svg>
+      </div>
+    </div>
+  `;
+}
+
+// === SVG 图表：每小时 Token 吞吐（堆叠柱状图）===
+function renderTokenThroughputCard(hourly) {
+  const data = (hourly || []).slice(-48);
+  const maxTotal = Math.max(1, ...data.map(h => h.total));
+  const W = 600, H = 180, P = 28;
+  const innerW = W - P * 2, innerH = H - P * 2;
+  if (data.length === 0) {
+    return `
+      <div class="panel">
+        <div class="panel-header"><div class="panel-title">每小时请求量（柱状）</div><div class="panel-meta">绿=成功 · 红=5xx</div></div>
+        <div class="panel-body"><div class="empty-state">暂无数据</div></div>
+      </div>
+    `;
+  }
+  const barW = innerW / data.length * 0.7;
+  const gap = innerW / data.length * 0.3;
+  const bars = data.map((h, i) => {
+    const x = P + (i + 0.15) * (innerW / data.length);
+    const totalH = (h.total / maxTotal) * innerH;
+    const errH = h.error > 0 ? (h.error / maxTotal) * innerH : 0;
     const okH = totalH - errH;
-    const time = fmtTimeShort(h.hour + 60 * 30); // mid-of-hour
     return `
-      <div class="bar-col">
-        <div class="bar-tooltip">${time} · 总${h.total} · 成功${h.success} · 错误${h.error}</div>
-        <div class="bar-stack error" style="height:${errH}%;"></div>
-        <div class="bar-stack" style="height:${okH}%;"></div>
-        <div class="bar-label">${time.slice(0, 5)}</div>
-      </div>
+      <g>
+        <rect x="${x}" y="${P + innerH - okH}" width="${barW}" height="${okH}" fill="#10b981" rx="1">
+          <title>${fmtTimeShort(h.hour)} · 总 ${h.total} · 成功 ${h.success}</title>
+        </rect>
+        ${errH > 0 ? `<rect x="${x}" y="${P + innerH - totalH}" width="${barW}" height="${errH}" fill="#ef4444" rx="1">
+          <title>${fmtTimeShort(h.hour)} · 错误 ${h.error}</title>
+        </rect>` : ''}
+      </g>
     `;
   }).join('');
-  return `<div class="bar-chart">${bars}</div>`;
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(t => ({
+    y: P + innerH - t * innerH,
+    val: Math.round(t * maxTotal),
+  }));
+  const xLabels = data.filter((_, i) => i % 6 === 0).map((h, i) => {
+    const idx = data.indexOf(h);
+    const x = P + (idx + 0.5) * (innerW / data.length);
+    return `<text x="${x}" y="${H - 8}" text-anchor="middle" font-size="10" fill="var(--text-muted)">${fmtTimeShort(h.hour).slice(0, 5)}</text>`;
+  }).join('');
+  return `
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">每小时请求量（柱状）</div>
+        <div class="panel-meta">绿=成功 · 红=5xx</div>
+      </div>
+      <div class="panel-body">
+        <svg viewBox="0 0 ${W} ${H}" class="dashboard-svg" preserveAspectRatio="none">
+          ${yTicks.map(t => `
+            <line x1="${P}" y1="${t.y}" x2="${W - P}" y2="${t.y}" stroke="var(--border)" stroke-dasharray="3 3" stroke-width="0.5"/>
+            <text x="${P - 6}" y="${t.y + 3}" text-anchor="end" font-size="10" fill="var(--text-muted)">${t.val}</text>
+          `).join('')}
+          ${bars}
+          ${xLabels}
+        </svg>
+      </div>
+    </div>
+  `;
 }
 
-function renderModelList(models) {
-  if (!models || models.length === 0) return `<div class="empty-state">暂无数据</div>`;
-  const max = Math.max(1, ...models.map(m => m.count));
-  return models.map(m => {
-    const pct = (m.count / max) * 100;
+// === SVG 饼图：协议分类 ===
+function renderProtoBreakdownCard(protoBreakdown) {
+  const entries = Object.entries(protoBreakdown || {}).filter(([, v]) => v > 0);
+  const total = entries.reduce((s, [, v]) => s + v, 0);
+  if (total === 0) {
     return `
-      <div style="margin-bottom:10px;">
-        <div class="flex-between mb-1">
-          <span class="mono" style="font-size:12px;">${escapeHtml(m.model)}</span>
-          <span class="text-muted" style="font-size:12px;">${m.count}</span>
-        </div>
-        <div style="height:6px;background:var(--bg-elevated);border-radius:3px;overflow:hidden;">
-          <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,var(--primary),var(--purple));"></div>
-        </div>
+      <div class="panel">
+        <div class="panel-header"><div class="panel-title">协议分布</div><div class="panel-meta">按端点类别</div></div>
+        <div class="panel-body"><div class="empty-state">暂无数据</div></div>
       </div>
     `;
-  }).join('');
+  }
+  const labels = { chat: 'Chat 对话', models: 'Models 元信息', images: 'Images 图像', embeddings: 'Embeddings', moderations: 'Moderations', other: '其他' };
+  const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#64748b'];
+  const cx = 90, cy = 90, r = 70, innerR = 38;
+  let cumAngle = -Math.PI / 2;
+  const slices = entries.map(([k, v], i) => {
+    const angle = (v / total) * Math.PI * 2;
+    const x1 = cx + r * Math.cos(cumAngle);
+    const y1 = cy + r * Math.sin(cumAngle);
+    const x2 = cx + r * Math.cos(cumAngle + angle);
+    const y2 = cy + r * Math.sin(cumAngle + angle);
+    const xi1 = cx + innerR * Math.cos(cumAngle);
+    const yi1 = cy + innerR * Math.sin(cumAngle);
+    const xi2 = cx + innerR * Math.cos(cumAngle + angle);
+    const yi2 = cy + innerR * Math.sin(cumAngle + angle);
+    const largeArc = angle > Math.PI ? 1 : 0;
+    const path = `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} L ${xi2} ${yi2} A ${innerR} ${innerR} 0 ${largeArc} 0 ${xi1} ${yi1} Z`;
+    cumAngle += angle;
+    const pct = (v / total * 100).toFixed(0);
+    return { path, color: colors[i % colors.length], label: labels[k] || k, value: v, pct };
+  });
+  return `
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">协议分布</div><div class="panel-meta">按端点类别</div></div>
+      <div class="panel-body" style="display:flex;flex-direction:column;gap:12px;align-items:center;">
+        <svg viewBox="0 0 180 180" class="dashboard-pie">
+          ${slices.map(s => `<path d="${s.path}" fill="${s.color}"><title>${s.label}: ${s.value} (${s.pct}%)</title></path>`).join('')}
+          <text x="90" y="86" text-anchor="middle" font-size="14" font-weight="600" fill="var(--text)">${total}</text>
+          <text x="90" y="100" text-anchor="middle" font-size="9" fill="var(--text-muted)">总计</text>
+        </svg>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;width:100%;font-size:12px;">
+          ${slices.map(s => `
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span style="width:10px;height:10px;border-radius:2px;background:${s.color};flex-shrink:0;"></span>
+              <span class="text-muted">${escapeHtml(s.label)}</span>
+              <strong style="margin-left:auto;">${s.value} · ${s.pct}%</strong>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
-function renderProtocolList(protocols) {
-  const entries = Object.entries(protocols || {}).sort((a, b) => b[1] - a[1]);
-  if (entries.length === 0) return `<div class="empty-state">暂无数据</div>`;
-  const total = entries.reduce((s, [, c]) => s + c, 0);
-  const colors = {
-    'openai-chat': 'badge-success',
-    'openai-responses': 'badge-info',
-    'anthropic': 'badge-purple',
-    'openai-legacy': 'badge-muted',
-    'openai-embeddings': 'badge-info',
-    'openai-moderations': 'badge-muted',
-    'openai-images': 'badge-warning',
-    'meta': 'badge-muted',
-    'other': 'badge-muted',
-  };
-  return entries.map(([proto, count]) => {
-    const pct = ((count / total) * 100).toFixed(1);
-    const cls = colors[proto] || 'badge-muted';
-    return `
-      <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--border);">
-        <span><span class="badge ${cls}">${escapeHtml(proto)}</span></span>
-        <span class="mono">${count} · ${pct}%</span>
+// === 账号池健康度卡片（带进度条）===
+function renderAccountHealthCard(active, total, all) {
+  const valid = all.success || 0;
+  const errors = (all.client_errors || 0) + (all.server_errors || 0);
+  const errRate = all.total > 0 ? (errors / all.total * 100).toFixed(1) : 0;
+  const successRate = all.success_rate || 0;
+  return `
+    <div class="panel">
+      <div class="panel-header"><div class="panel-title">服务健康度</div><div class="panel-meta">实时指标</div></div>
+      <div class="panel-body">
+        ${renderMetricRow('活跃账号', active, total)}
+        ${renderMetricRow('成功率', Math.round(successRate), 100, '%')}
+        ${renderMetricRow('错误率', Math.round(errRate * 1) / 1, 100, '%', true)}
+        ${renderMetricRow('请求成功', valid, all.total || 0)}
       </div>
-    `;
-  }).join('');
+    </div>
+  `;
+}
+
+function renderMetricRow(label, value, total, suffix = '', invertColor = false) {
+  const ratio = total > 0 ? Math.min(100, (value / total) * 100) : 0;
+  const barColor = invertColor
+    ? (ratio >= 10 ? 'var(--error)' : ratio >= 5 ? 'var(--warning)' : 'var(--success)')
+    : (ratio >= 80 ? 'var(--success)' : ratio >= 50 ? 'var(--warning)' : 'var(--error)');
+  return `
+    <div class="metric-row">
+      <div class="metric-head">
+        <span>${escapeHtml(label)}</span>
+        <strong>${value}${suffix} / ${total}${suffix}</strong>
+      </div>
+      <div class="metric-progress">
+        <div class="metric-progress-fill" style="width:${ratio}%;background:${barColor};"></div>
+      </div>
+    </div>
+  `;
+}
+
+// === 底部 4 卡 ===
+function renderTrafficSplitCard(protoBreakdown, totalReqs) {
+  const pb = protoBreakdown || {};
+  return `
+    <div class="kpi-card">
+      <div class="kpi-label" style="margin-bottom:12px;">流量拆分</div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div class="flex-between"><span class="text-muted">Chat 对话</span><strong>${pb.chat || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">Models 元信息</span><strong>${pb.models || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">Images 图像</span><strong>${pb.images || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">Embeddings</span><strong>${pb.embeddings || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">其他</span><strong>${pb.other || 0}</strong></div>
+      </div>
+    </div>
+  `;
+}
+
+function renderServiceParamsCard(d) {
+  // 简化版服务参数卡（从 d 拿不到 server 配置，用静态信息）
+  return `
+    <div class="kpi-card">
+      <div class="kpi-label" style="margin-bottom:12px;">运行参数</div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div class="flex-between"><span class="text-muted">运行时长</span><strong class="mono">${fmtDuration(d.uptime_seconds)}</strong></div>
+        <div class="flex-between"><span class="text-muted">30m 请求数</span><strong>${d.requests_30m || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">当前 RPM</span><strong class="mono">${d.rpm || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">平均 RPM</span><strong class="mono">${d.avg_rpm || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">峰值 RPM</span><strong class="mono">${d.peak_rpm || 0}</strong></div>
+      </div>
+    </div>
+  `;
+}
+
+function renderModelSupplyCard(topModels) {
+  const models = topModels || [];
+  return `
+    <div class="kpi-card">
+      <div class="kpi-label" style="margin-bottom:12px;">模型使用 Top ${models.length}</div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        ${models.length === 0 ? '<div class="text-muted">暂无数据</div>' : models.map(m => `
+          <div class="flex-between">
+            <span class="mono text-muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(m.model)}">${escapeHtml(m.model)}</span>
+            <strong>${m.count}</strong>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderOpsMetricsCard(d, requests30m, peakRpm) {
+  const tokenTotals = d.token_totals || { prompt: 0, completion: 0, total: 0 };
+  return `
+    <div class="kpi-card">
+      <div class="kpi-label" style="margin-bottom:12px;">Token 累计</div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div class="flex-between"><span class="text-muted">Prompt</span><strong class="mono">${fmtCompactNum(tokenTotals.prompt)}</strong></div>
+        <div class="flex-between"><span class="text-muted">Completion</span><strong class="mono">${fmtCompactNum(tokenTotals.completion)}</strong></div>
+        <div class="flex-between"><span class="text-muted">总计</span><strong class="mono">${fmtCompactNum(tokenTotals.total)}</strong></div>
+        <div class="flex-between" style="margin-top:4px;padding-top:8px;border-top:1px solid var(--border);">
+          <span class="text-muted">30m Token</span>
+          <strong class="mono">${fmtCompactNum((d.token_30m || {}).total || 0)}</strong>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 // =========================================================================
@@ -751,7 +1011,8 @@ function cssEscape(s) {
 }
 
 // =========================================================================
-// Probe view (端点测试 - 自由发送 chat completions 请求)
+// Probe view (端点测试 - 双列布局：左 Debug 表单 + 右 API Overview)
+// 参考 Qwen2API_Go debug-tab，但适配我们项目的端点结构
 // =========================================================================
 
 async function refreshProbe() {
@@ -767,7 +1028,6 @@ async function refreshProbe() {
   }
   const localPayload = (modelsData && modelsData.local) || {};
   const models = localPayload.models || [];
-  // 把基础模型排在前面
   const sorted = [...models].sort((a, b) => {
     if (a.is_variant !== b.is_variant) return a.is_variant ? 1 : -1;
     return a.id.localeCompare(b.id);
@@ -778,58 +1038,160 @@ async function refreshProbe() {
   }).join('');
 
   document.getElementById('view-probe').innerHTML = `
-    <div class="panel">
-      <div class="panel-header">
-        <div class="panel-title">端点测试</div>
-        <div class="panel-meta">选择模型 + 输入消息 → 查看完整响应</div>
-      </div>
-      <div class="panel-body">
-        <div class="probe-form">
-          <div class="probe-row">
-            <label class="probe-label">模型</label>
-            <select id="probe-model" class="probe-input" style="flex:1;">
-              ${options || '<option value="">(无可用模型)</option>'}
-            </select>
-          </div>
-          <div class="probe-row" style="gap:12px;">
-            <div style="flex:1;">
-              <label class="probe-label">Temperature <span id="probe-temp-val" class="text-muted">0.7</span></label>
-              <input type="range" id="probe-temperature" min="0" max="2" step="0.1" value="0.7" class="probe-input" />
-            </div>
-            <div style="width:140px;">
-              <label class="probe-label">Max Tokens</label>
-              <input type="number" id="probe-max-tokens" value="512" min="1" max="8192" class="probe-input" />
-            </div>
-          </div>
-          <div class="probe-row">
-            <label class="probe-label">System Prompt (可选)</label>
-            <textarea id="probe-system" class="probe-input" rows="2" placeholder="例如：你是一个简洁的助手"></textarea>
-          </div>
-          <div class="probe-row">
-            <label class="probe-label">用户消息</label>
-            <textarea id="probe-message" class="probe-input" rows="4" placeholder="输入要发送给模型的消息...">你好，用一句话介绍你自己</textarea>
-          </div>
-          <div class="probe-row" style="flex-direction:row;align-items:center;gap:12px;">
-            <button id="probe-send" class="btn btn-primary">🚀 发送请求</button>
-            <button id="probe-clear" class="btn btn-ghost">清空</button>
-            <span id="probe-status" class="text-muted" style="font-size:12px;"></span>
-          </div>
+    <div class="probe-layout">
+      <!-- 左列：Debug 表单 + 结果 -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">调试终端</div>
+          <div class="panel-meta">选择模型 + 输入消息 → 查看完整响应</div>
         </div>
-      </div>
-    </div>
+        <div class="panel-body">
+          <div class="probe-form">
+            <!-- 4 字段网格 -->
+            <div class="probe-form-grid">
+              <div class="probe-form-group">
+                <label class="probe-label">模型</label>
+                <select id="probe-model" class="probe-input">
+                  ${options || '<option value="">(无可用模型)</option>'}
+                </select>
+              </div>
+              <div class="probe-form-group">
+                <label class="probe-label">Temperature <span id="probe-temp-val" class="text-muted">0.7</span></label>
+                <input type="range" id="probe-temperature" min="0" max="2" step="0.1" value="0.7" class="probe-input" />
+              </div>
+              <div class="probe-form-group">
+                <label class="probe-label">Max Tokens</label>
+                <input type="number" id="probe-max-tokens" value="512" min="1" max="8192" class="probe-input" />
+              </div>
+              <div class="probe-form-group">
+                <label class="probe-label">Stream</label>
+                <select id="probe-stream" class="probe-input">
+                  <option value="false">false（同步）</option>
+                  <option value="true">true（流式 - 暂未支持）</option>
+                </select>
+              </div>
+            </div>
 
-    <div class="panel" id="probe-result-panel" style="display:none;">
-      <div class="panel-header">
-        <div class="panel-title">响应结果</div>
-        <div class="panel-meta" id="probe-result-meta"></div>
-      </div>
-      <div class="panel-body">
-        <div id="probe-result-tabs" class="probe-tabs">
-          <button class="probe-tab active" data-tab="content">响应内容</button>
-          <button class="probe-tab" data-tab="raw">原始 JSON</button>
-          <button class="probe-tab" data-tab="meta">元信息</button>
+            <!-- System + User 双 textarea -->
+            <div class="probe-form-grid-2">
+              <div class="probe-form-group">
+                <label class="probe-label">System Prompt</label>
+                <textarea id="probe-system" class="probe-input" rows="5" placeholder="例如：你是一个简洁的助手"></textarea>
+              </div>
+              <div class="probe-form-group">
+                <label class="probe-label">User Message</label>
+                <textarea id="probe-message" class="probe-input" rows="5" placeholder="输入要发送给模型的消息...">你好，用一句话介绍你自己</textarea>
+              </div>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="probe-actions">
+              <button id="probe-send" class="btn btn-primary">发送请求</button>
+              <button id="probe-clear" class="btn btn-ghost">清空结果</button>
+              <span id="probe-status" class="text-muted" style="font-size:12px;"></span>
+            </div>
+
+            <div id="probe-error-box" class="probe-error-box" style="display:none;"></div>
+          </div>
+
+          <!-- 双列结果：模型回复 + Token Usage -->
+          <div class="probe-result-grid" id="probe-result-area" style="display:none;">
+            <div class="probe-form-group">
+              <label class="probe-label">模型回复</label>
+              <div id="probe-content-box" class="probe-content-box">发送请求后此处显示模型回复</div>
+            </div>
+            <div class="probe-form-group">
+              <label class="probe-label">Token Usage</label>
+              <div class="probe-usage-box" id="probe-usage-box">
+                <div class="flex-between"><span class="text-muted">Input</span><strong id="usage-prompt">0</strong></div>
+                <div class="flex-between"><span class="text-muted">Output</span><strong id="usage-completion">0</strong></div>
+                <div class="flex-between"><span class="text-muted">Total</span><strong id="usage-total">0</strong></div>
+                <div class="flex-between" style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);">
+                  <span class="text-muted">Model</span>
+                  <strong class="mono" id="usage-model" style="font-size:11px;">-</strong>
+                </div>
+                <div class="flex-between">
+                  <span class="text-muted">Latency</span>
+                  <strong class="mono" id="usage-latency">-</strong>
+                </div>
+                <div class="flex-between">
+                  <span class="text-muted">Account</span>
+                  <strong class="mono" id="usage-account">-</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 原始 JSON -->
+          <div class="probe-form-group" id="probe-raw-wrap" style="display:none;margin-top:16px;">
+            <label class="probe-label">原始 JSON 响应</label>
+            <pre class="probe-code" id="probe-raw-json">{ }</pre>
+          </div>
         </div>
-        <div id="probe-tab-content" class="probe-tab-pane"></div>
+      </div>
+
+      <!-- 右列：API Overview -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">API 端点概览</div>
+          <div class="panel-meta">本项目支持的所有协议端点</div>
+        </div>
+        <div class="panel-body">
+          <div class="probe-endpoint-list">
+            ${renderEndpointItem('GET',  '/health',                       '健康检查端点')}
+            ${renderEndpointItem('GET',  '/v1/models',                    'OpenAI 兼容模型列表')}
+            ${renderEndpointItem('POST', '/v1/chat/completions',          'OpenAI Chat Completions（流式 + 非流式 + tools）')}
+            ${renderEndpointItem('POST', '/v1/messages',                  'Anthropic Messages API（流式 + 非流式）')}
+            ${renderEndpointItem('POST', '/v1/responses',                 'OpenAI Responses API（事件流）')}
+            ${renderEndpointItem('POST', '/v1/completions',               'Legacy text completion')}
+            ${renderEndpointItem('POST', '/v1/images/generations',        '文生图（cogView）')}
+            ${renderEndpointItem('POST', '/v1/moderations',               '内容审核（启发式）')}
+            ${renderEndpointItem('POST', '/v1/embeddings',                '文本 embedding（hash 投影）')}
+            ${renderEndpointItem('GET',  '/admin',                        '管理面板（HTML）')}
+            ${renderEndpointItem('POST', '/admin/api/login',              '管理面板登录')}
+            ${renderEndpointItem('GET',  '/admin/api/dashboard',          '仪表盘聚合数据')}
+            ${renderEndpointItem('GET',  '/admin/api/models',             '真实上游助手 + 本地兼容模型')}
+            ${renderEndpointItem('POST', '/admin/api/probe',              '端点测试（本页使用）')}
+          </div>
+
+          <div class="probe-form-group" style="margin-top:20px;">
+            <label class="probe-label">curl 示例</label>
+            <pre class="probe-code" id="probe-curl-example">${generateCurlExample(sorted[0]?.id || 'glm-4-flash')}</pre>
+          </div>
+
+          <div class="probe-form-group" style="margin-top:16px;">
+            <label class="probe-label">Python SDK 示例</label>
+            <pre class="probe-code">from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="dummy",  # 留空 SERVER_API_KEYS 时任意填
+)
+
+resp = client.chat.completions.create(
+    model="${escapeHtml(sorted[0]?.id || 'glm-4-flash')}",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)</pre>
+          </div>
+
+          <div class="probe-form-group" style="margin-top:16px;">
+            <label class="probe-label">Anthropic SDK 示例</label>
+            <pre class="probe-code">from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="dummy",
+)
+
+resp = client.messages.create(
+    model="${escapeHtml(sorted[0]?.id || 'glm-4-flash')}",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.content[0].text)</pre>
+          </div>
+        </div>
       </div>
     </div>
   `;
@@ -842,11 +1204,49 @@ async function refreshProbe() {
   document.getElementById('probe-clear').addEventListener('click', () => {
     document.getElementById('probe-system').value = '';
     document.getElementById('probe-message').value = '';
-    document.getElementById('probe-result-panel').style.display = 'none';
+    document.getElementById('probe-result-area').style.display = 'none';
+    document.getElementById('probe-raw-wrap').style.display = 'none';
+    document.getElementById('probe-error-box').style.display = 'none';
   });
-  document.querySelectorAll('.probe-tab').forEach(tab => {
-    tab.addEventListener('click', () => switchProbeTab(tab.dataset.tab));
+  // 模型选择变化时更新 curl 示例
+  document.getElementById('probe-model').addEventListener('change', e => {
+    const curlEl = document.getElementById('probe-curl-example');
+    if (curlEl) curlEl.textContent = generateCurlExample(e.target.value);
   });
+}
+
+function renderEndpointItem(method, path, summary) {
+  const methodClass = {
+    GET: 'endpoint-method-get',
+    POST: 'endpoint-method-post',
+    DELETE: 'endpoint-method-delete',
+    PUT: 'endpoint-method-put',
+  }[method] || 'endpoint-method-post';
+  return `
+    <div class="probe-endpoint">
+      <div class="probe-endpoint-head">
+        <span class="endpoint-method ${methodClass}">${method}</span>
+        <code class="endpoint-path">${escapeHtml(path)}</code>
+      </div>
+      <p class="probe-endpoint-summary">${escapeHtml(summary)}</p>
+    </div>
+  `;
+}
+
+function generateCurlExample(modelId) {
+  const m = modelId || 'glm-4-flash';
+  return `curl -X POST http://127.0.0.1:8000/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer dummy" \\
+  -d '{
+    "model": "${m}",
+    "stream": false,
+    "temperature": 0.7,
+    "max_tokens": 512,
+    "messages": [
+      {"role": "user", "content": "你好，用一句话介绍你自己"}
+    ]
+  }'`;
 }
 
 let _lastProbeResult = null;
@@ -859,6 +1259,7 @@ async function handleProbeSend() {
   const maxTokens = parseInt(document.getElementById('probe-max-tokens').value, 10) || 512;
   const statusEl = document.getElementById('probe-status');
   const sendBtn = document.getElementById('probe-send');
+  const errorBox = document.getElementById('probe-error-box');
 
   if (!model) { showToast('请选择模型', 'error'); return; }
   if (!userMessage) { showToast('请输入用户消息', 'error'); return; }
@@ -878,7 +1279,9 @@ async function handleProbeSend() {
   sendBtn.disabled = true;
   sendBtn.textContent = '请求中…';
   statusEl.innerHTML = '<span class="spinner"></span> 等待响应...';
-  document.getElementById('probe-result-panel').style.display = 'none';
+  errorBox.style.display = 'none';
+  document.getElementById('probe-result-area').style.display = 'none';
+  document.getElementById('probe-raw-wrap').style.display = 'none';
 
   const t0 = performance.now();
   try {
@@ -894,40 +1297,35 @@ async function handleProbeSend() {
     }
   } catch (err) {
     statusEl.innerHTML = `<span class="text-error">❌ ${escapeHtml(err.message)}</span>`;
+    errorBox.style.display = '';
+    errorBox.textContent = '❌ ' + err.message;
     showToast('请求失败: ' + err.message, 'error');
   } finally {
     sendBtn.disabled = false;
-    sendBtn.textContent = '🚀 发送请求';
+    sendBtn.textContent = '发送请求';
   }
 }
 
 function renderProbeResult(result, payload, elapsed) {
-  const panel = document.getElementById('probe-result-panel');
-  panel.style.display = '';
-  const metaEl = document.getElementById('probe-result-meta');
-  metaEl.innerHTML = `
-    ${result.ok ? '<span class="badge badge-success">OK</span>' : '<span class="badge badge-error">FAIL</span>'}
-    <span class="text-muted">·</span>
-    <span class="mono">HTTP ${result.status}</span>
-    <span class="text-muted">·</span>
-    <span class="mono">${result.latency_ms}ms</span>
-    ${result.account_index >= 0 ? `<span class="text-muted">·</span><span class="mono">账号 #${result.account_index}</span>` : ''}
-  `;
-  switchProbeTab('content');
-}
+  const resultArea = document.getElementById('probe-result-area');
+  const rawWrap = document.getElementById('probe-raw-wrap');
+  resultArea.style.display = '';
+  rawWrap.style.display = '';
 
-function switchProbeTab(tab) {
-  document.querySelectorAll('.probe-tab').forEach(t => {
-    t.classList.toggle('active', t.dataset.tab === tab);
-  });
-  const pane = document.getElementById('probe-tab-content');
-  if (!_lastProbeResult) { pane.innerHTML = '<div class="empty-state">无数据</div>'; return; }
-  const { result, payload, elapsed } = _lastProbeResult;
-  if (tab === 'content') {
-    if (!result.ok) {
-      pane.innerHTML = `<div class="probe-error">❌ ${escapeHtml(result.error || '未知错误')}</div>`;
-      return;
-    }
+  // 填充 Token Usage
+  const usage = (result.response && result.response.usage) || {};
+  document.getElementById('usage-prompt').textContent = usage.prompt_tokens || 0;
+  document.getElementById('usage-completion').textContent = usage.completion_tokens || 0;
+  document.getElementById('usage-total').textContent = usage.total_tokens || 0;
+  document.getElementById('usage-model').textContent = (result.response && result.response.model) || payload.model || '-';
+  document.getElementById('usage-latency').textContent = `${result.latency_ms}ms / ${elapsed}ms (端到端)`;
+  document.getElementById('usage-account').textContent = result.account_index >= 0 ? `#${result.account_index}` : '-';
+
+  // 填充模型回复
+  const contentBox = document.getElementById('probe-content-box');
+  if (!result.ok) {
+    contentBox.innerHTML = `<span class="text-error">❌ ${escapeHtml(result.error || '未知错误')}</span>`;
+  } else {
     const resp = result.response || {};
     const choices = resp.choices || [];
     let content = '';
@@ -939,45 +1337,22 @@ function switchProbeTab(tab) {
       if (msg.reasoning_content) reasoning += msg.reasoning_content + '\n';
       if (msg.tool_calls) toolCalls += JSON.stringify(msg.tool_calls, null, 2) + '\n';
     });
-    const usage = resp.usage || {};
-    pane.innerHTML = `
-      <div class="probe-content-block">
-        <div class="probe-content-label">响应内容</div>
-        <div class="probe-content-text">${escapeHtml(content.trim()) || '<span class="text-muted">(空)</span>'}</div>
-      </div>
-      ${reasoning ? `
-        <div class="probe-content-block">
-          <div class="probe-content-label">思维链 (reasoning_content)</div>
-          <pre class="probe-content-pre">${escapeHtml(reasoning.trim())}</pre>
-        </div>` : ''}
-      ${toolCalls ? `
-        <div class="probe-content-block">
-          <div class="probe-content-label">工具调用</div>
-          <pre class="probe-content-pre">${escapeHtml(toolCalls.trim())}</pre>
-        </div>` : ''}
-      <div class="probe-content-block">
-        <div class="probe-content-label">Usage</div>
-        <div class="mono" style="font-size:12px;color:var(--text-muted);">
-          prompt=${usage.prompt_tokens || 0} · completion=${usage.completion_tokens || 0} · total=${usage.total_tokens || 0}
-        </div>
-      </div>
-    `;
-  } else if (tab === 'raw') {
-    pane.innerHTML = `<pre class="probe-json">${escapeHtml(JSON.stringify(result.response, null, 2))}</pre>`;
-  } else { // meta
-    pane.innerHTML = `
-      <div class="config-list">
-        <div class="config-row"><div class="config-key">请求模型</div><div class="config-value">${escapeHtml(payload.model)}</div></div>
-        <div class="config-row"><div class="config-key">HTTP 状态</div><div class="config-value">${result.status}</div></div>
-        <div class="config-row"><div class="config-key">上游延迟</div><div class="config-value">${result.latency_ms} ms</div></div>
-        <div class="config-row"><div class="config-key">总耗时 (含网络)</div><div class="config-value">${elapsed} ms</div></div>
-        <div class="config-row"><div class="config-key">使用账号</div><div class="config-value">${result.account_index >= 0 ? '#' + result.account_index : '-'}</div></div>
-        <div class="config-row"><div class="config-key">会话 ID</div><div class="config-value mono">${escapeHtml(result.conversation_id || '-')}</div></div>
-        <div class="config-row"><div class="config-key">是否成功</div><div class="config-value ${result.ok ? 'bool-true' : 'bool-false'}">${result.ok}</div></div>
-        ${result.error ? `<div class="config-row"><div class="config-key">错误</div><div class="config-value" style="color:var(--error);">${escapeHtml(result.error)}</div></div>` : ''}
-      </div>
-    `;
+    let html = '';
+    if (content.trim()) {
+      html += `<div class="probe-content-block"><div class="probe-content-label">响应内容</div><div class="probe-content-text">${escapeHtml(content.trim())}</div></div>`;
+    }
+    if (reasoning.trim()) {
+      html += `<div class="probe-content-block"><div class="probe-content-label">思维链 (reasoning_content)</div><pre class="probe-content-pre">${escapeHtml(reasoning.trim())}</pre></div>`;
+    }
+    if (toolCalls.trim()) {
+      html += `<div class="probe-content-block"><div class="probe-content-label">工具调用</div><pre class="probe-content-pre">${escapeHtml(toolCalls.trim())}</pre></div>`;
+    }
+    if (!html) html = '<span class="text-muted">(空响应)</span>';
+    contentBox.innerHTML = html;
   }
+
+  // 填充原始 JSON
+  document.getElementById('probe-raw-json').textContent = JSON.stringify(result.response, null, 2);
 }
 
 // =========================================================================
