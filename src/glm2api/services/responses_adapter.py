@@ -401,12 +401,20 @@ class ResponsesStreamAccumulator:
         if not self.started:
             events.extend(self.start_response())
 
+        # P4-2 修复：优先用上游真实 usage（不论 choices 是否为空）
+        # 上游可能在最后一个 chunk 同时带 choices + usage，也可能单独发 usage chunk
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            prompt_t = usage.get("prompt_tokens")
+            completion_t = usage.get("completion_tokens")
+            # 只有上游传了非零值才采纳（避免被 0 覆盖已估算的值）
+            if isinstance(prompt_t, (int, float)) and prompt_t > 0:
+                self.input_tokens = int(prompt_t)
+            if isinstance(completion_t, (int, float)) and completion_t > 0:
+                self.output_tokens = int(completion_t)
+
         choices = data.get("choices", [])
         if not isinstance(choices, list) or not choices:
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                self.input_tokens = usage.get("prompt_tokens", self.input_tokens)  # type: ignore
-                self.output_tokens = usage.get("completion_tokens", self.output_tokens)  # type: ignore
             return events
 
         choice = choices[0]

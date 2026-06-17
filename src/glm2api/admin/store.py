@@ -101,6 +101,11 @@ class AdminStore:
         self._token_30m_buckets: Dict[int, Dict[str, int]] = collections.defaultdict(
             lambda: {"prompt": 0, "completion": 0, "total": 0}
         )
+        # 复读检测触发统计（用于管理面板「复读率」展示）
+        # _repetition_events: list of {ts, model, path}，最多保留 200 条
+        self._repetition_events: Deque[Dict[str, Any]] = collections.deque(maxlen=200)
+        # _repetition_counter: {(model, path): count}
+        self._repetition_counter: Dict[tuple, int] = collections.Counter()
 
     # -----------------------------------------------------------------
     # Recording
@@ -167,6 +172,45 @@ class AdminStore:
             for k in list(self._token_30m_buckets.keys()):
                 if k < cutoff:
                     del self._token_30m_buckets[k]
+
+    def record_repetition_event(self, model: str, path: str) -> None:
+        """记录一次复读检测触发事件（用于管理面板展示复读率）。
+        
+        参数：
+          model: 触发复读的模型名（如 "glm-5.2"）
+          path: 调用路径（"stream" 或 "non_stream"）
+        """
+        now = time.time()
+        with self._lock:
+            self._repetition_events.append({
+                "ts": now,
+                "model": model,
+                "path": path,
+            })
+            self._repetition_counter[(model, path)] += 1
+
+    def get_repetition_stats(self) -> Dict[str, Any]:
+        """返回复读检测统计（用于管理面板展示）。"""
+        with self._lock:
+            # 最近 24 小时复读事件数
+            cutoff_24h = time.time() - 24 * 3600
+            recent_count = sum(1 for e in self._repetition_events if e["ts"] >= cutoff_24h)
+            # 按 model 分组
+            by_model: Dict[str, int] = collections.Counter()
+            by_path: Dict[str, int] = collections.Counter()
+            for (model, path), count in self._repetition_counter.items():
+                by_model[model] += count
+                by_path[path] += count
+            return {
+                "total_events": sum(self._repetition_counter.values()),
+                "recent_24h_count": recent_count,
+                "by_model": dict(by_model),
+                "by_path": dict(by_path),
+                "recent_events": [
+                    {"ts": e["ts"], "model": e["model"], "path": e["path"]}
+                    for e in list(self._repetition_events)[-20:]
+                ],
+            }
 
     def _hourly_append(self, rec: RequestRecord) -> None:
         hour = int(rec.ts // 3600) * 3600
@@ -303,7 +347,25 @@ class AdminStore:
                 "accounts_active": accounts_active,
                 "accounts_total": accounts_total,
                 "proto_breakdown": proto_breakdown,
+                # 复读检测统计
+                "repetition": self.get_repetition_stats_unlocked(),
             }
+
+    def get_repetition_stats_unlocked(self) -> Dict[str, Any]:
+        """返回复读检测统计（已持锁版本，避免重入）。"""
+        cutoff_24h = time.time() - 24 * 3600
+        recent_count = sum(1 for e in self._repetition_events if e["ts"] >= cutoff_24h)
+        by_model: Dict[str, int] = collections.Counter()
+        by_path: Dict[str, int] = collections.Counter()
+        for (model, path), count in self._repetition_counter.items():
+            by_model[model] += count
+            by_path[path] += count
+        return {
+            "total_events": sum(self._repetition_counter.values()),
+            "recent_24h_count": recent_count,
+            "by_model": dict(by_model),
+            "by_path": dict(by_path),
+        }
 
     def recent_logs(self, limit: int = 100, only_errors: bool = False) -> List[Dict[str, Any]]:
         with self._lock:

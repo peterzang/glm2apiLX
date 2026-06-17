@@ -210,6 +210,15 @@ class GLMWebClient:
                         "检测到 GLM 响应复读循环 model=%s 重试中 (attempt=2/2)",
                         payload.get("model", "unknown"),
                     )
+                    # 记录到 admin store 用于面板展示
+                    try:
+                        from ..admin.store import get_store as _get_admin_store
+                        _get_admin_store().record_repetition_event(
+                            model=str(payload.get("model", "unknown")),
+                            path="non_stream",
+                        )
+                    except Exception:
+                        pass
                     continue  # 重试一次
                 return result, conv_id
             except Exception as exc:
@@ -394,6 +403,32 @@ class GLMWebClient:
             tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
         )
 
+        # 流式复读检测：buffer 一定量文本后再决定是否输出
+        # 避免 codex 长任务场景下复读文本被部分输出后才报错
+        # _rep_buffer：缓存的可见文本 chunk（待 flush）
+        # _rep_buffering：是否还在 buffer 阶段（达到阈值前）
+        # _rep_triggered：是否已检测到复读（防止重复触发）
+        state = {
+            "buffering": True,            # 是否还在 buffer 阶段
+            "buffered_chunks": [],        # 待 flush 的 OpenAI chunk 字节
+            "buffered_text_len": 0,       # 已 buffer 的可见文本长度
+            "rep_triggered": False,       # 是否已触发复读
+        }
+        REP_BUFFER_THRESHOLD = 240  # buffer 240 字符后检测（覆盖大多数复读模式）
+
+        def _build_rep_error_chunk() -> bytes:
+            """构造 OpenAI 兼容的 error chunk，让 codex 等客户端收到 error 后自动重试。
+            以 [DONE] 结束当前流，错误通过单独 chunk 输出。
+            """
+            err_payload = {
+                "error": {
+                    "message": "GLM response detected as repetition loop, please retry",
+                    "type": "upstream_error",
+                    "code": "repetition_loop_detected",
+                }
+            }
+            return f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode("utf-8")
+
         def generate():
             try:
                 for event in self._iter_sse_events(response):
@@ -401,19 +436,89 @@ class GLMWebClient:
                         continue
                     self._raise_for_event_error(event, stream=True)
                     chunks, status = accumulator.consume_event(event)
-                    for chunk in chunks:
-                        yield chunk.encode("utf-8")
+
+                    if state["buffering"] and not state["rep_triggered"]:
+                        # buffer 阶段：累积 chunks 但不 yield
+                        for chunk in chunks:
+                            # 解析 chunk 看是否含 content delta
+                            try:
+                                chunk_str = chunk.decode("utf-8", errors="replace")
+                                # 简单估算：累积所有 chunk 字节，从 accumulator 取真实可见文本长度
+                                state["buffered_chunks"].append(chunk)
+                            except Exception:
+                                state["buffered_chunks"].append(chunk)
+                            # 从 accumulator 获取已累积的可见文本长度
+                            state["buffered_text_len"] = len(accumulator._completion_text_buffer or "")
+
+                            # 达到阈值时检测复读
+                            if state["buffered_text_len"] >= REP_BUFFER_THRESHOLD:
+                                # 用累积文本检测复读
+                                fake_result = {"choices": [{"message": {"content": accumulator._completion_text_buffer}}]}
+                                if self._is_repetition_loop(fake_result):
+                                    # 检测到复读：不发任何 content，直接输出 error chunk
+                                    self.logger.warning(
+                                        "流式路径检测到 GLM 响应复读循环 model=%s 已发 error 让客户端重试",
+                                        payload.get("model", "unknown"),
+                                    )
+                                    from ..admin.store import get_store as _get_admin_store
+                                    try:
+                                        _get_admin_store().record_repetition_event(
+                                            model=str(payload.get("model", "unknown")),
+                                            path="stream",
+                                        )
+                                    except Exception:
+                                        pass
+                                    state["rep_triggered"] = True
+                                    state["buffering"] = False
+                                    state["buffered_chunks"] = []  # 丢弃已 buffer 的 content
+                                    yield _build_rep_error_chunk()
+                                    return
+                                else:
+                                    # 不复读：flush buffer，恢复正常流式
+                                    state["buffering"] = False
+                                    for buffered in state["buffered_chunks"]:
+                                        yield buffered.encode("utf-8") if isinstance(buffered, str) else buffered
+                                    state["buffered_chunks"] = []
+                                    break
+
+                        # 如果还在 buffer 阶段且未达阈值，继续 for 循环（不 yield）
+                        if state["buffering"]:
+                            # 但要检查 finish 状态：如果 finish 了但 buffer 不足阈值，直接 flush
+                            if status in {"finish", "intervene"}:
+                                state["buffering"] = False
+                                for buffered in state["buffered_chunks"]:
+                                    yield buffered.encode("utf-8") if isinstance(buffered, str) else buffered
+                                state["buffered_chunks"] = []
+                                for chunk in accumulator.finalize(
+                                    status=status,
+                                    last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
+                                ):
+                                    yield chunk.encode("utf-8")
+                                return
+                            continue
+
+                    # 非 buffer 阶段（或已 flush）：正常 yield
+                    if not state["rep_triggered"]:
+                        for chunk in chunks:
+                            yield chunk.encode("utf-8")
 
                     if status in {"finish", "intervene"}:
-                        for chunk in accumulator.finalize(
-                            status=status,
-                            last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
-                        ):
-                            yield chunk.encode("utf-8")
+                        if not state["rep_triggered"]:
+                            for chunk in accumulator.finalize(
+                                status=status,
+                                last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
+                            ):
+                                yield chunk.encode("utf-8")
                         return
 
-                for chunk in accumulator.finalize(status="stop"):
-                    yield chunk.encode("utf-8")
+                # 流式结束但没收到 finish 事件
+                if not state["rep_triggered"]:
+                    if state["buffering"]:
+                        # 整个流都未达阈值，flush
+                        for buffered in state["buffered_chunks"]:
+                            yield buffered.encode("utf-8") if isinstance(buffered, str) else buffered
+                    for chunk in accumulator.finalize(status="stop"):
+                        yield chunk.encode("utf-8")
             finally:
                 response.close() # type: ignore
                 self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
