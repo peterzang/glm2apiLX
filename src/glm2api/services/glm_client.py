@@ -198,20 +198,17 @@ class GLMWebClient:
         if n_value > 1:
             return self._chat_completion_n(payload, n_value)
 
-        # 复读检测 + 描述性文本检测：第一次失败时自动重试 1 次
-        # 审核报告 P1 问题：GLM-5.1 在长 prompt + 工具调用场景下偶发复读模式
-        # v4 改进：检测描述性文本（GLM 写 "I'll create..." 但不调工具）
+        # v5 改进：多重试 + prompt 微调（最多 3 次尝试）
+        MAX_ATTEMPTS = 3
         last_exc: Exception | None = None
-        for attempt in range(2):  # 最多 2 次尝试（1 次正常 + 1 次重试）
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 result, conv_id = self._chat_completion_single(payload)
-                # 复读检测：检查响应是否陷入复读模式
-                if attempt == 0 and self._is_repetition_loop(result):
+                if attempt < MAX_ATTEMPTS - 1 and self._is_repetition_loop(result):
                     self.logger.warning(
-                        "检测到 GLM 响应复读循环 model=%s 重试中 (attempt=2/2)",
-                        payload.get("model", "unknown"),
+                        "检测到 GLM 响应复读循环 model=%s 重试中 (attempt=%d/%d)",
+                        payload.get("model", "unknown"), attempt + 2, MAX_ATTEMPTS,
                     )
-                    # 记录到 admin store 用于面板展示
                     try:
                         from ..admin.store import get_store as _get_admin_store
                         _get_admin_store().record_repetition_event(
@@ -220,40 +217,57 @@ class GLMWebClient:
                         )
                     except Exception:
                         pass
-                    continue  # 重试一次
+                    payload = self._inject_retry_hint(payload)
+                    continue
                 return result, conv_id
             except Exception as exc:
                 last_exc = exc
-                # 描述性文本异常：重试一次
-                if attempt == 0 and "descriptive_text_without_tool_call" in str(exc):
+                if attempt < MAX_ATTEMPTS - 1 and "descriptive_text_without_tool_call" in str(exc):
                     self.logger.warning(
-                        "检测到 GLM 描述性文本未调用工具 model=%s 重试中 (attempt=2/2)",
-                        payload.get("model", "unknown"),
+                        "检测到 GLM 描述性文本未调用工具 model=%s 重试中 (attempt=%d/%d)",
+                        payload.get("model", "unknown"), attempt + 2, MAX_ATTEMPTS,
+                    )
+                    payload = self._inject_retry_hint(payload)
+                    continue
+                if attempt < MAX_ATTEMPTS - 1:
+                    self.logger.warning(
+                        "GLM 请求失败 重试中 model=%s error=%s (attempt=%d/%d)",
+                        payload.get("model", "unknown"), exc, attempt + 2, MAX_ATTEMPTS,
                     )
                     continue
-                # 其他异常：重试一次
-                if attempt == 0:
-                    self.logger.warning(
-                        "GLM 请求失败 重试中 model=%s error=%s",
-                        payload.get("model", "unknown"), exc,
-                    )
-                    continue
-                # 重试仍失败：如果是描述性文本异常，返回原始响应而不是报错
                 if "descriptive_text_without_tool_call" in str(exc):
                     self.logger.warning(
-                        "GLM 描述性文本重试仍失败 model=%s 返回原始响应",
-                        payload.get("model", "unknown"),
+                        "GLM 描述性文本 %d 次重试仍失败 model=%s 返回原始响应",
+                        MAX_ATTEMPTS, payload.get("model", "unknown"),
                     )
-                    # 直接再调一次但不检测描述性文本（返回原始响应给客户端）
                     try:
                         return self._chat_completion_single_no_descriptive_check(payload)
                     except Exception:
-                        pass  # 如果这次也失败，走下面的 raise
+                        pass
                 raise
         if last_exc:
             raise last_exc
-        # 兜底（理论上不会到达）
         return self._chat_completion_single(payload)
+
+    def _inject_retry_hint(self, payload: dict[str, object]) -> dict[str, object]:
+        """重试时微调 prompt：在 user message 前加一条强制工具调用指令。"""
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return payload
+        payload = dict(payload)
+        messages = list(messages)
+        hint = {
+            "role": "system",
+            "content": "IMPORTANT RETRY HINT: Your previous response did not call any tool. You MUST call a tool in this response. Do not write descriptions, plans, or explanations. Output the tool call XML immediately.",
+        }
+        insert_pos = 0
+        for i, msg in enumerate(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                insert_pos = i
+                break
+        messages.insert(insert_pos, hint)
+        payload["messages"] = messages
+        return payload
 
     def _is_repetition_loop(self, result: dict[str, object]) -> bool:
         """检测响应是否陷入复读模式（同一句话重复 N 次以上）。

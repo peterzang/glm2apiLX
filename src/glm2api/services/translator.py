@@ -139,7 +139,44 @@ def sanitize_tool_call_payload(
             if is_powershell_command and not is_shell_host:
                 cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
 
+        # === M3 修复：bash heredoc 引号转义修复 ===
+        # GLM-5.2 在生成含 heredoc + 嵌套引号的 bash 命令时，引号转义能力不足：
+        #   #"'!/usr/bin/env python3  →  应为 #!/usr/bin/env python3
+        #   task['"'id']              →  应为 task['id']
+        #   task['"'title']           →  应为 task['title']
+        # 这些诡异转义破坏了 bash 语法，导致 heredoc 文件创建失败。
+        # 在这里对 shell 命令做后处理修复。
+        final_command = cleaned.get("command")
+        if isinstance(final_command, list):
+            cleaned["command"] = [
+                _fix_bash_quote_escaping(part) if isinstance(part, str) else part
+                for part in final_command
+            ]
+        elif isinstance(final_command, str):
+            cleaned["command"] = _fix_bash_quote_escaping(final_command)
+
     return cleaned
+
+
+def _fix_bash_quote_escaping(text: str) -> str:
+    """修复 GLM-5.2 生成的 bash 命令中的引号转义错误。
+
+    已知 bug 模式（v3-v5 审核报告 M3）：
+      1. #"'!    →  #!       （shebang 行的诡异转义：# + " + ' + !）
+      2. '"'      →  '         （单引号被双引号包裹：' + " + ' → '）
+      3. \\"'     →  '         （转义单引号）
+
+    这些模式出现在 heredoc 内容里，破坏了 bash 语法解析。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    # 模式 1：#"'!  →  #!（3 字符序列 " + ' 在 # 后面）
+    text = text.replace('#"\'!', '#!')
+    # 模式 2：'"'  →  '（3 字符序列 ' + " + ' 替换为单个 '）
+    text = text.replace('\'"\'', '\'')
+    # 模式 3：\\"'  →  '（转义双引号+单引号）
+    text = text.replace('\\"\'', '\'')
+    return text
 
 
 def sanitize_tool_calls(
