@@ -37,6 +37,11 @@ from ..core.model_variants import split_model_features
 from ..core.model_profiles import get_model_profile
 from ..services.glm_client import GLMWebClient, UpstreamAPIError, QueueTimeoutError
 from ..services.upstream_discovery import get_upstream_discovery, to_dict as upstream_assistant_to_dict
+from ..services.models_registry import (
+    get_unified_models,
+    get_orphan_assistants,
+    to_dict as unified_model_to_dict,
+)
 from .store import (
     GLOBAL_STORE,
     RequestRecord,
@@ -338,79 +343,71 @@ def _handle_config(handler, config: AppConfig, glm_client: GLMWebClient, logger:
 
 
 def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
-    """返回真实上游助手列表 + 本地 OpenAI 兼容模型列表。
+    """返回统一模型列表（单一数据源，前后端一致）。
 
-    真实助手列表来自 services/upstream_discovery.py：
-      - 拉 chatglm.cn 主页 → 解析 main.<hash>.js URL → 拉 main.js → 提取 24-hex assistant_id
-      - 并发调 /backend-api/assistant/info 拉每个助手详情
-      - 内存缓存 30 分钟
-
-    本地 OpenAI 兼容模型来自 config.exposed_models（BUILTIN_EXPOSED_MODELS 展开），
-    是项目对外暴露的 OpenAI Chat Completions 协议层模型名。
+    设计目标（用户原话："不要搞的前端是 20 几个模型后端又是几个模型的要统一获取模型"）：
+      - 单一 models 列表：所有地方（/v1/models, /admin/api/models, /admin/api/probe,
+        /admin/api/probe_model）看到的模型列表完全一致
+      - 每个模型附加真实上游助手元数据（upstream_name / upstream_avatar 等），
+        不再分成 upstream + local 两个独立列表
+      - "孤儿助手"（真实助手中没有对应本地模型别名的）单独返回到 orphan_assistants，
+        前端可折叠展示，提醒用户这些助手目前无法通过 OpenAI API 调用
 
     返回结构：
       {
-        "upstream": {
-          "cache": {...},
-          "assistants": [...]
-        },
-        "local": {
-          "total": 74,
-          "base_count": 20,
-          "models": [...]
-        }
+        "total": 82,                  # 模型总数（= config.exposed_models 长度）
+        "base_count": 22,             # 基础模型数
+        "models": [...],              # 统一模型列表（含真实助手元数据 + 探针结果）
+        "orphan_assistants": [...],   # 未映射到本地模型的真实助手
+        "upstream_cache": {...}       # 上游助手缓存状态
       }
     """
-    # --- 真实上游助手 ---
-    discovery = get_upstream_discovery(config, logger, glm_client.auth)
-    assistants = discovery.discover(force_refresh=False)
-    cache_info = discovery.get_cache_info()
-    upstream_payload = {
-        "cache": cache_info,
-        "assistants": [upstream_assistant_to_dict(a) for a in assistants],
-    }
-
-    # --- 本地 OpenAI 兼容模型 ---
-    image_model = config.glm_image_model_name
+    # 拉取探针缓存
     probe_cache = get_store().get_model_probe_cache()
-    local_models: list[dict[str, Any]] = []
-    for model_id in config.exposed_models:
-        base, features = split_model_features(model_id)
-        profile = get_model_profile(base)
-        local_models.append({
-            "id": model_id,
-            "base": base,
-            "features": sorted(features),
-            "is_variant": bool(features),
-            "is_image_model": model_id == image_model,
-            "profile": {
-                "native_function_calling": profile.native_function_calling,
-                "preferred_format": profile.preferred_format,
-            },
-            "last_probe": probe_cache.get(model_id),
-        })
-    base_count = len({m["base"] for m in local_models})
-    local_payload = {
-        "total": len(local_models),
-        "base_count": base_count,
-        "models": local_models,
-    }
+    # 构造统一模型列表（内部会拉取真实助手元数据）
+    models = get_unified_models(
+        config, logger, glm_client.auth,
+        probe_cache=probe_cache,
+        fetch_upstream=True,
+    )
+    # 获取孤儿助手（未映射的真实助手）
+    orphans = get_orphan_assistants(config, logger, glm_client.auth)
+    # 上游缓存信息
+    discovery = get_upstream_discovery(config, logger, glm_client.auth)
+    upstream_cache = discovery.get_cache_info()
+    # 统计
+    base_count = len({m.base for m in models})
 
     _send_json(handler, HTTPStatus.OK, {
-        "upstream": upstream_payload,
-        "local": local_payload,
+        "total": len(models),
+        "base_count": base_count,
+        "models": [unified_model_to_dict(m) for m in models],
+        "orphan_assistants": [upstream_assistant_to_dict(a) for a in orphans],
+        "upstream_cache": upstream_cache,
     }, config)
 
 
 def _handle_upstream_refresh(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
-    """强制刷新真实上游助手列表（绕过缓存）。"""
+    """强制刷新真实上游助手列表（绕过缓存）。
+
+    刷新后下次调 /admin/api/models 会自动看到新的助手元数据。
+    """
     discovery = get_upstream_discovery(config, logger, glm_client.auth)
-    assistants = discovery.discover(force_refresh=True)
+    discovery.discover(force_refresh=True)
     cache_info = discovery.get_cache_info()
+    # 顺便返回新的统一模型列表（前端刷新后立即更新 UI）
+    probe_cache = get_store().get_model_probe_cache()
+    models = get_unified_models(
+        config, logger, glm_client.auth,
+        probe_cache=probe_cache,
+        fetch_upstream=True,
+    )
+    orphans = get_orphan_assistants(config, logger, glm_client.auth)
     _send_json(handler, HTTPStatus.OK, {
         "ok": True,
         "cache": cache_info,
-        "assistants": [upstream_assistant_to_dict(a) for a in assistants],
+        "models": [unified_model_to_dict(m) for m in models],
+        "orphan_assistants": [upstream_assistant_to_dict(a) for a in orphans],
     }, config)
 
 

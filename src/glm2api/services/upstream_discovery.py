@@ -214,27 +214,40 @@ class UpstreamDiscovery:
         return results
 
     def _fetch_one_assistant(self, assistant_id: str) -> UpstreamAssistant:
-        """拉单个助手详情。"""
-        # 用账号 0 的 token（游客模式也有权访问 assistant/info）
-        access_token = self.auth.get_access_token_for_account(0)
-        device_id = self.auth.get_device_id_for_account(0)
+        """拉单个助手详情。
+
+        账号选择策略：随机选一个账号，避免所有探针请求都打到账号 0 触发风控。
+        """
+        import random
+        account_count = self.auth.get_account_count()
+        account_index = random.randint(0, max(0, account_count - 1))
+        access_token = self.auth.get_access_token_for_account(account_index)
+        device_id = self.auth.get_device_id_for_account(account_index)
         headers = self.auth.get_browser_headers(app_fr="default")
         headers.update({
             "Authorization": f"Bearer {access_token}",
             "X-Device-Id": device_id,
             "Referer": "https://chatglm.cn/main/chat",
             "X-App-Fr": "default",
-            "Accept-Encoding": "identity",  # 强制不压缩，避免 gzip 解压问题
+            "Accept-Encoding": "identity",  # 强制不压缩，避免 gzip/deflate 解压问题
         })
         url = f"{self.config.glm_base_url}/backend-api/assistant/info?assistant_id={assistant_id}"
         req = urllib.request.Request(url, method="GET", headers=headers)
         with urllib.request.urlopen(req, timeout=15) as r:
             body = r.read()
-            if r.headers.get("Content-Encoding", "").lower() == "gzip":
+            encoding = r.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
                 body = gzip.decompress(body)
+            elif encoding == "deflate":
+                import zlib
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    # 兼容 raw deflate（无 zlib header）
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
             text = body.decode("utf-8", errors="replace")
             payload = json.loads(text)
-        
+
         result = payload.get("result") or {}
         return UpstreamAssistant(
             assistant_id=assistant_id,
@@ -252,7 +265,7 @@ class UpstreamDiscovery:
         )
 
     def _fetch_text(self, url: str, headers: Dict[str, str], timeout: int) -> str:
-        """通用 GET 拉取（自动解压 gzip）。"""
+        """通用 GET 拉取（自动解压 gzip / deflate）。"""
         full_headers = {
             "User-Agent": self.config.glm_user_agent,
             "Accept-Encoding": "gzip, deflate",
@@ -261,8 +274,15 @@ class UpstreamDiscovery:
         req = urllib.request.Request(url, headers=full_headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
-            if r.headers.get("Content-Encoding", "").lower() == "gzip":
+            encoding = r.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
                 body = gzip.decompress(body)
+            elif encoding == "deflate":
+                import zlib
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    body = zlib.decompress(body, -zlib.MAX_WBITS)
             return body.decode("utf-8", errors="replace")
 
 

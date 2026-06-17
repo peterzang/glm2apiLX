@@ -262,13 +262,15 @@ class AdminStore:
             accounts_active = sum(1 for s in self._account_stats.values() if s.get("last_used_ts", 0) > 0)
             accounts_total = len(self._account_stats)
             # 协议分类（chat / models / images / admin / meta / other）
+            # "meta" 协议包含 /v1/models / /v1/models/{id} / /health，
+            # 这里把 meta 全算到 models（健康检查占比小，可接受）
             proto_breakdown = {
-                "chat": sum(c for p, c in protocols.items() if p == "openai-chat" or p == "anthropic" or p == "openai-responses" or p == "openai-legacy"),
-                "models": protocols.get("meta", 0),  # /v1/models / /health 都算 meta
+                "chat": sum(c for p, c in protocols.items() if p in ("openai-chat", "anthropic", "openai-responses", "openai-legacy")),
+                "models": protocols.get("meta", 0),
                 "images": protocols.get("openai-images", 0),
                 "embeddings": protocols.get("openai-embeddings", 0),
                 "moderations": protocols.get("openai-moderations", 0),
-                "other": sum(c for p, c in protocols.items() if p == "other"),
+                "other": protocols.get("other", 0),
             }
             return {
                 "now": now,

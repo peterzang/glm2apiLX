@@ -699,58 +699,96 @@ let _probingAll = false;        // 防止"全部探针"按钮被重复点击
 async function refreshModels() {
   const data = await api('models');
   _modelsCache = data;
-  const upstream = data.upstream || {};
-  const local = data.local || {};
-  const assistants = upstream.assistants || [];
-  const localModels = local.models || [];
-  const cache = upstream.cache || {};
+  const models = data.models || [];
+  const orphans = data.orphan_assistants || [];
+  const cache = data.upstream_cache || {};
 
-  // 统计真实助手
-  const okAssistants = assistants.filter(a => !a.fetch_error);
-  const failAssistants = assistants.filter(a => a.fetch_error);
-  const enabledCount = okAssistants.filter(a => a.enabled).length;
-  const knownCount = okAssistants.filter(a => a.is_known).length;
-  const cacheAge = cache.cache_age_seconds ? Math.round(cache.cache_age_seconds / 60) : 0;
-  const cacheTtl = Math.round((cache.cache_ttl_seconds || 1800) / 60);
-
-  // 统计本地模型
-  const probed = localModels.filter(m => m.last_probe);
+  // 统计
+  const probed = models.filter(m => m.last_probe);
   const okCount = probed.filter(m => m.last_probe.ok).length;
   const failCount = probed.length - okCount;
-  const imageCount = localModels.filter(m => m.is_image_model).length;
-  const variantCount = localModels.filter(m => m.is_variant).length;
+  const imageCount = models.filter(m => m.is_image_model).length;
+  const variantCount = models.filter(m => m.is_variant).length;
+  const withUpstream = models.filter(m => m.upstream_name).length;
+  const cacheAge = cache.cache_age_seconds ? Math.round(cache.cache_age_seconds / 60) : 0;
+  const cacheTtl = Math.round((cache.cache_ttl_seconds || 1800) / 60);
 
   const html = `
     <div class="kpi-grid">
       <div class="kpi-card info">
-        <div class="kpi-label">真实上游助手</div>
-        <div class="kpi-value">${okAssistants.length}</div>
-        <div class="kpi-sub">${failAssistants.length} 个拉取失败 · ${knownCount} 个项目内置</div>
+        <div class="kpi-label">模型总数</div>
+        <div class="kpi-value">${data.total || 0}</div>
+        <div class="kpi-sub">基础 ${data.base_count || 0} · 变体 ${variantCount} · 图像 ${imageCount}</div>
       </div>
       <div class="kpi-card success">
-        <div class="kpi-label">已启用助手</div>
-        <div class="kpi-value">${enabledCount}</div>
-        <div class="kpi-sub">enabled=true</div>
+        <div class="kpi-label">探测可用</div>
+        <div class="kpi-value">${okCount}</div>
+        <div class="kpi-sub">已探测 ${probed.length} / ${models.length} · 失败 ${failCount}</div>
+      </div>
+      <div class="kpi-card ${withUpstream === 0 ? 'warning' : ''}">
+        <div class="kpi-label">关联真实助手</div>
+        <div class="kpi-value">${withUpstream}</div>
+        <div class="kpi-sub">来自 chatglm.cn 实时拉取 · 孤儿助手 ${orphans.length} 个</div>
       </div>
       <div class="kpi-card ${cacheAge >= cacheTtl - 5 ? 'warning' : ''}">
-        <div class="kpi-label">缓存年龄</div>
+        <div class="kpi-label">上游缓存</div>
         <div class="kpi-value" style="font-size:18px;">${cacheAge} 分钟</div>
         <div class="kpi-sub">TTL ${cacheTtl} 分钟 · ${cache.cached ? '已缓存' : '未缓存'}</div>
-      </div>
-      <div class="kpi-card warning">
-        <div class="kpi-label">本地 OpenAI 兼容模型</div>
-        <div class="kpi-value">${local.total || 0}</div>
-        <div class="kpi-sub">基础 ${local.base_count || 0} · 变体 ${variantCount}</div>
       </div>
     </div>
 
     <div class="panel">
       <div class="panel-header">
-        <div class="panel-title">真实上游助手（从 chatglm.cn 实时拉取）</div>
+        <div class="panel-title">统一模型列表（本地兼容模型 + 关联真实助手元数据）</div>
         <div class="panel-meta">
-          <button id="models-upstream-refresh" class="btn btn-primary btn-sm">🔄 强制刷新上游</button>
-          <span class="text-muted" style="margin-left:8px;font-size:11px;">main.js: ${escapeHtml(cache.main_js_url || '-')}</span>
+          <button id="models-upstream-refresh" class="btn btn-ghost btn-sm">刷新上游</button>
+          <button id="models-probe-all" class="btn btn-primary btn-sm" style="margin-left:8px;">${_probingAll ? '探针中…' : '全部探针'}</button>
+          <button id="models-clear-probe" class="btn btn-ghost btn-sm" style="margin-left:8px;">清除探针</button>
         </div>
+      </div>
+      <div class="panel-body">
+        <div class="filter-bar" style="margin-bottom:12px;">
+          <label>过滤:
+            <input type="text" id="models-filter" placeholder="按 model id / 助手名过滤..." style="background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-light);border-radius:4px;padding:4px 8px;font-size:13px;width:240px;" />
+          </label>
+          <label>状态:
+            <select id="models-status-filter" style="background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-light);border-radius:4px;padding:4px 8px;font-size:13px;">
+              <option value="all">全部</option>
+              <option value="ok">✅ 可用</option>
+              <option value="fail">❌ 失败</option>
+              <option value="unprobed">⏳ 未探测</option>
+            </select>
+          </label>
+          <span class="text-muted" style="font-size:11px;margin-left:auto;">main.js: ${escapeHtml(cache.main_js_url || '-')}</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>模型 ID</th>
+                <th>基础</th>
+                <th>特性</th>
+                <th>类型</th>
+                <th>关联上游助手</th>
+                <th>最近探针</th>
+                <th>延迟</th>
+                <th>账号</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="models-tbody">
+              ${models.map(m => renderUnifiedModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    ${orphans.length > 0 ? `
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">未映射助手（${orphans.length} 个，目前无法通过 OpenAI API 调用）</div>
+        <div class="panel-meta">如需调用这些助手，请在 config.py 的 BUILTIN_EXPOSED_MODELS 添加对应别名</div>
       </div>
       <div class="panel-body">
         <div class="table-wrapper">
@@ -763,62 +801,15 @@ async function refreshModels() {
                 <th>描述</th>
                 <th>scope</th>
                 <th>状态</th>
-                <th>项目角色</th>
-                <th>starter_prompts</th>
               </tr>
             </thead>
             <tbody>
-              ${assistants.map(a => renderUpstreamAssistantRow(a)).join('') || `<tr><td colspan="8" class="empty-state">无数据</td></tr>`}
+              ${orphans.map(a => renderOrphanAssistantRow(a)).join('')}
             </tbody>
           </table>
         </div>
       </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-header">
-        <div class="panel-title">本地 OpenAI 兼容模型（用于端点测试）</div>
-        <div class="panel-meta">
-          <button id="models-probe-all" class="btn btn-primary btn-sm">${_probingAll ? '探针中…' : '🧪 全部探针'}</button>
-          <button id="models-clear-probe" class="btn btn-ghost btn-sm" style="margin-left:8px;">清除探针结果</button>
-        </div>
-      </div>
-      <div class="panel-body">
-        <div class="filter-bar" style="margin-bottom:12px;">
-          <label>过滤:
-            <input type="text" id="models-filter" placeholder="按名称过滤..." style="background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-light);border-radius:4px;padding:4px 8px;font-size:13px;width:220px;" />
-          </label>
-          <label>状态:
-            <select id="models-status-filter" style="background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-light);border-radius:4px;padding:4px 8px;font-size:13px;">
-              <option value="all">全部</option>
-              <option value="ok">✅ 可用</option>
-              <option value="fail">❌ 失败</option>
-              <option value="unprobed">⏳ 未探测</option>
-            </select>
-          </label>
-        </div>
-        <div class="table-wrapper">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>模型 ID</th>
-                <th>基础模型</th>
-                <th>特性</th>
-                <th>类型</th>
-                <th>协议</th>
-                <th>最近探针</th>
-                <th>延迟</th>
-                <th>账号</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="models-tbody">
-              ${localModels.map(m => renderLocalModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    </div>` : ''}
   `;
   document.getElementById('view-models').innerHTML = html;
 
@@ -833,46 +824,27 @@ async function refreshModels() {
   });
 }
 
-function renderUpstreamAssistantRow(a) {
-  const avatarCell = a.avatar
-    ? `<img src="${escapeHtml(a.avatar)}" alt="" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';" />`
-    : `<div style="width:32px;height:32px;border-radius:50%;background:var(--bg-elevated);display:flex;align-items:center;justify-content:center;font-size:14px;">🤖</div>`;
-  const statusBadge = a.fetch_error
-    ? `<span class="badge badge-error" title="${escapeHtml(a.fetch_error)}">❌ 拉取失败</span>`
-    : a.enabled
-      ? `<span class="badge badge-success">✅ 已启用</span>`
-      : `<span class="badge badge-muted">⏸ 已禁用</span>`;
-  const knownBadge = a.is_known
-    ? `<span class="badge badge-purple">${escapeHtml(a.known_role)}</span>`
-    : `<span class="text-muted">-</span>`;
-  const prompts = (a.starter_prompts || []).slice(0, 3).map(p =>
-    `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">• ${escapeHtml(p.length > 40 ? p.slice(0, 40) + '...' : p)}</div>`
-  ).join('');
-  const description = a.description
-    ? escapeHtml(a.description.length > 80 ? a.description.slice(0, 80) + '...' : a.description)
-    : '<span class="text-muted">-</span>';
-  return `
-    <tr>
-      <td>${avatarCell}</td>
-      <td><strong>${escapeHtml(a.name || '(无名)')}</strong></td>
-      <td class="mono" style="font-size:11px;">${escapeHtml(a.assistant_id)}</td>
-      <td style="font-size:12px;max-width:300px;">${description}</td>
-      <td class="mono">${a.scope}</td>
-      <td>${statusBadge}</td>
-      <td>${knownBadge}</td>
-      <td style="max-width:200px;">${prompts || '<span class="text-muted">-</span>'}</td>
-    </tr>
-  `;
-}
-
-function renderLocalModelRow(m) {
+function renderUnifiedModelRow(m) {
   const features = (m.features || []).map(f => `<span class="badge badge-info">${escapeHtml(f)}</span>`).join(' ');
   const typeBadge = m.is_image_model
     ? `<span class="badge badge-warning">图像</span>`
     : m.is_variant
       ? `<span class="badge badge-muted">变体</span>`
       : `<span class="badge badge-success">基础</span>`;
-  const profile = m.profile || {};
+  // 关联上游助手（avatar + name）
+  let upstreamCell;
+  if (m.upstream_name) {
+    const avatar = m.upstream_avatar
+      ? `<img src="${escapeHtml(m.upstream_avatar)}" alt="" style="width:20px;height:20px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:6px;" onerror="this.style.display='none';" />`
+      : '';
+    const enabledBadge = m.upstream_enabled
+      ? ''
+      : ` <span class="badge badge-muted" style="font-size:9px;">已禁用</span>`;
+    upstreamCell = `${avatar}<span class="text-muted" style="font-size:12px;">${escapeHtml(m.upstream_name)}</span>${enabledBadge}`;
+  } else {
+    upstreamCell = '<span class="text-muted">-</span>';
+  }
+  // 探针徽章
   const probe = m.last_probe;
   let probeBadge, latencyStr, accountStr;
   if (!probe) {
@@ -889,12 +861,12 @@ function renderLocalModelRow(m) {
     accountStr = probe.account_index >= 0 ? `#${probe.account_index}` : '-';
   }
   return `
-    <tr data-model-id="${escapeHtml(m.id)}" data-probe-ok="${probe ? (probe.ok ? 'ok' : 'fail') : 'unprobed'}">
+    <tr data-model-id="${escapeHtml(m.id)}" data-probe-ok="${probe ? (probe.ok ? 'ok' : 'fail') : 'unprobed'}" data-upstream-name="${escapeHtml(m.upstream_name || '').toLowerCase()}">
       <td class="mono" style="font-size:12px;">${escapeHtml(m.id)}</td>
       <td class="mono text-muted" style="font-size:12px;">${escapeHtml(m.base)}</td>
       <td>${features || '<span class="text-muted">-</span>'}</td>
       <td>${typeBadge}</td>
-      <td class="mono text-muted" style="font-size:11px;">${escapeHtml(profile.preferred_format || '-')}</td>
+      <td>${upstreamCell}</td>
       <td>${probeBadge}</td>
       <td class="mono">${latencyStr}</td>
       <td class="mono text-muted">${accountStr}</td>
@@ -903,10 +875,34 @@ function renderLocalModelRow(m) {
   `;
 }
 
+function renderOrphanAssistantRow(a) {
+  const avatarCell = a.avatar
+    ? `<img src="${escapeHtml(a.avatar)}" alt="" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';" />`
+    : `<div style="width:32px;height:32px;border-radius:50%;background:var(--bg-elevated);display:flex;align-items:center;justify-content:center;font-size:14px;">🤖</div>`;
+  const statusBadge = a.fetch_error
+    ? `<span class="badge badge-error" title="${escapeHtml(a.fetch_error)}">❌ 拉取失败</span>`
+    : a.enabled
+      ? `<span class="badge badge-success">✅ 已启用</span>`
+      : `<span class="badge badge-muted">⏸ 已禁用</span>`;
+  const description = a.description
+    ? escapeHtml(a.description.length > 80 ? a.description.slice(0, 80) + '...' : a.description)
+    : '<span class="text-muted">-</span>';
+  return `
+    <tr>
+      <td>${avatarCell}</td>
+      <td><strong>${escapeHtml(a.name || '(无名)')}</strong></td>
+      <td class="mono" style="font-size:11px;">${escapeHtml(a.assistant_id)}</td>
+      <td style="font-size:12px;max-width:300px;">${description}</td>
+      <td class="mono">${a.scope}</td>
+      <td>${statusBadge}</td>
+    </tr>
+  `;
+}
+
 async function handleUpstreamRefresh() {
   const btn = document.getElementById('models-upstream-refresh');
-  if (btn) { btn.disabled = true; btn.textContent = '🔄 刷新中...'; }
-  showToast('正在强制刷新上游助手列表（拉主页 + main.js + 23 次 assistant/info）...', 'info');
+  if (btn) { btn.disabled = true; btn.textContent = '刷新中...'; }
+  showToast('正在强制刷新上游助手列表...', 'info');
   try {
     await api('upstream_refresh', { method: 'POST', body: {} });
     showToast('✅ 上游助手列表已刷新', 'success');
@@ -914,7 +910,7 @@ async function handleUpstreamRefresh() {
   } catch (err) {
     showToast('刷新失败: ' + err.message, 'error');
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '🔄 强制刷新上游'; }
+    if (btn) { btn.disabled = false; btn.textContent = '刷新上游'; }
   }
 }
 
@@ -923,8 +919,9 @@ function applyModelFilter() {
   const status = document.getElementById('models-status-filter').value;
   document.querySelectorAll('#models-tbody tr[data-model-id]').forEach(tr => {
     const id = (tr.dataset.modelId || '').toLowerCase();
+    const upstreamName = (tr.dataset.upstreamName || '').toLowerCase();
     const ok = tr.dataset.probeOk;
-    const matchQ = !q || id.includes(q);
+    const matchQ = !q || id.includes(q) || upstreamName.includes(q);
     const matchS = status === 'all' || ok === status;
     tr.style.display = (matchQ && matchS) ? '' : 'none';
   });
@@ -953,11 +950,11 @@ async function handleProbeModel(modelId) {
 
 async function handleProbeAll() {
   if (_probingAll) return;
-  if (!_modelsCache || !_modelsCache.local || !_modelsCache.local.models) return;
+  if (!_modelsCache || !_modelsCache.models) return;
   _probingAll = true;
   const btn = document.getElementById('models-probe-all');
   if (btn) { btn.disabled = true; btn.textContent = '探针中…'; }
-  const models = _modelsCache.local.models;
+  const models = _modelsCache.models;
   let okCount = 0, failCount = 0;
   showToast(`开始批量探针 ${models.length} 个模型...`, 'info');
   for (let i = 0; i < models.length; i++) {
@@ -971,19 +968,16 @@ async function handleProbeAll() {
     }
   }
   _probingAll = false;
-  if (btn) { btn.disabled = false; btn.textContent = '🧪 全部探针'; }
+  if (btn) { btn.disabled = false; btn.textContent = '全部探针'; }
   showToast(`批量探针完成：✅ ${okCount} 可用 / ❌ ${failCount} 失败`, failCount > 0 ? 'warning' : 'success');
   await refreshModels();
 }
 
 async function handleClearProbe() {
   // 没有专门的后端端点，直接前端重渲染（缓存还在后端，但下次 probe 会覆盖）
-  // 简化：通过重新拉取 models 端点，因为 last_probe 还是会有；这里实际上需要后端清理
-  // 暂用前端隐藏：清空所有 last_probe 显示
   if (!confirm('确认清除所有模型的探针结果？')) return;
-  // 前端临时清空：直接重渲染但不显示探针状态
-  if (_modelsCache && _modelsCache.local && _modelsCache.local.models) {
-    _modelsCache.local.models = _modelsCache.local.models.map(m => ({ ...m, last_probe: null }));
+  if (_modelsCache && _modelsCache.models) {
+    _modelsCache.models = _modelsCache.models.map(m => ({ ...m, last_probe: null }));
     refreshModelsUI();
     showToast('已清除探针结果（后端缓存仍在，下次探测会覆盖）', 'info');
   }
@@ -992,12 +986,10 @@ async function handleClearProbe() {
 // 仅刷新 UI（不重新拉 API），用于 clear probe 后立即生效
 function refreshModelsUI() {
   if (!_modelsCache) return;
-  const data = _modelsCache;
-  const localPayload = data.local || {};
-  const models = localPayload.models || [];
+  const models = _modelsCache.models || [];
   const tbody = document.getElementById('models-tbody');
   if (tbody) {
-    tbody.innerHTML = models.map(m => renderLocalModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`;
+    tbody.innerHTML = models.map(m => renderUnifiedModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`;
     document.querySelectorAll('[data-probe-model]').forEach(btn => {
       btn.addEventListener('click', () => handleProbeModel(btn.dataset.probeModel));
     });
@@ -1026,8 +1018,7 @@ async function refreshProbe() {
       // 静默失败，下面会显示错误
     }
   }
-  const localPayload = (modelsData && modelsData.local) || {};
-  const models = localPayload.models || [];
+  const models = (modelsData && modelsData.models) || [];
   const sorted = [...models].sort((a, b) => {
     if (a.is_variant !== b.is_variant) return a.is_variant ? 1 : -1;
     return a.id.localeCompare(b.id);

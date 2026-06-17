@@ -425,16 +425,7 @@ class GLM2APIServer:
                     logger.info("收到 chat 请求 model=%s", payload.get("model"))
                     result, conversation_id = glm_client.chat_completion(payload)
                     # 记录 token 使用量到 admin store（用于仪表盘 KPI）
-                    try:
-                        usage = result.get("usage") if isinstance(result, dict) else None
-                        if usage and isinstance(usage, dict):
-                            from .admin.store import get_store as _get_admin_store
-                            _get_admin_store().record_token_usage(
-                                int(usage.get("prompt_tokens", 0) or 0),
-                                int(usage.get("completion_tokens", 0) or 0),
-                            )
-                    except Exception:
-                        pass
+                    self._record_token_usage(result)
                     self._write_json(HTTPStatus.OK, result)
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)
@@ -557,6 +548,7 @@ class GLM2APIServer:
 
                 result, _ = glm_client.chat_completion(openai_payload)
                 response = openai_to_anthropic_response(result, model)
+                self._record_token_usage(result)
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
@@ -612,6 +604,7 @@ class GLM2APIServer:
 
                 result, _ = glm_client.chat_completion(openai_payload)
                 response = openai_to_responses(result, model)
+                self._record_token_usage(result)
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
@@ -730,6 +723,27 @@ class GLM2APIServer:
                 logger.info("流式请求完成 model=%s", model)
 
             # ---- OpenAI-compat endpoint handlers ----
+
+            def _record_token_usage(self, result: object) -> None:
+                """从 chat_completion 响应中提取 token 用量并记录到 admin store。
+
+                用于仪表盘 KPI（token_totals / token_30m / RPM）。
+                在 /v1/chat/completions / /v1/messages / /v1/responses 三个端点的
+                非流式成功路径调用。流式路径暂不记录（需要从累加器提取，复杂度高）。
+                """
+                try:
+                    if not isinstance(result, dict):
+                        return
+                    usage = result.get("usage")
+                    if not isinstance(usage, dict):
+                        return
+                    from .admin.store import get_store as _get_admin_store
+                    _get_admin_store().record_token_usage(
+                        int(usage.get("prompt_tokens", 0) or 0),
+                        int(usage.get("completion_tokens", 0) or 0),
+                    )
+                except Exception:
+                    pass  # 永不让 metrics 影响主请求
 
             def _model_info(self, model_id: str) -> dict[str, object]:
                 """Build OpenAI-format model info object.
