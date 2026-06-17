@@ -36,6 +36,7 @@ from ..config import AppConfig
 from ..core.model_variants import split_model_features
 from ..core.model_profiles import get_model_profile
 from ..services.glm_client import GLMWebClient, UpstreamAPIError, QueueTimeoutError
+from ..services.upstream_discovery import get_upstream_discovery, to_dict as upstream_assistant_to_dict
 from .store import (
     GLOBAL_STORE,
     RequestRecord,
@@ -337,33 +338,46 @@ def _handle_config(handler, config: AppConfig, glm_client: GLMWebClient, logger:
 
 
 def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
-    """列出当前服务暴露的所有模型（含变体）+ 元信息 + 最近探针结果。
+    """返回真实上游助手列表 + 本地 OpenAI 兼容模型列表。
+
+    真实助手列表来自 services/upstream_discovery.py：
+      - 拉 chatglm.cn 主页 → 解析 main.<hash>.js URL → 拉 main.js → 提取 24-hex assistant_id
+      - 并发调 /backend-api/assistant/info 拉每个助手详情
+      - 内存缓存 30 分钟
+
+    本地 OpenAI 兼容模型来自 config.exposed_models（BUILTIN_EXPOSED_MODELS 展开），
+    是项目对外暴露的 OpenAI Chat Completions 协议层模型名。
 
     返回结构：
       {
-        "total": 74,
-        "base_count": 20,
-        "models": [
-          {
-            "id": "glm-4-flash",
-            "base": "glm-4-flash",
-            "features": [],
-            "is_variant": false,
-            "is_image_model": false,
-            "profile": {"native_function_calling": false, "preferred_format": "xml"},
-            "last_probe": null  或  { ts, ok, latency_ms, status, error, content_preview, account_index }
-          },
-          ...
-        ]
+        "upstream": {
+          "cache": {...},
+          "assistants": [...]
+        },
+        "local": {
+          "total": 74,
+          "base_count": 20,
+          "models": [...]
+        }
       }
     """
+    # --- 真实上游助手 ---
+    discovery = get_upstream_discovery(config, logger, glm_client.auth)
+    assistants = discovery.discover(force_refresh=False)
+    cache_info = discovery.get_cache_info()
+    upstream_payload = {
+        "cache": cache_info,
+        "assistants": [upstream_assistant_to_dict(a) for a in assistants],
+    }
+
+    # --- 本地 OpenAI 兼容模型 ---
     image_model = config.glm_image_model_name
     probe_cache = get_store().get_model_probe_cache()
-    models: list[dict[str, Any]] = []
+    local_models: list[dict[str, Any]] = []
     for model_id in config.exposed_models:
         base, features = split_model_features(model_id)
         profile = get_model_profile(base)
-        models.append({
+        local_models.append({
             "id": model_id,
             "base": base,
             "features": sorted(features),
@@ -375,11 +389,28 @@ def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger:
             },
             "last_probe": probe_cache.get(model_id),
         })
-    base_count = len({m["base"] for m in models})
-    _send_json(handler, HTTPStatus.OK, {
-        "total": len(models),
+    base_count = len({m["base"] for m in local_models})
+    local_payload = {
+        "total": len(local_models),
         "base_count": base_count,
-        "models": models,
+        "models": local_models,
+    }
+
+    _send_json(handler, HTTPStatus.OK, {
+        "upstream": upstream_payload,
+        "local": local_payload,
+    }, config)
+
+
+def _handle_upstream_refresh(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """强制刷新真实上游助手列表（绕过缓存）。"""
+    discovery = get_upstream_discovery(config, logger, glm_client.auth)
+    assistants = discovery.discover(force_refresh=True)
+    cache_info = discovery.get_cache_info()
+    _send_json(handler, HTTPStatus.OK, {
+        "ok": True,
+        "cache": cache_info,
+        "assistants": [upstream_assistant_to_dict(a) for a in assistants],
     }, config)
 
 
@@ -661,6 +692,7 @@ _API_ROUTES = {
     "rotates": ("GET", _handle_rotates),
     "accounts": ("GET", _handle_accounts),
     "models": ("GET", _handle_models),
+    "upstream_refresh": ("POST", _handle_upstream_refresh),
     "probe_model": ("POST", _handle_probe_model),
     "probe": ("POST", _handle_probe),
     "config": ("GET", _handle_config),

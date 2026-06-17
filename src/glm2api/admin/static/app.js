@@ -430,7 +430,7 @@ async function handleRotate(idx) {
 }
 
 // =========================================================================
-// Models view (动态模型列表 + 单模型探针)
+// Models view (真实上游助手 + 本地 OpenAI 兼容模型)
 // =========================================================================
 
 let _modelsCache = null;        // 缓存上次拉取的 models 列表，避免 probe 时重复拉
@@ -439,41 +439,85 @@ let _probingAll = false;        // 防止"全部探针"按钮被重复点击
 async function refreshModels() {
   const data = await api('models');
   _modelsCache = data;
-  const models = data.models || [];
-  // 统计
-  const probed = models.filter(m => m.last_probe);
+  const upstream = data.upstream || {};
+  const local = data.local || {};
+  const assistants = upstream.assistants || [];
+  const localModels = local.models || [];
+  const cache = upstream.cache || {};
+
+  // 统计真实助手
+  const okAssistants = assistants.filter(a => !a.fetch_error);
+  const failAssistants = assistants.filter(a => a.fetch_error);
+  const enabledCount = okAssistants.filter(a => a.enabled).length;
+  const knownCount = okAssistants.filter(a => a.is_known).length;
+  const cacheAge = cache.cache_age_seconds ? Math.round(cache.cache_age_seconds / 60) : 0;
+  const cacheTtl = Math.round((cache.cache_ttl_seconds || 1800) / 60);
+
+  // 统计本地模型
+  const probed = localModels.filter(m => m.last_probe);
   const okCount = probed.filter(m => m.last_probe.ok).length;
   const failCount = probed.length - okCount;
-  const imageCount = models.filter(m => m.is_image_model).length;
-  const variantCount = models.filter(m => m.is_variant).length;
+  const imageCount = localModels.filter(m => m.is_image_model).length;
+  const variantCount = localModels.filter(m => m.is_variant).length;
 
   const html = `
     <div class="kpi-grid">
       <div class="kpi-card info">
-        <div class="kpi-label">模型总数</div>
-        <div class="kpi-value">${data.total}</div>
-        <div class="kpi-sub">基础模型 ${data.base_count} · 变体 ${variantCount}</div>
+        <div class="kpi-label">真实上游助手</div>
+        <div class="kpi-value">${okAssistants.length}</div>
+        <div class="kpi-sub">${failAssistants.length} 个拉取失败 · ${knownCount} 个项目内置</div>
       </div>
       <div class="kpi-card success">
-        <div class="kpi-label">探测可用</div>
-        <div class="kpi-value">${okCount}</div>
-        <div class="kpi-sub">已探测 ${probed.length} / ${data.total}</div>
+        <div class="kpi-label">已启用助手</div>
+        <div class="kpi-value">${enabledCount}</div>
+        <div class="kpi-sub">enabled=true</div>
       </div>
-      <div class="kpi-card ${failCount > 0 ? 'error' : ''}">
-        <div class="kpi-label">探测失败</div>
-        <div class="kpi-value">${failCount}</div>
-        <div class="kpi-sub">${failCount === 0 ? '暂无失败' : '点击状态徽章查看错误'}</div>
+      <div class="kpi-card ${cacheAge >= cacheTtl - 5 ? 'warning' : ''}">
+        <div class="kpi-label">缓存年龄</div>
+        <div class="kpi-value" style="font-size:18px;">${cacheAge} 分钟</div>
+        <div class="kpi-sub">TTL ${cacheTtl} 分钟 · ${cache.cached ? '已缓存' : '未缓存'}</div>
       </div>
       <div class="kpi-card warning">
-        <div class="kpi-label">图像模型</div>
-        <div class="kpi-value">${imageCount}</div>
-        <div class="kpi-sub">cogView / glm-image-1</div>
+        <div class="kpi-label">本地 OpenAI 兼容模型</div>
+        <div class="kpi-value">${local.total || 0}</div>
+        <div class="kpi-sub">基础 ${local.base_count || 0} · 变体 ${variantCount}</div>
       </div>
     </div>
 
     <div class="panel">
       <div class="panel-header">
-        <div class="panel-title">模型列表</div>
+        <div class="panel-title">真实上游助手（从 chatglm.cn 实时拉取）</div>
+        <div class="panel-meta">
+          <button id="models-upstream-refresh" class="btn btn-primary btn-sm">🔄 强制刷新上游</button>
+          <span class="text-muted" style="margin-left:8px;font-size:11px;">main.js: ${escapeHtml(cache.main_js_url || '-')}</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>头像</th>
+                <th>名称</th>
+                <th>assistant_id</th>
+                <th>描述</th>
+                <th>scope</th>
+                <th>状态</th>
+                <th>项目角色</th>
+                <th>starter_prompts</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${assistants.map(a => renderUpstreamAssistantRow(a)).join('') || `<tr><td colspan="8" class="empty-state">无数据</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">本地 OpenAI 兼容模型（用于端点测试）</div>
         <div class="panel-meta">
           <button id="models-probe-all" class="btn btn-primary btn-sm">${_probingAll ? '探针中…' : '🧪 全部探针'}</button>
           <button id="models-clear-probe" class="btn btn-ghost btn-sm" style="margin-left:8px;">清除探针结果</button>
@@ -509,7 +553,7 @@ async function refreshModels() {
               </tr>
             </thead>
             <tbody id="models-tbody">
-              ${models.map(m => renderModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`}
+              ${localModels.map(m => renderLocalModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`}
             </tbody>
           </table>
         </div>
@@ -519,6 +563,7 @@ async function refreshModels() {
   document.getElementById('view-models').innerHTML = html;
 
   // 绑定事件
+  document.getElementById('models-upstream-refresh').addEventListener('click', handleUpstreamRefresh);
   document.getElementById('models-probe-all').addEventListener('click', handleProbeAll);
   document.getElementById('models-clear-probe').addEventListener('click', handleClearProbe);
   document.getElementById('models-filter').addEventListener('input', applyModelFilter);
@@ -528,7 +573,39 @@ async function refreshModels() {
   });
 }
 
-function renderModelRow(m) {
+function renderUpstreamAssistantRow(a) {
+  const avatarCell = a.avatar
+    ? `<img src="${escapeHtml(a.avatar)}" alt="" style="width:32px;height:32px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';" />`
+    : `<div style="width:32px;height:32px;border-radius:50%;background:var(--bg-elevated);display:flex;align-items:center;justify-content:center;font-size:14px;">🤖</div>`;
+  const statusBadge = a.fetch_error
+    ? `<span class="badge badge-error" title="${escapeHtml(a.fetch_error)}">❌ 拉取失败</span>`
+    : a.enabled
+      ? `<span class="badge badge-success">✅ 已启用</span>`
+      : `<span class="badge badge-muted">⏸ 已禁用</span>`;
+  const knownBadge = a.is_known
+    ? `<span class="badge badge-purple">${escapeHtml(a.known_role)}</span>`
+    : `<span class="text-muted">-</span>`;
+  const prompts = (a.starter_prompts || []).slice(0, 3).map(p =>
+    `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">• ${escapeHtml(p.length > 40 ? p.slice(0, 40) + '...' : p)}</div>`
+  ).join('');
+  const description = a.description
+    ? escapeHtml(a.description.length > 80 ? a.description.slice(0, 80) + '...' : a.description)
+    : '<span class="text-muted">-</span>';
+  return `
+    <tr>
+      <td>${avatarCell}</td>
+      <td><strong>${escapeHtml(a.name || '(无名)')}</strong></td>
+      <td class="mono" style="font-size:11px;">${escapeHtml(a.assistant_id)}</td>
+      <td style="font-size:12px;max-width:300px;">${description}</td>
+      <td class="mono">${a.scope}</td>
+      <td>${statusBadge}</td>
+      <td>${knownBadge}</td>
+      <td style="max-width:200px;">${prompts || '<span class="text-muted">-</span>'}</td>
+    </tr>
+  `;
+}
+
+function renderLocalModelRow(m) {
   const features = (m.features || []).map(f => `<span class="badge badge-info">${escapeHtml(f)}</span>`).join(' ');
   const typeBadge = m.is_image_model
     ? `<span class="badge badge-warning">图像</span>`
@@ -566,6 +643,21 @@ function renderModelRow(m) {
   `;
 }
 
+async function handleUpstreamRefresh() {
+  const btn = document.getElementById('models-upstream-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = '🔄 刷新中...'; }
+  showToast('正在强制刷新上游助手列表（拉主页 + main.js + 23 次 assistant/info）...', 'info');
+  try {
+    await api('upstream_refresh', { method: 'POST', body: {} });
+    showToast('✅ 上游助手列表已刷新', 'success');
+    await refreshModels();
+  } catch (err) {
+    showToast('刷新失败: ' + err.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔄 强制刷新上游'; }
+  }
+}
+
 function applyModelFilter() {
   const q = (document.getElementById('models-filter').value || '').toLowerCase().trim();
   const status = document.getElementById('models-status-filter').value;
@@ -601,11 +693,11 @@ async function handleProbeModel(modelId) {
 
 async function handleProbeAll() {
   if (_probingAll) return;
-  if (!_modelsCache || !_modelsCache.models) return;
+  if (!_modelsCache || !_modelsCache.local || !_modelsCache.local.models) return;
   _probingAll = true;
   const btn = document.getElementById('models-probe-all');
   if (btn) { btn.disabled = true; btn.textContent = '探针中…'; }
-  const models = _modelsCache.models;
+  const models = _modelsCache.local.models;
   let okCount = 0, failCount = 0;
   showToast(`开始批量探针 ${models.length} 个模型...`, 'info');
   for (let i = 0; i < models.length; i++) {
@@ -630,8 +722,8 @@ async function handleClearProbe() {
   // 暂用前端隐藏：清空所有 last_probe 显示
   if (!confirm('确认清除所有模型的探针结果？')) return;
   // 前端临时清空：直接重渲染但不显示探针状态
-  if (_modelsCache) {
-    _modelsCache.models = _modelsCache.models.map(m => ({ ...m, last_probe: null }));
+  if (_modelsCache && _modelsCache.local && _modelsCache.local.models) {
+    _modelsCache.local.models = _modelsCache.local.models.map(m => ({ ...m, last_probe: null }));
     refreshModelsUI();
     showToast('已清除探针结果（后端缓存仍在，下次探测会覆盖）', 'info');
   }
@@ -641,10 +733,11 @@ async function handleClearProbe() {
 function refreshModelsUI() {
   if (!_modelsCache) return;
   const data = _modelsCache;
-  const models = data.models || [];
+  const localPayload = data.local || {};
+  const models = localPayload.models || [];
   const tbody = document.getElementById('models-tbody');
   if (tbody) {
-    tbody.innerHTML = models.map(m => renderModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`;
+    tbody.innerHTML = models.map(m => renderLocalModelRow(m)).join('') || `<tr><td colspan="9" class="empty-state">无模型</td></tr>`;
     document.querySelectorAll('[data-probe-model]').forEach(btn => {
       btn.addEventListener('click', () => handleProbeModel(btn.dataset.probeModel));
     });
@@ -672,7 +765,8 @@ async function refreshProbe() {
       // 静默失败，下面会显示错误
     }
   }
-  const models = (modelsData && modelsData.models) || [];
+  const localPayload = (modelsData && modelsData.local) || {};
+  const models = localPayload.models || [];
   // 把基础模型排在前面
   const sorted = [...models].sort((a, b) => {
     if (a.is_variant !== b.is_variant) return a.is_variant ? 1 : -1;
