@@ -168,7 +168,14 @@ def sanitize_tool_calls(
         )
         if cleaned_arguments is None:
             continue
-        repaired = not isinstance(original_value, dict) or safe_json_dumps(cleaned_arguments) != safe_json_dumps(original_value)
+        repaired = not isinstance(original_value, dict) or (
+            # 只有当参数的 key set 发生变化（如 {"param_name":"url"} → {"url": fallback_url}）
+            # 才算"实质性修复"，对应的 tool error 结果应该丢弃（因为参数已经不一样了）。
+            # 如果只是 value 被规范化（如 ["ls"] → ["powershell.exe","-Command","ls"]），
+            # keys 没变，tool_call_id 仍然有效，对应的 tool 结果必须保留。
+            # 否则 Codex shell 工具的合法 tool 结果会被错误丢弃，导致模型死循环。
+            set(cleaned_arguments.keys()) != set(original_value.keys())
+        )
         sanitized.append(
             {
                 "id": str(tool_call.get("id", "")) or f"call_repaired_{index}",
@@ -412,17 +419,31 @@ def convert_messages(
             content = f"{assistant_text}\n{block}".strip() if assistant_text and block else (assistant_text or block)
         elif role == "tool":
             tool_call_id = str(message.get("tool_call_id", "")).strip()
+            # 第一个 check：客户端传的 tool_call_id 必须对应一个我们认可过的 assistant tool_call。
+            #   - 如果 tool_call_id 为空，放行（兼容某些客户端不传 id 的情况）
+            #   - 如果有 id 但不在 valid_tool_call_ids 里，说明对应的 assistant tool_call 被丢了，跳过 tool 结果
             if tool_call_id and valid_tool_call_ids and tool_call_id not in valid_tool_call_ids:
                 continue
+            # 第二个 check：如果对应的 assistant tool_call 被实质性修复（参数 keys 变了），
+            # 说明客户端用错误参数调了工具得到 error，这个 error 已经不相关了，跳过。
+            # 注意：sanitize_tool_calls 现在只在 keys 变化时才标记 _repaired，
+            # 所以"参数规范化"（如 PowerShell 别名 ls → powershell.exe -Command ls）不会被误标记，
+            # Codex shell 工具的合法 tool 结果不会被错误丢弃。
             if tool_call_id and tool_call_id in repaired_tool_call_ids:
                 continue
             role = "user"
             tool_name = str(message.get("name", "")).strip() or "unknown_tool"
             tool_result_text = extract_text_content(content)
-            content = serialize_tool_result_block(
-                tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
-                tool_name=tool_name,
-                content=tool_result_text,
+            # 用普通 user 消息格式传递 tool 结果，而不是 DSML tool_result block。
+            # 之前用 <|DSML|tool_result> 格式时，GLM 会误以为这是它要继续输出的对话格式，
+            # 导致模型在第二轮反复调用同一个工具，陷入死循环。
+            # 改成普通 user 消息 + 明确指令后，模型能正确理解"工具已执行完，现在该总结"。
+            content = (
+                f"[TOOL RESULT from `{tool_name}` (call_id={tool_call_id or 'unknown'})]\n"
+                f"{tool_result_text}\n"
+                f"[END OF TOOL RESULT. The tool has been executed by the client. "
+                f"Do NOT call `{tool_name}` again with the same arguments. "
+                f"Summarize the result for the user in plain text now.]"
             )
         elif role == "assistant" and not content:
             continue

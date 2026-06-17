@@ -48,7 +48,14 @@ def test_convert_messages_injects_xml_tool_prompt_and_history():
 
     assert "<|DSML|tool_calls>" in prompt
     assert "<|DSML|invoke name=\"get_weather\">" in prompt
-    assert "<|DSML|tool_result call_id=\"call_1\" name=\"get_weather\">" in prompt
+    # tool 结果改用普通 user 消息格式（不再用 DSML tool_result block）
+    # 否则 GLM 模型会误以为 <|DSML|tool_result|> 是要继续输出的对话格式，
+    # 导致第二轮反复调用同一个工具陷入死循环。
+    assert "[TOOL RESULT from `get_weather` (call_id=call_1)]" in prompt
+    assert "[END OF TOOL RESULT." in prompt
+    # 实际 tool_result block（带 call_id 和 content）不应出现
+    # 注意：指令说明文字里仍可能提到 "<|DSML|tool_result ...>" 作为规则示例
+    assert '<|DSML|tool_result call_id="call_1"' not in prompt
     assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
     assert "Use the DSML format below exactly." in prompt
