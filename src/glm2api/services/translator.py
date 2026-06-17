@@ -576,6 +576,9 @@ class GLMEventAccumulator:
     tools_schema: list[dict[str, object]] | None = None
     response_id: str = field(default_factory=gen_chatcmpl_id)
     _completion_text_buffer: str = ""
+    # P9 修复：max_tokens 强制限制
+    max_tokens_limit: int = 0  # 0 = 不限制
+    _force_finished: bool = False  # 达到 max_tokens 后强制 finish
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
@@ -670,6 +673,33 @@ class GLMEventAccumulator:
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
             self._completion_text_buffer += visible_text_delta
+            # P9 修复：检查 max_tokens 限制
+            if self.max_tokens_limit > 0 and not self._force_finished:
+                # 近似 token 计数：每 4 字符 ≈ 1 token
+                approx_tokens = len(self._completion_text_buffer) // 4
+                if approx_tokens >= self.max_tokens_limit:
+                    self._force_finished = True
+                    if self.logger:
+                        self.logger.info(
+                            "max_tokens 限制触发 approx_tokens=%d limit=%d model=%s，强制 finish",
+                            approx_tokens, self.max_tokens_limit, self.model,
+                        )
+                    # 发送 finish chunk 并返回
+                    chunks.append(
+                        self._chunk_json(
+                            {
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "length",
+                                        "logprobs": None,
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                    return chunks, "finish"
             if self.allowed_tool_names is not None:
                 self._deferred_visible_text += visible_text_delta
             else:
@@ -716,14 +746,15 @@ class GLMEventAccumulator:
                 len(self._server_side_tool_calls),
             )
 
-        # === v4 改进：当客户端提供了 tools 但 GLM 没调任何工具且文本超长时，检测是否是描述性文本 ===
-        # 这种场景下 GLM 生成了 "I will create..." 类型的长文本但不调工具
-        # 返回 error 让客户端重试（客户端如 codex 会重新发请求）
+        # === v4/v6 改进：当客户端提供了 tools 但 GLM 没调任何工具时，检测是否是描述性文本 ===
+        # P10 修复：阈值从 500 降到 30 字符，覆盖 GLM 生成短描述性文本就退出的场景
+        # （v6 报告：GLM 只生成 22 tokens 的 "I'll create..." 就退出，500 阈值太高没触发）
+        DESCRIPTIVE_MIN_LEN = 30  # v6: 从 500 降到 30
         if (
             not all_tool_calls
             and self.allowed_tool_names is not None
             and len(self.allowed_tool_names) > 0
-            and len(self._cached_full_text) > 500
+            and len(self._cached_full_text) > DESCRIPTIVE_MIN_LEN
             and not self._is_useful_response()
         ):
             if self.logger:
@@ -913,7 +944,7 @@ class GLMEventAccumulator:
             not all_tool_calls
             and self.allowed_tool_names is not None
             and len(self.allowed_tool_names) > 0
-            and len(full_text) > 500
+            and len(full_text) > 30  # P10: 从 500 降到 30
             and not self._is_useful_response()
         ):
             if self.logger:
@@ -935,6 +966,24 @@ class GLMEventAccumulator:
             raise RuntimeError("descriptive_text_without_tool_call")
 
         final_content = clean_content.strip()
+        # P9 修复：非流式路径也检查 max_tokens
+        finish_reason = "tool_calls" if all_tool_calls else "stop"
+        if (
+            not all_tool_calls
+            and self.max_tokens_limit > 0
+            and final_content
+        ):
+            approx_tokens = len(final_content) // 4
+            if approx_tokens > self.max_tokens_limit:
+                # 截断到 max_tokens
+                final_content = final_content[: self.max_tokens_limit * 4]
+                finish_reason = "length"
+                if self.logger:
+                    self.logger.info(
+                        "非流式 max_tokens 截断 approx_tokens=%d limit=%d model=%s",
+                        approx_tokens, self.max_tokens_limit, self.model,
+                    )
+
         message: dict[str, object] = {
             "role": "assistant",
             "content": None if all_tool_calls or not final_content else final_content,
@@ -955,7 +1004,7 @@ class GLMEventAccumulator:
                 {
                     "index": 0,
                     "message": message,
-                    "finish_reason": "tool_calls" if all_tool_calls else "stop",
+                    "finish_reason": finish_reason,
                     "logprobs": None,
                 }
             ],
@@ -975,15 +1024,8 @@ class GLMEventAccumulator:
     def _is_useful_response(self) -> bool:
         """检测 GLM 生成的文本是否是"有用的响应"。
 
-        用于 v4 改进：当客户端提供了 tools 但 GLM 没调任何工具且文本超长时，
-        判断文本是否是：
-        - 纯描述性文本（"I will create...", "Let me..." 开头）→ 不是有用的 → 返回 False
-        - 实际的回答/代码/分析 → 是有用的 → 返回 True
-
-        判定规则：
-          1. 文本以 "I will" / "I'll" / "Let me" / "I'm going to" / "First," 开头 → 描述性
-          2. 文本前 200 字符里有 3+ 次 "I will" / "I'll" / "Let me" → 描述性
-          3. 其他情况 → 有用
+        v6 改进：增加更多描述性短语检测，降低误判率。
+        P10 修复：覆盖短文本（"I'll create..." 只有 30+ 字符也检测）。
         """
         text = (self._cached_full_text or "").strip()
         if not text:
@@ -993,6 +1035,11 @@ class GLMEventAccumulator:
         descriptive_starts = (
             "i will ", "i'll ", "let me ", "i'm going to ",
             "first, ", "sure, ", "certainly, ", "of course, ",
+            # v6 新增：覆盖更多 GLM 描述性开头
+            "i'll create", "i will create", "let me start",
+            "i'm going to create", "i plan to", "here's what",
+            "i'll build", "i will build", "let me build",
+            "i'll implement", "i will implement",
         )
         if lower.startswith(descriptive_starts):
             # 检查是否后续真的调了工具（如果文本里含 XML tool call 标签，说明模型有尝试）
@@ -1006,6 +1053,10 @@ class GLMEventAccumulator:
         desc_count = sum(lower.count(phrase) for phrase in ("i will ", "i'll ", "let me "))
         if desc_count >= 3:
             return False
+        # 规则 3（v6 新增）：文本包含 "planning" / "tasks" / "steps" 且没调工具
+        if any(word in lower for word in ("planning the tasks", "start by planning", "here are the steps", "let me outline")):
+            if "<ml_tool" not in text and "```" not in text[:500]:
+                return False
         return True
 
     def _extract_reasoning_tool_calls(self, reasoning_text: str | None = None) -> list[dict[str, object]]:

@@ -334,6 +334,7 @@ class GLMWebClient:
             logger=self.logger,
             prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
             tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
+            max_tokens_limit=int(payload.get("max_tokens", 0) or 0),
         )
         try:
             for event in self._iter_sse_events(response):
@@ -377,6 +378,7 @@ class GLMWebClient:
             logger=self.logger,
             prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
             tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
+            max_tokens_limit=int(payload.get("max_tokens", 0) or 0),
         )
         try:
             for event in self._iter_sse_events(response):
@@ -482,6 +484,7 @@ class GLMWebClient:
             logger=self.logger,
             prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
             tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
+            max_tokens_limit=int(payload.get("max_tokens", 0) or 0),
         )
 
         # 流式复读检测：buffer 一定量文本后再决定是否输出
