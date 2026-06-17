@@ -532,6 +532,14 @@ def convert_messages(
             "Your next response MUST be a tool call. "
             "Do NOT write text explanations. Call a tool NOW.]"
         )
+        # P11-2: 加日志确认 SYSTEM REMINDER 确实注入
+        import logging as _logging
+        _logging.getLogger("glm2api.translator").info(
+            "P11 SYSTEM REMINDER 已注入 prompt 末尾 tools=%d mode=%s prompt_len=%d",
+            len(tools) if tools else 0,
+            tool_choice_policy.get("mode"),
+            len(prompt),
+        )
 
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
 
@@ -1004,16 +1012,20 @@ class GLMEventAccumulator:
             and self.max_tokens_limit > 0
             and final_content
         ):
-            # P9/P12-2 修复：按内容语言动态估算 token 数
+            # P9/P12-2/P15 修复：按内容语言动态估算 token 数 + 动态截断
             approx_tokens = _estimate_token_count(final_content)
             if approx_tokens > self.max_tokens_limit:
-                # 截断到 max_tokens
-                final_content = final_content[: self.max_tokens_limit * 4]
+                # P15 修复：截断时也按 CJK 比例动态调整 multiplier
+                cjk_count = sum(1 for c in final_content if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
+                cjk_ratio = cjk_count / len(final_content) if final_content else 0
+                multiplier = 2 if cjk_ratio > 0.3 else 4
+                final_content = final_content[: self.max_tokens_limit * multiplier]
                 finish_reason = "length"
+                # P15: 同时修正 usage，让 completion_tokens 反映截断后的实际值
                 if self.logger:
                     self.logger.info(
-                        "非流式 max_tokens 截断 approx_tokens=%d limit=%d model=%s",
-                        approx_tokens, self.max_tokens_limit, self.model,
+                        "非流式 max_tokens 截断 approx_tokens=%d limit=%d multiplier=%d cjk_ratio=%.2f model=%s",
+                        approx_tokens, self.max_tokens_limit, multiplier, cjk_ratio, self.model,
                     )
 
         message: dict[str, object] = {
