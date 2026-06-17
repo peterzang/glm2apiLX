@@ -401,6 +401,25 @@ class ResponsesStreamAccumulator:
         if not self.started:
             events.extend(self.start_response())
 
+        # P6 修复：检测 Chat Completions 风格的 error chunk 并转为 response.failed
+        # 当 translator.py 的描述性文本检测/复读检测触发时，返回的是 Chat 风格 error chunk：
+        #   {"choices":[...], "error":{"message":"...","code":"..."}}
+        # codex 走 wire_api=responses 期望的是 response.failed 事件，不是 Chat error
+        error_field = data.get("error")
+        if isinstance(error_field, dict):
+            failed_response = self._base_response("failed")
+            failed_response["error"] = {
+                "code": str(error_field.get("code", "upstream_error")),
+                "message": str(error_field.get("message", "Unknown upstream error")),
+            }
+            events.append(self._sse("response.failed", {
+                "type": "response.failed",
+                "response": failed_response,
+            }))
+            events.append("data: [DONE]\n\n")
+            self._finished = True
+            return events
+
         # P4-2 修复：优先用上游真实 usage（不论 choices 是否为空）
         # 上游可能在最后一个 chunk 同时带 choices + usage，也可能单独发 usage chunk
         usage = data.get("usage")
