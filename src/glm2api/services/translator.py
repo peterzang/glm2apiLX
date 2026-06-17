@@ -676,7 +676,9 @@ class GLMEventAccumulator:
             # P9 修复：检查 max_tokens 限制
             if self.max_tokens_limit > 0 and not self._force_finished:
                 # 近似 token 计数：每 4 字符 ≈ 1 token
-                approx_tokens = len(self._completion_text_buffer) // 4
+                # P9/P12 修复：用 ÷3 更保守地估算 token（中文 1 字符≈1-2 token，英文 4 字符≈1 token）
+                # ÷3 让实际 token 数略低于 max_tokens，避免超限
+                approx_tokens = len(self._completion_text_buffer) // 3
                 if approx_tokens >= self.max_tokens_limit:
                     self._force_finished = True
                     if self.logger:
@@ -973,7 +975,8 @@ class GLMEventAccumulator:
             and self.max_tokens_limit > 0
             and final_content
         ):
-            approx_tokens = len(final_content) // 4
+            # P9/P12 修复：用 ÷3 更保守地估算 token
+            approx_tokens = len(final_content) // 3
             if approx_tokens > self.max_tokens_limit:
                 # 截断到 max_tokens
                 final_content = final_content[: self.max_tokens_limit * 4]
