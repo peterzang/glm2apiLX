@@ -53,6 +53,47 @@ class AccountState:
     refresh_token: str
     is_guest: bool = False
     cached_token: AccessToken | None = None
+    # device_id：每次启动随机生成，被风控时主动轮换
+    device_id: str = ""
+    request_id_counter: int = 0
+    # 主动轮换：每个 device_id 累计请求数（含失败）
+    # 超过阈值时主动 rotate，不等失败
+    device_request_count: int = 0
+    # === device_id 池预 fetch（消除轮换延迟）===
+    # rotate 后立即异步 fetch 新 token，下次请求直接命中 0 延迟
+    # prefetched_token 必须配合 prefetched_device_id 校验：device_id 又被 rotate 后废弃
+    prefetched_token: AccessToken | None = None
+    prefetched_device_id: str = ""
+    prefetch_in_progress: bool = False
+
+
+def _load_or_create_device_id(account_index: int) -> str:
+    """生成新的随机 device_id（不再持久化）。
+    
+    设计变更（2026-06-17）：
+    之前持久化 device_id 是为了避免"同账号多设备并发"风控。但实测发现
+    智谱游客 chat 接口的频控恰恰按 device_id 计数——持久化的 device_id
+    用几次就会被风控（"您已多次体验过对话, 请登录后继续使用"），
+    全新的随机 device_id 反而稳定可用。
+    
+    因此这里改为：每次启动生成新 UUID，永不持久化。失败时由
+    `rotate_device_id_for_account` 主动轮换。
+    """
+    return uuid.uuid4().hex
+
+
+# 游客频控关键字（命中即触发 device_id 轮换）
+GUEST_RATE_LIMIT_MARKERS = (
+    "多次体验过",
+    "请登录后继续使用",
+    "请登录后重试",
+)
+
+
+def is_guest_rate_limited(exc: Exception) -> bool:
+    """判断异常是否是游客频控（需要轮换 device_id 重试）。"""
+    msg = str(exc)
+    return any(marker in msg for marker in GUEST_RATE_LIMIT_MARKERS)
 
 
 class GLMAccessTokenManager:
@@ -63,11 +104,14 @@ class GLMAccessTokenManager:
             AccountState(
                 refresh_token="" if token == GUEST_REFRESH_TOKEN_MARKER else token,
                 is_guest=(token == GUEST_REFRESH_TOKEN_MARKER),
+                device_id=_load_or_create_device_id(idx),
             )
-            for token in config.glm_refresh_tokens
+            for idx, token in enumerate(config.glm_refresh_tokens)
         ]
         self._current_index = 0
-        self._lock = threading.Lock()
+        # RLock：因为 get_device_id_for_account / next_request_id_for_account
+        # 会在 _refresh_access_token（已持锁）内被调用，需要可重入
+        self._lock = threading.RLock()
         self._persist_lock = threading.Lock()
         logger.info(
             "账号管理器初始化 账号数=%s 游客模式=%s",
@@ -137,6 +181,194 @@ class GLMAccessTokenManager:
         with self._lock:
             return self._accounts[account_index].is_guest
 
+    def get_device_id_for_account(self, account_index: int) -> str:
+        """返回该账号当前的 device_id（每次启动随机生成，运行时可通过 rotate 轮换）。"""
+        with self._lock:
+            if 0 <= account_index < len(self._accounts):
+                dev = self._accounts[account_index].device_id
+                if dev:
+                    return dev
+            return uuid.uuid4().hex
+
+    def rotate_device_id_for_account(self, account_index: int, reason: str = "rate_limited") -> str:
+        """轮换该账号的 device_id：生成新 UUID + 清空 cached_token。
+        
+        触发场景：检测到游客频控（"多次体验过对话"）时调用。下一次请求会
+        用新 device_id 重新 fetch guest token，从而拿到新的 user_id，
+        绕过按 device_id 计数的风控。
+
+        优化（2026-06-17）：rotate 后立即触发后台异步预 fetch 新 token，
+        下次请求命中预 fetch 池时 0 延迟；池空退回同步 fetch 兜底。
+
+        参数 reason：用于 admin 审计日志区分触发原因
+          - "rate_limited" (默认)：检测到游客频控被动触发
+          - "manual"：管理面板手动触发
+          - "proactive"：达到阈值主动轮换（注意：此路径在 next_request_id_for_account 中独立处理）
+        """
+        with self._lock:
+            if 0 <= account_index < len(self._accounts):
+                acc = self._accounts[account_index]
+                old_dev = acc.device_id[:8] if acc.device_id else "None"
+                acc.device_id = uuid.uuid4().hex
+                acc.cached_token = None
+                acc.request_id_counter = 0
+                # 废弃旧的预 fetch（device_id 已变）
+                acc.prefetched_token = None
+                acc.prefetched_device_id = ""
+                self.logger.info(
+                    "account=%s device_id 已轮换 %s → %s... (reason=%s)",
+                    account_index, old_dev, acc.device_id[:8], reason,
+                )
+                new_dev = acc.device_id
+                new_dev_short = acc.device_id[:8]
+            else:
+                return uuid.uuid4().hex
+        # 锁外触发后台 prefetch（避免持锁等待网络）
+        self._trigger_prefetch(account_index, new_dev)
+        # 通知 admin store 记录轮换事件（best-effort）
+        try:
+            from ..admin.store import get_store
+            get_store().record_rotate(account_index, old_dev, new_dev_short, reason)
+        except Exception:
+            pass
+        return new_dev
+
+    def next_request_id_for_account(self, account_index: int) -> str:
+        """生成基于 device_id 的 request_id，保证全局唯一且可追溯。
+        
+        副作用：累计 device_request_count，超阈值时主动轮换 device_id。
+        主动轮换是关键优化：避免"用到失败再换"的反应式策略，
+        把风控窗口前的请求都打到新 device_id，降低失败重试率。
+        """
+        with self._lock:
+            if 0 <= account_index < len(self._accounts):
+                acc = self._accounts[account_index]
+                acc.request_id_counter += 1
+                acc.device_request_count += 1
+                # 主动轮换：超过阈值时换新 device_id（清 cached_token 强制下次重新 fetch）
+                # 默认 8 次，可配置 GLM_DEVICE_ID_ROTATE_THRESHOLD
+                threshold = getattr(self.config, "device_id_rotate_threshold", 8)
+                rotated_dev: str | None = None
+                rotated_old_dev: str = ""
+                if threshold > 0 and acc.device_request_count >= threshold:
+                    old_dev = acc.device_id[:8]
+                    acc.device_id = uuid.uuid4().hex
+                    acc.cached_token = None  # 强制重新 fetch guest token
+                    acc.request_id_counter = 0
+                    acc.device_request_count = 0
+                    # 废弃旧的预 fetch（device_id 已变）
+                    acc.prefetched_token = None
+                    acc.prefetched_device_id = ""
+                    self.logger.info(
+                        "account=%s 主动轮换 device_id %s → %s... (达到阈值 %d)",
+                        account_index, old_dev, acc.device_id[:8], threshold,
+                    )
+                    rotated_dev = acc.device_id
+                    rotated_old_dev = old_dev
+                req_id = f"{acc.device_id[:8]}-{int(time.time()*1000)}-{acc.request_id_counter}"
+            else:
+                return uuid.uuid4().hex
+        # 锁外触发后台 prefetch（如果刚轮换）
+        if rotated_dev is not None:
+            self._trigger_prefetch(account_index, rotated_dev)
+            # 通知 admin store 记录主动轮换事件（best-effort）
+            try:
+                from ..admin.store import get_store
+                get_store().record_rotate(account_index, rotated_old_dev, rotated_dev[:8], "proactive")
+            except Exception:
+                pass
+        return req_id
+
+    def _trigger_prefetch(self, account_index: int, device_id: str) -> None:
+        """后台异步预 fetch guest token，避免下次请求同步阻塞。
+        
+        设计要点：
+        1. 只对游客账号做预 fetch（登录账号 refresh_token 已存在，无需预取）
+        2. 已有预 fetch 在跑时不重复触发
+        3. 线程内不持锁发 HTTP；完成后持锁写结果，并校验 device_id 未被再次 rotate
+        4. 失败静默（兜底同步 fetch 会再试一次）
+        """
+        with self._lock:
+            if not (0 <= account_index < len(self._accounts)):
+                return
+            acc = self._accounts[account_index]
+            if not acc.is_guest:
+                return
+            if acc.prefetch_in_progress:
+                return
+            acc.prefetch_in_progress = True
+
+        def _do_prefetch() -> None:
+            token: AccessToken | None = None
+            try:
+                # 锁外发 HTTP，传入当前 device_id（不再触发 next_request_id 递增）
+                token = self._fetch_guest_token_raw(device_id)
+            except Exception as exc:
+                self.logger.debug(
+                    "预 fetch guest token 失败 account=%s dev=%s... error=%s",
+                    account_index, device_id[:8], exc,
+                )
+            finally:
+                with self._lock:
+                    acc2 = self._accounts[account_index]
+                    acc2.prefetch_in_progress = False
+                    # 校验：device_id 是否仍然有效（可能已被再次 rotate）
+                    if token is not None and acc2.device_id == device_id:
+                        acc2.prefetched_token = token
+                        acc2.prefetched_device_id = device_id
+                        self.logger.info(
+                            "预 fetch 完成 account=%s dev=%s... (池内 1 个 token)",
+                            account_index, device_id[:8],
+                        )
+                    # else: device_id 已变，token 废弃
+
+        threading.Thread(
+            target=_do_prefetch,
+            name=f"glm-prefetch-{account_index}",
+            daemon=True,
+        ).start()
+
+    def _fetch_guest_token_raw(self, device_id: str) -> AccessToken:
+        """底层 guest token fetch，使用指定的 device_id 而非读取账号当前值。
+        
+        与 _fetch_guest_access_token 的区别：
+        - 不调用 next_request_id_for_account（避免触发主动轮换）
+        - 不写入 account.refresh_token（仅返回 token 给调用方）
+        - 适用于预 fetch 场景；正式请求路径仍走 _fetch_guest_access_token
+        """
+        timestamp, nonce, sign = build_sign()
+        # 预 fetch 用一个独立的 request_id（不递增 account.request_id_counter）
+        request_id = f"{device_id[:8]}-pf-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
+        request = urllib.request.Request(
+            self.config.guest_refresh_url,
+            data=b"",
+            method="POST",
+            headers={
+                **self.get_browser_headers(app_fr="default"),
+                "Content-Length": "0",
+                "Referer": "https://chatglm.cn/",
+                "X-Device-Id": device_id,
+                "X-Nonce": nonce,
+                "X-Request-Id": request_id,
+                "X-Sign": sign,
+                "X-Timestamp": timestamp,
+            },
+        )
+        debug_dump(self.logger, self.config.debug_dump_all, f"GLM 预 fetch 游客 token 请求头 dev={device_id[:8]}", dict(request.header_items()))
+        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+            payload = self.read_json_response(response)
+        code = payload.get("code", payload.get("status"))
+        result = payload.get("result") or {}
+        access_token = result.get("access_token")
+        refresh_token = result.get("refresh_token")
+        if response.status != 200 or code not in {0, None} or not access_token or not refresh_token:
+            raise RuntimeError(f"预 fetch GLM 游客 token 失败: {payload}")
+        return AccessToken(
+            access_token=str(access_token),
+            refresh_token=str(refresh_token),
+            expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
+        )
+
     def advance_account(self, failed_index: int, reason: str) -> int:
         with self._lock:
             if failed_index != self._current_index:
@@ -164,12 +396,29 @@ class GLMAccessTokenManager:
             return self._get_access_token_for_index(account_index)
 
     def _get_access_token_for_index(self, account_index: int) -> str:
-        account = self._accounts[account_index]
-        if account.cached_token and time.time() < account.cached_token.expires_at - 60:
-            self.logger.debug("使用缓存 access_token account=%s 剩余=%.0fs", account_index, account.cached_token.expires_at - time.time())
+        with self._lock:
+            account = self._accounts[account_index]
+            if account.cached_token and time.time() < account.cached_token.expires_at - 60:
+                self.logger.debug("使用缓存 access_token account=%s 剩余=%.0fs", account_index, account.cached_token.expires_at - time.time())
+                return account.cached_token.access_token
+            # 命中预 fetch 池：原子交换到 cached_token，0 延迟
+            if (
+                account.prefetched_token is not None
+                and account.prefetched_device_id == account.device_id
+                and time.time() < account.prefetched_token.expires_at - 60
+            ):
+                account.cached_token = account.prefetched_token
+                account.prefetched_token = None
+                account.prefetched_device_id = ""
+                self.logger.info(
+                    "命中预 fetch 池 account=%s dev=%s... 剩余=%.0fs",
+                    account_index, account.cached_token.refresh_token[:8] if account.cached_token.refresh_token else "?",
+                    account.cached_token.expires_at - time.time(),
+                )
+                return account.cached_token.access_token
+            # 兜底：同步 fetch（持有 RLock 可重入）
+            account.cached_token = self._refresh_access_token(account_index)
             return account.cached_token.access_token
-        account.cached_token = self._refresh_access_token(account_index)
-        return account.cached_token.access_token
 
     def _refresh_access_token(self, account_index: int) -> AccessToken:
         account = self._accounts[account_index]
@@ -183,9 +432,9 @@ class GLMAccessTokenManager:
             headers={
                 **self.get_browser_headers(),
                 "Authorization": f"Bearer {account.refresh_token}",
-                "X-Device-Id": uuid.uuid4().hex,
+                "X-Device-Id": self.get_device_id_for_account(account_index),
                 "X-Nonce": nonce,
-                "X-Request-Id": uuid.uuid4().hex,
+                "X-Request-Id": self.next_request_id_for_account(account_index),
                 "X-Sign": sign,
                 "X-Timestamp": timestamp,
             },
@@ -219,8 +468,8 @@ class GLMAccessTokenManager:
     def _fetch_guest_access_token(self, account_index: int) -> AccessToken:
         account = self._accounts[account_index]
         timestamp, nonce, sign = build_sign()
-        request_id = uuid.uuid4().hex
-        device_id = uuid.uuid4().hex
+        request_id = self.next_request_id_for_account(account_index)
+        device_id = self.get_device_id_for_account(account_index)
         request = urllib.request.Request(
             self.config.guest_refresh_url,
             data=b"",

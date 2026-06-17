@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GLM2API 管理面板</title>
+<link rel="icon" href="/admin/static/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/admin/static/style.css" />
+</head>
+<body>
+
+<!-- ===================== Login Screen ===================== -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <div class="login-logo">GLM2API</div>
+    <div class="login-subtitle">管理面板登录</div>
+    <form id="login-form" class="login-form">
+      <input type="password" id="login-password" placeholder="管理密码" autocomplete="current-password" required />
+      <button type="submit">登录</button>
+      <div id="login-error" class="login-error" hidden></div>
+    </form>
+    <div class="login-hint">提示：默认密码为环境变量 ADMIN_PASSWORD 或首个 SERVER_API_KEYS</div>
+  </div>
+</div>
+
+<!-- ===================== Main App ===================== -->
+<div id="app" class="app hidden">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-logo">GLM</div>
+      <div class="brand-text">
+        <div class="brand-title">GLM2API</div>
+        <div class="brand-sub">管理面板</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a class="nav-item active" data-view="dashboard">
+        <span class="nav-icon">📊</span><span>仪表盘</span>
+      </a>
+      <a class="nav-item" data-view="accounts">
+        <span class="nav-icon">👤</span><span>账号管理</span>
+      </a>
+      <a class="nav-item" data-view="logs">
+        <span class="nav-icon">📋</span><span>请求日志</span>
+      </a>
+      <a class="nav-item" data-view="rotates">
+        <span class="nav-icon">🔄</span><span>轮换事件</span>
+      </a>
+      <a class="nav-item" data-view="config">
+        <span class="nav-icon">⚙️</span><span>配置查看</span>
+      </a>
+      <a class="nav-item" data-view="system">
+        <span class="nav-icon">🖥️</span><span>系统监控</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <button id="logout-btn" class="logout-btn">退出登录</button>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="topbar-title">仪表盘</div>
+      <div class="topbar-actions">
+        <label class="auto-refresh">
+          <input type="checkbox" id="auto-refresh" checked />
+          <span>自动刷新 (5s)</span>
+        </label>
+        <button id="manual-refresh" class="btn btn-ghost">刷新</button>
+      </div>
+    </header>
+
+    <div class="content" id="content">
+      <!-- Dashboard -->
+      <section id="view-dashboard" class="view active"></section>
+      <!-- Accounts -->
+      <section id="view-accounts" class="view"></section>
+      <!-- Logs -->
+      <section id="view-logs" class="view">
+        <div class="filter-bar">
+          <label><input type="checkbox" id="logs-only-errors" /> 仅显示错误 (4xx/5xx)</label>
+          <label>显示条数:
+            <select id="logs-limit">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+          </label>
+        </div>
+        <div id="logs-table-wrapper"></div>
+      </section>
+      <!-- Rotates -->
+      <section id="view-rotates" class="view">
+        <div id="rotates-table-wrapper"></div>
+      </section>
+      <!-- Config -->
+      <section id="view-config" class="view"></section>
+      <!-- System -->
+      <section id="view-system" class="view"></section>
+    </div>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/admin/static/app.js"></script>
+</body>
+</html>

@@ -11,6 +11,10 @@ from logging import Logger
 from ..config import AppConfig
 from ..logging_utils import debug_dump
 from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
+from ..utils.openai_compat import (
+    gen_chatcmpl_id,
+    system_fingerprint,
+)
 from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 from ..utils.tool_protocol import (
     BLOCKED_NATIVE_TOOL_NAMES,
@@ -23,6 +27,12 @@ from ..utils.tool_protocol import (
     serialize_tool_call_block as _protocol_serialize_tool_call_block,
     serialize_tool_result_block as _protocol_serialize_tool_result_block,
     tools_to_prompt as _protocol_tools_to_prompt,
+)
+from ..utils.tokenizer import (
+    count_tokens,
+    estimate_completion_tokens,
+    estimate_message_tokens,
+    estimate_tools_tokens,
 )
 
 
@@ -495,9 +505,39 @@ class GLMEventAccumulator:
     _server_side_tool_calls: list[dict[str, object]] = field(default_factory=list)
     _server_side_tool_call_ids: set[str] = field(default_factory=set)
     _deferred_visible_text: str = ""
+    # OpenAI-compat fields
+    prompt_messages: list[dict[str, object]] | None = None
+    tools_schema: list[dict[str, object]] | None = None
+    response_id: str = field(default_factory=gen_chatcmpl_id)
+    _completion_text_buffer: str = ""
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
+
+    def _estimate_usage(self, completion_text: str = "") -> dict[str, int]:
+        """Compute realistic prompt_tokens / completion_tokens / total_tokens."""
+        prompt_tokens = 0
+        if self.prompt_messages is not None:
+            try:
+                prompt_tokens = estimate_message_tokens(self.prompt_messages)
+            except Exception:
+                prompt_tokens = 0
+        if self.tools_schema:
+            try:
+                prompt_tokens += estimate_tools_tokens(self.tools_schema)
+            except Exception:
+                pass
+        if not completion_text:
+            completion_text = self._cached_full_text or self._completion_text_buffer
+        completion_tokens = estimate_completion_tokens(completion_text) if completion_text else 0
+        # Min 1 completion token if there's any output at all (matches OpenAI behavior)
+        if completion_tokens == 0 and (self._cached_full_text or self._completion_text_buffer or self._server_side_tool_calls):
+            completion_tokens = 1
+        return {
+            "prompt_tokens": max(prompt_tokens, 1),
+            "completion_tokens": max(completion_tokens, 1),
+            "total_tokens": max(prompt_tokens + completion_tokens, 2),
+        }
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
@@ -558,6 +598,7 @@ class GLMEventAccumulator:
 
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
+            self._completion_text_buffer += visible_text_delta
             if self.allowed_tool_names is not None:
                 self._deferred_visible_text += visible_text_delta
             else:
@@ -607,6 +648,8 @@ class GLMEventAccumulator:
         chunks: list[str] = []
         final_text = self._deferred_visible_text + tail_text
         self._deferred_visible_text = ""
+        if final_text:
+            self._completion_text_buffer += final_text
         if not final_text and not all_tool_calls and self.allowed_tool_names is not None:
             _, attempted_tool_calls = parse_tool_calls_from_text(
                 self._cached_full_text.strip(),
@@ -703,6 +746,7 @@ class GLMEventAccumulator:
                 )
 
         finish_reason = "tool_calls" if all_tool_calls else "stop"
+        # Per OpenAI spec: chunk with finish_reason (no usage here)
         chunks.append(
             self._chunk_json(
                 {
@@ -711,9 +755,19 @@ class GLMEventAccumulator:
                             "index": 0,
                             "delta": {},
                             "finish_reason": finish_reason,
+                            "logprobs": None,
                         }
                     ],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            )
+        )
+        # Final usage chunk (matches OpenAI stream_options.include_usage behavior)
+        # choices is empty array here per spec
+        chunks.append(
+            self._chunk_json(
+                {
+                    "choices": [],
+                    "usage": self._estimate_usage(),
                 }
             )
         )
@@ -754,18 +808,20 @@ class GLMEventAccumulator:
                 for item in all_tool_calls
             ]
         response = {
-            "id": self.conversation_id,
+            "id": self.response_id or self.conversation_id or gen_chatcmpl_id(),
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": system_fingerprint(),
             "choices": [
                 {
                     "index": 0,
                     "message": message,
                     "finish_reason": "tool_calls" if all_tool_calls else "stop",
+                    "logprobs": None,
                 }
             ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "usage": self._estimate_usage(completion_text=final_content),
         }
         if self.logger:
             self.logger.info(
@@ -876,10 +932,11 @@ class GLMEventAccumulator:
 
     def _chunk_json(self, patch: dict[str, object]) -> str:
         payload = {
-            "id": self.conversation_id,
+            "id": self.response_id or self.conversation_id or gen_chatcmpl_id(),
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
+            "system_fingerprint": system_fingerprint(),
         }
         payload.update(patch)
         return "data: " + safe_json_dumps(payload) + "\n\n"

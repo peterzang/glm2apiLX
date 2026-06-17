@@ -1,18 +1,81 @@
-# Python-generated files
+# ============================================================
+# GLM2API .gitignore - 只保留项目源码，排除所有运行时产物
+# ============================================================
+
+# ---- Python 编译产物 ----
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+*.egg
 
-# Virtual environments
-.venv
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+.uv-cache/
 
-# Config
+# ---- 运行时日志 ----
+*.log
+log/
+logs/
+
+# ---- PID 文件 ----
+*.pid
+
+# ---- 运行时状态 / 缓存 ----
+.device_ids.json
+.device_ids.json.bak
+token.txt
+tokens/
+cache/
+
+# ---- 配置文件（含真实密钥，不能上传）----
 .env
+.env.local
+.env.*.local
+.env.bak*
+.env.router
+.env.router.bak
+*.env.bak
 
-log
-docs
+# ---- 备份文件 ----
+*.bak
+*.bak.*
+*.orig
+*.rej
 
+# ---- 测试 / 临时产物 ----
+codex_test/
+codex_test2/
+tool-results/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 打包产物 ----
 main.spec
+*.spec
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- 文档临时目录 ----
+docs/
+
+# ---- 系统文件 ----
+*.tmp
+*.temp

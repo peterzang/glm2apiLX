@@ -10,6 +10,14 @@ import json
 import time
 import uuid
 
+from ..utils.openai_compat import (
+    gen_function_call_id,
+    gen_function_call_item_id,
+    gen_message_id,
+    gen_response_id,
+    system_fingerprint,
+)
+
 
 def _safe_json(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
@@ -195,8 +203,8 @@ def responses_to_openai(payload: dict[str, object]) -> dict[str, object]:
 
 def openai_to_responses(result: dict[str, object], model: str) -> dict[str, object]:
     """Convert an OpenAI chat/completions response to Responses API format."""
-    response_id = f"resp_{uuid.uuid4().hex[:24]}"
-    created = int(time.time())
+    response_id = result.get("id") if isinstance(result.get("id"), str) and result["id"].startswith("resp_") else gen_response_id()
+    created = int(result.get("created", time.time())) if isinstance(result.get("created"), (int, float)) else int(time.time())
     output: list[dict[str, object]] = []
     output_text_parts: list[str] = []
     status = "completed"
@@ -227,7 +235,7 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
                 if msg_content:
                     output.append({
                         "type": "message",
-                        "id": f"msg_{uuid.uuid4().hex[:24]}",
+                        "id": gen_message_id(),
                         "status": "completed",
                         "role": "assistant",
                         "content": msg_content,
@@ -246,8 +254,8 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
                             args_str = "{}"
                         output.append({
                             "type": "function_call",
-                            "id": f"fc_{uuid.uuid4().hex[:24]}",
-                            "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
+                            "id": gen_function_call_item_id(),
+                            "call_id": str(tc.get("id") or gen_function_call_id()),
                             "name": fn.get("name", "") if isinstance(fn, dict) else "",
                             "arguments": str(args_str),
                             "status": "completed",
@@ -276,10 +284,12 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
         "parallel_tool_calls": True,
         "previous_response_id": None,
         "store": False,
+        "system_fingerprint": system_fingerprint(),
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
         },
     }
 
@@ -294,7 +304,7 @@ class ResponsesStreamAccumulator:
 
     def __init__(self, model: str) -> None:
         self.model = model
-        self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        self.response_id = gen_response_id()
         self.created = int(time.time())
         self.started = False
         self.output_index = 0
@@ -339,6 +349,7 @@ class ResponsesStreamAccumulator:
             "previous_response_id": None,
             "reasoning": {"effort": None, "summary": None},
             "store": False,
+            "system_fingerprint": system_fingerprint(),
             "temperature": 1,
             "text": {"format": {"type": "text"}},
             "tool_choice": "auto",
@@ -435,8 +446,8 @@ class ResponsesStreamAccumulator:
                     if self._message_started:
                         events.extend(self._end_message_output())
 
-                    fc_id = f"fc_{uuid.uuid4().hex[:24]}"
-                    call_id = tc.get("id", f"call_{uuid.uuid4().hex[:24]}")
+                    fc_id = gen_function_call_item_id()
+                    call_id = str(tc.get("id") or gen_function_call_id())
                     tool_name = fn.get("name", "")
                     self._pending_tool_calls[tc_index] = {
                         "id": fc_id, "call_id": str(call_id), "name": str(tool_name),
@@ -508,7 +519,7 @@ class ResponsesStreamAccumulator:
         return events
 
     def _start_message_output(self) -> list[str]:
-        self._current_msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self._current_msg_id = gen_message_id()
         self._message_started = True
         self.current_type = "text"
         msg_item: dict[str, object] = {

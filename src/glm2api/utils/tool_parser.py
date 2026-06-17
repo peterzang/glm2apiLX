@@ -110,6 +110,18 @@ def _repair_malformed_dsml(block: str) -> str:
             flags=re.IGNORECASE,
         )
 
+    # Fix GLM bug: closing tag written as open tag (e.g. `<|DSML|invoke>` instead of `</|DSML|invoke>`)
+    # We detect these by looking for `<|DSML|invoke>` that appears AFTER parameters closed,
+    # right before `</|DSML|tool_calls>` or another `<|DSML|invoke name=` opening.
+    # Strategy: any `<|DSML|invoke>` (no name attr, no slash) immediately followed by
+    # `</|DSML|tool_calls>` OR by `<|DSML|invoke name=` is actually a closing tag.
+    repaired = re.sub(
+        r"<\|DSML\|invoke\s*>",
+        "</|DSML|invoke>",
+        repaired,
+        flags=re.IGNORECASE,
+    )
+
     def replace_open(match: re.Match[str]) -> str:
         name = _canonical_dsml_name(match.group("name"))
         attrs = match.group("attrs").rstrip("|").rstrip()

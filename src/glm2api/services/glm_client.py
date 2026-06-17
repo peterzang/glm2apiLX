@@ -7,6 +7,7 @@ import http.client
 import json
 import mimetypes
 import re
+import socket
 import threading
 import time
 import uuid
@@ -128,6 +129,17 @@ class GLMWebClient:
             wait_timeout=config.glm_queue_wait_timeout,
             max_concurrency=config.glm_max_concurrency,
         )
+        # Thread-local: last account index used by this thread (for admin metrics)
+        import threading
+        self._tl = threading.local()
+
+    def _set_last_account_index(self, idx: int) -> None:
+        self._tl.last_account_index = idx
+
+    def get_last_account_index(self) -> int:
+        """Return the account index used by the most recent operation on this thread.
+        Returns -1 if no operation has run yet."""
+        return getattr(self._tl, "last_account_index", -1)
 
     def _resolve_tools(self, openai_payload: dict[str, object]) -> tuple[list[dict[str, object]] | None, set[str] | None]:
         raw_tools = list(openai_payload.get("tools", [])) if isinstance(openai_payload.get("tools"), list) else None # type: ignore
@@ -148,7 +160,44 @@ class GLMWebClient:
                 self.logger.info("已过滤不受支持的工具: %s", ", ".join(blocked_names))
         return filtered_tools, {tool["function"]["name"] for tool in filtered_tools} if filtered_tools else None # type: ignore[index]
 
+    @staticmethod
+    def _inject_system_instruction(messages: list[dict[str, object]], instruction: str) -> list[dict[str, object]]:
+        """Prepend or augment a system message in the message list.
+
+        If a system message already exists at index 0, append the instruction to it.
+        Otherwise, prepend a new system message.
+
+        This is used to implement response_format=json_object by translating it
+        into a system instruction (GLM doesn't have a native JSON mode).
+        """
+        if not messages:
+            return [{"role": "system", "content": instruction}]
+        new_messages = [dict(m) for m in messages]  # shallow copy each
+        first = new_messages[0]
+        if isinstance(first, dict) and first.get("role") == "system":
+            existing = first.get("content")
+            if isinstance(existing, str):
+                first["content"] = existing + "\n\n" + instruction
+            elif isinstance(existing, list):
+                # Multi-part system content
+                first["content"] = list(existing) + [{"type": "text", "text": instruction}]  # type: ignore[list-item]
+            else:
+                first["content"] = instruction
+        else:
+            new_messages.insert(0, {"role": "system", "content": instruction})
+        return new_messages
+
     def chat_completion(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
+        # Support n>1 by issuing multiple parallel requests to GLM and merging choices.
+        # GLM upstream doesn't support n natively, so we fan out at the gateway level.
+        try:
+            n_value = int(payload.get("n", 1) or 1)
+        except (TypeError, ValueError):
+            n_value = 1
+        n_value = max(1, min(n_value, 4))  # cap at 4 to limit blast radius
+        if n_value > 1:
+            return self._chat_completion_n(payload, n_value)
+
         _, allowed_tool_names = self._resolve_tools(payload)
         lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
         try:
@@ -162,6 +211,8 @@ class GLMWebClient:
             fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
+            prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
+            tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
         )
         try:
             for event in self._iter_sse_events(response):
@@ -177,6 +228,50 @@ class GLMWebClient:
             self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
         return accumulator.build_response(), accumulator.conversation_id
+
+    def _chat_completion_n(self, payload: dict[str, object], n: int) -> tuple[dict[str, object], str | None]:
+        """Handle n>1 by issuing multiple sequential calls and merging choices."""
+        # Strip n from payload so child calls don't recurse
+        child_payload = dict(payload)
+        child_payload["n"] = 1
+        # Run n sequential calls (parallel would need queue fan-out, sequential is safer)
+        responses: list[tuple[dict[str, object], str | None]] = []
+        last_error: Exception | None = None
+        for _ in range(n):
+            try:
+                resp, conv = self.chat_completion(child_payload)
+                responses.append((resp, conv))
+            except Exception as exc:
+                last_error = exc
+                # Continue to fill as many choices as possible
+        if not responses:
+            assert last_error is not None
+            raise last_error
+        # Merge: take the first response as base, append the rest's choices
+        base_resp, base_conv = responses[0]
+        merged_choices: list[dict[str, object]] = []
+        for idx, (resp, _) in enumerate(responses):
+            choices = resp.get("choices", [])
+            if isinstance(choices, list) and choices:
+                ch = dict(choices[0])
+                ch["index"] = idx
+                merged_choices.append(ch)
+        merged = dict(base_resp)
+        merged["choices"] = merged_choices
+        # Aggregate usage across all calls
+        total_prompt = 0
+        total_completion = 0
+        for resp, _ in responses:
+            u = resp.get("usage", {})
+            if isinstance(u, dict):
+                total_prompt += int(u.get("prompt_tokens", 0) or 0)
+                total_completion += int(u.get("completion_tokens", 0) or 0)
+        merged["usage"] = {
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+        }
+        return merged, base_conv
 
     def generate_images(self, payload: dict[str, object]) -> dict[str, object]:
         lease = self.request_queue.acquire(f"image:{payload.get('model', self.config.glm_image_model_name)}")
@@ -221,6 +316,8 @@ class GLMWebClient:
             fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
+            prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
+            tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
         )
 
         def generate():
@@ -318,9 +415,9 @@ class GLMWebClient:
                         **self.auth.get_browser_headers(),
                         "Authorization": f"Bearer {access_token}",
                         "Referer": "https://chatglm.cn/main/alltoolsdetail",
-                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Device-Id": self.auth.get_device_id_for_account(account_index),
                         "X-Nonce": nonce,
-                        "X-Request-Id": uuid.uuid4().hex,
+                        "X-Request-Id": self.auth.next_request_id_for_account(account_index),
                         "X-Sign": sign,
                         "X-Timestamp": timestamp,
                     },
@@ -355,8 +452,41 @@ class GLMWebClient:
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
         filtered_tools, _ = self._resolve_tools(openai_payload)
+        # Translate response_format (json_object / json_schema) into a system instruction
+        # GLM doesn't have a native JSON mode, but it can follow instructions reliably.
+        response_format = openai_payload.get("response_format")
+        messages_for_conversion = list(openai_payload.get("messages", []))  # type: ignore[arg-type]
+        if isinstance(response_format, dict):
+            rf_type = str(response_format.get("type", "")).strip().lower()
+            if rf_type == "json_object":
+                # OpenAI's documented behavior: when json_object is requested, the model
+                # is told to always respond with valid JSON. We prepend a system message
+                # if none exists, or augment the existing system message.
+                json_instruction = (
+                    "You are a helpful assistant designed to output JSON. "
+                    "Always respond with valid, parseable JSON. "
+                    "Do not include any text outside the JSON object. "
+                    "Do not wrap the JSON in markdown code fences."
+                )
+                messages_for_conversion = self._inject_system_instruction(
+                    messages_for_conversion, json_instruction
+                )
+            elif rf_type == "json_schema":
+                # json_schema mode: provide the schema to the model
+                schema = response_format.get("json_schema", {}).get("schema", {}) if isinstance(response_format.get("json_schema"), dict) else {}
+                schema_str = json.dumps(schema, ensure_ascii=False, separators=(",", ":")) if schema else "{}"
+                json_instruction = (
+                    "You are a helpful assistant designed to output JSON matching a specific schema. "
+                    "Always respond with valid, parseable JSON that matches this schema exactly:\n"
+                    f"{schema_str}\n"
+                    "Do not include any text outside the JSON object. "
+                    "Do not wrap the JSON in markdown code fences."
+                )
+                messages_for_conversion = self._inject_system_instruction(
+                    messages_for_conversion, json_instruction
+                )
         converted_messages = convert_messages(
-            messages=list(openai_payload.get("messages", [])), # type: ignore
+            messages=messages_for_conversion,
             tools=filtered_tools,
             blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
             tool_choice=openai_payload.get("tool_choice"),
@@ -422,9 +552,9 @@ class GLMWebClient:
                         headers={
                             **self.auth.get_browser_headers(),
                             "Authorization": f"Bearer {access_token}",
-                            "X-Device-Id": uuid.uuid4().hex,
+                            "X-Device-Id": self.auth.get_device_id_for_account(account_index),
                             "X-Nonce": nonce,
-                            "X-Request-Id": uuid.uuid4().hex,
+                            "X-Request-Id": self.auth.next_request_id_for_account(account_index),
                             "X-Sign": sign,
                             "X-Timestamp": timestamp,
                         },
@@ -525,9 +655,9 @@ class GLMWebClient:
                 headers={
                     **self.auth.get_browser_headers(),
                     "Authorization": f"Bearer {access_token}",
-                    "X-Device-Id": uuid.uuid4().hex,
+                    "X-Device-Id": self.auth.get_device_id_for_account(account_index),
                     "X-Nonce": nonce,
-                    "X-Request-Id": uuid.uuid4().hex,
+                    "X-Request-Id": self.auth.next_request_id_for_account(account_index),
                     "X-Sign": sign,
                     "X-Timestamp": timestamp,
                 },
@@ -696,8 +826,23 @@ class GLMWebClient:
             except http.client.IncompleteRead as exc:
                 raw_chunk = exc.partial or b""
                 stop_after_chunk = True
-                self.logger.warning("上游 SSE 连接提前断开，按已接收内容收尾 bytes=%s", len(raw_chunk))
+                self.logger.warning("上游 SSE 连接提前断开(IncompleteRead)，按已接收内容收尾 bytes=%s", len(raw_chunk))
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
+                self.logger.warning("上游 SSE 连接被重置(%s)，按已接收内容收尾", type(exc).__name__)
+                raw_chunk = b""
+                stop_after_chunk = True
+            except (socket.timeout, TimeoutError) as exc:
+                self.logger.warning("上游 SSE 读取超时(%s)，按已接收内容收尾", type(exc).__name__)
+                raw_chunk = b""
+                stop_after_chunk = True
+            except OSError as exc:
+                self.logger.warning("上游 SSE 网络 IO 异常(%s: %s)，按已接收内容收尾", type(exc).__name__, exc)
+                raw_chunk = b""
+                stop_after_chunk = True
             if not raw_chunk:
+                if stop_after_chunk:
+                    # 上游断了但还没收到 [DONE]，必须显式收尾，否则客户端会卡死等下一帧
+                    break
                 break
 
             pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
@@ -721,6 +866,8 @@ class GLMWebClient:
             event = emit_block(pending.strip())
             if event not in (None, "[DONE]"):
                 yield event
+        # 关键兜底：上游异常断流时也补一个 [DONE]，让 OpenAI/Anthropic/Responses 客户端能正常结束
+        # （由调用方在 yield 完后自己发 [DONE]，这里不直接 yield 字符串以避免类型混乱）
 
     def _upload_referenced_files(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
         refs: list[dict[str, object]] = []
@@ -772,9 +919,9 @@ class GLMWebClient:
                         "Authorization": f"Bearer {access_token}",
                         "Content-Type": f"multipart/form-data; boundary={boundary}",
                         "Referer": "https://chatglm.cn/",
-                        "X-Device-Id": uuid.uuid4().hex,
+                        "X-Device-Id": self.auth.get_device_id_for_account(account_index),
                         "X-Nonce": nonce,
-                        "X-Request-Id": uuid.uuid4().hex,
+                        "X-Request-Id": self.auth.next_request_id_for_account(account_index),
                         "X-Sign": sign,
                         "X-Timestamp": timestamp,
                     },
@@ -903,21 +1050,48 @@ class GLMWebClient:
             for attempt in range(guest_retry_limit + 1):
                 try:
                     access_token = self.auth.get_access_token_for_account(account_index)
+                    # Record which account served this request (for admin metrics)
+                    self._set_last_account_index(account_index)
                     return operation(account_index, access_token)
                 except Exception as exc:
                     last_exc = exc
                     should_switch = self.auth.should_switch_account(exc)
+                    # 游客频控检测：命中即轮换 device_id（核心修复）
+                    # 智谱游客 chat 接口按 device_id 计数，持久化 device_id 用几次
+                    # 就会被风控；只有换新 device_id + 重新 fetch token 才能恢复
+                    from .glm_auth import is_guest_rate_limited as _is_rate_limited
+                    is_rate_limited = _is_rate_limited(exc)
+                    if is_rate_limited and self.auth.is_guest_account(account_index):
+                        new_dev = self.auth.rotate_device_id_for_account(account_index)
+                        self.logger.warning(
+                            "检测到游客频控，已轮换 device_id account=%s new_dev=%s... 原错误=%s",
+                            account_index, new_dev[:8], exc,
+                        )
+                        # 轮换后必须重试（不管 should_switch）
+                        if attempt < guest_retry_limit:
+                            backoff = min(2 ** attempt, 4)
+                            time.sleep(backoff)
+                            continue
+                        # 重试用完，尝试切换到下一个账号
+                        if account_count > 1:
+                            self.auth.advance_account(account_index, f"{request_name}: 频控")
+                            break
+                        raise
                     if should_switch:
                         self.auth.invalidate_account(account_index)
                     if should_switch and attempt < guest_retry_limit:
+                        # 指数退避：1s → 2s → 4s → 8s ...，避免连续 3 次秒级失败被风控
+                        backoff = min(2 ** attempt, 16)
                         self.logger.warning(
-                            "游客账号请求失败，重新获取游客 ck 重试 attempt=%s/%s request=%s account=%s error=%s",
+                            "游客账号请求失败，%.1fs 后重新获取游客 ck 重试 attempt=%s/%s request=%s account=%s error=%s",
+                            backoff,
                             attempt + 1,
                             guest_retry_limit,
                             request_name,
                             account_index,
                             exc,
                         )
+                        time.sleep(backoff)
                         continue
                     if not should_switch or account_count == 1:
                         raise
