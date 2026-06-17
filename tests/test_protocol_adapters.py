@@ -100,7 +100,10 @@ def test_openai_to_responses_exposes_output_text_and_standard_fields():
     assert response["output_text"] == "hello"
     assert response["error"] is None
     assert response["incomplete_details"] is None
-    assert response["usage"] == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+    assert response["usage"]["input_tokens"] == 2
+    assert response["usage"]["output_tokens"] == 3
+    assert response["usage"]["total_tokens"] == 5
+    assert response["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
 
 
 def test_responses_stream_uses_openai_event_envelope():

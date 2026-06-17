@@ -30,7 +30,7 @@ from .services.responses_adapter import (
     openai_to_responses,
     responses_to_openai,
 )
-from .utils.openai_compat import (
+from .core.openai_compat import (
     ERROR_API,
     ERROR_AUTHENTICATION,
     ERROR_INVALID_REQUEST,
@@ -48,7 +48,7 @@ from .utils.openai_compat import (
     status_for_error_type,
     system_fingerprint,
 )
-from .utils.tokenizer import count_tokens, estimate_message_tokens
+from .core.tokenizer import count_tokens, estimate_message_tokens
 
 
 _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)

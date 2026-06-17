@@ -73,9 +73,6 @@ main.spec
 .DS_Store
 Thumbs.db
 
-# ---- 文档临时目录 ----
-docs/
-
 # ---- 系统文件 ----
 *.tmp
 *.temp

@@ -10,13 +10,13 @@ from logging import Logger
 
 from ..config import AppConfig
 from ..logging_utils import debug_dump
-from ..model_variants import model_requests_search, model_requests_thinking, split_model_features
-from ..utils.openai_compat import (
+from ..core.model_variants import model_requests_search, model_requests_thinking, split_model_features
+from ..core.openai_compat import (
     gen_chatcmpl_id,
     system_fingerprint,
 )
-from ..utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
-from ..utils.tool_protocol import (
+from ..protocol.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+from ..protocol.tool_protocol import (
     BLOCKED_NATIVE_TOOL_NAMES,
     CANONICAL_TOOL_CALL_EXAMPLE,
     SERVER_SIDE_TOOL_NAMES,
@@ -28,7 +28,7 @@ from ..utils.tool_protocol import (
     serialize_tool_result_block as _protocol_serialize_tool_result_block,
     tools_to_prompt as _protocol_tools_to_prompt,
 )
-from ..utils.tokenizer import (
+from ..core.tokenizer import (
     count_tokens,
     estimate_completion_tokens,
     estimate_message_tokens,

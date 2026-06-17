@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model_variants import expand_model_variants
+from .core.model_variants import expand_model_variants
 
 
 DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796"
@@ -180,7 +180,22 @@ def ensure_env_file(env_path: Path) -> bool:
     if env_path.exists():
         return False
 
+    # Search order for the .env.example template:
+    #   1. <cwd>/.env.example            (root layout, e.g. repo root)
+    #   2. <cwd>/configs/env.example     (new layout under configs/)
+    #   3. <cwd>/configs/.env.example    (alternative naming)
+    #   4. <package_root>/../../.env.example       (src layout, repo root)
+    #   5. <package_root>/../../configs/env.example (src layout, configs/)
+    cwd = Path.cwd()
+    pkg_root = Path(__file__).resolve().parent
+    repo_root = pkg_root.parent.parent  # src/glm2api -> src -> repo_root
     example_candidates = [
+        cwd / ".env.example",
+        cwd / "configs" / "env.example",
+        cwd / "configs" / ".env.example",
+        repo_root / ".env.example",
+        repo_root / "configs" / "env.example",
+        repo_root / "configs" / ".env.example",
         env_path.with_name(".env.example"),
         env_path.parent / ".env.example",
     ]

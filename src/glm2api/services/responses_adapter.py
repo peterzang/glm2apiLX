@@ -10,7 +10,7 @@ import json
 import time
 import uuid
 
-from ..utils.openai_compat import (
+from ..core.openai_compat import (
     gen_function_call_id,
     gen_function_call_item_id,
     gen_message_id,

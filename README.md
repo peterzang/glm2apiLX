@@ -4,11 +4,33 @@
 
 支持的主要接口：
 
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/images/generations`
-- `GET /v1/models`
-- `GET /health`
+- `POST /v1/chat/completions` — OpenAI Chat Completions（含流式 / 工具调用 / n>1）
+- `POST /v1/messages` — Anthropic Messages API
+- `POST /v1/responses` — OpenAI Responses API
+- `POST /v1/images/generations` — 文生图（走 GLM cogView）
+- `GET /v1/models` — 模型列表
+- `GET /health` — 健康检查
+- `/admin` — 内置管理面板（Dashboard / 账号管理 / 请求日志 / device_id 轮换审计 / 配置查看 / 系统监控）
+
+## 项目结构
+
+```
+glm2api/
+├── .github/workflows/    # CI 配置
+├── configs/              # 配置示例 + systemd unit
+├── docs/                 # 项目文档（架构 / API 兼容 / 管理面板 / 部署）
+├── scripts/              # 启动 / 停止 / 状态脚本
+├── src/glm2api/          # 源码
+│   ├── core/             # 核心层：模型 / OpenAI 兼容 / tokenizer
+│   ├── services/         # 服务层：上游对接 + 协议适配
+│   ├── protocol/         # 协议层：工具调用解析
+│   └── admin/            # 管理面板（前后端）
+├── tests/                # 单元测试
+├── main.py               # 入口
+└── pyproject.toml
+```
+
+详细架构见 [docs/architecture.md](./docs/architecture.md)。
 
 ## 1. 使用前准备
 
@@ -49,10 +71,10 @@ GLM_USE_GUEST_REFRESH_TOKEN=true
 先复制示例配置：
 
 ```bash
-cp .env.example .env
+cp configs/env.example .env
 ```
 
-如果当前目录没有 `.env`，程序启动时也会自动从 `.env.example` 复制一份默认配置再继续加载。
+如果当前目录没有 `.env`，程序启动时也会自动从 `configs/env.example` 复制一份默认配置再继续加载。
 
 推荐优先准备 `token.txt`，每行一个账号的 `refresh_token`：
 

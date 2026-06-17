@@ -1,4 +1,4 @@
-from glm2api.utils.tool_parser import StreamingToolParser, parse_tool_calls_from_text
+from glm2api.protocol.tool_parser import StreamingToolParser, parse_tool_calls_from_text
 
 
 def test_parse_tool_calls_from_dsml_markup():

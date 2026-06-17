@@ -1,0 +1,28 @@
+[Unit]
+Description=GLM2API - OpenAI/Anthropic compatible reverse-engineered API adapter for ChatGLM
+Documentation=https://github.com/LX-u0/glm2api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glm2api
+Group=glm2api
+WorkingDirectory=/opt/glm2api
+EnvironmentFile=/opt/glm2api/.env
+ExecStart=/opt/glm2api/.venv/bin/python /opt/glm2api/main.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/var/log/glm2api/server.log
+StandardError=append:/var/log/glm2api/server.log
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/glm2api /var/log/glm2api
+
+[Install]
+WantedBy=multi-user.target

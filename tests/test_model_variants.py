@@ -1,4 +1,4 @@
-from glm2api.model_variants import expand_model_variants, split_model_features
+from glm2api.core.model_variants import expand_model_variants, split_model_features
 from glm2api.services.translator import resolve_chat_mode, resolve_networking, resolve_upstream_model
 
 
