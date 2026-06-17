@@ -15,6 +15,16 @@ BLOCKED_NATIVE_TOOL_NAMES = {
     "web_search",
     "browse",
     "open_link",
+    # === 上游 chatglm.cn 自带工具（v3 审核报告 M4）===
+    # GLM-5.2 倾向用上游沙箱工具而非客户端提供的工具，导致 codex 等客户端
+    # 收到 0 个 OpenAI tool_calls，无法继续工作流。屏蔽后强制 GLM 用客户端工具。
+    "execute_sandbox_code",
+    "execute_code",
+    "sandbox_code",
+    "code_sandbox",
+    "run_code",
+    "code_interpreter",
+    "python_interpreter",
 }
 SERVER_SIDE_TOOL_NAMES: set[str] = set()
 

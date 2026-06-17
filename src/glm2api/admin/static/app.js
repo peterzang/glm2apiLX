@@ -274,9 +274,78 @@ async function refreshDashboard() {
       ${renderModelSupplyCard(d.top_models)}
       ${renderOpsMetricsCard(d, requests30m, peakRpm)}
     </div>
+    <div class="kpi-grid" style="margin-top:20px;">
+      ${renderRepetitionCard(d.repetition)}
+      ${renderModelLatencyCard(d.model_latencies)}
+    </div>
   `;
 
   document.getElementById('view-dashboard').innerHTML = kpiRow1 + kpiRow2 + mainArea + bottomCards;
+}
+
+// === 复读率监控卡片（v3 审核报告建议）===
+function renderRepetitionCard(rep) {
+  rep = rep || {};
+  const total = rep.total_events || 0;
+  const recent24h = rep.recent_24h_count || 0;
+  const byModel = rep.by_model || {};
+  const byPath = rep.by_path || {};
+  const tone = total > 0 ? 'warning' : 'success';
+  const modelRows = Object.entries(byModel).map(([m, c]) =>
+    `<div class="flex-between"><span class="mono text-muted" style="font-size:11px;">${escapeHtml(m)}</span><strong>${c}</strong></div>`
+  ).join('') || '<div class="text-muted">暂无</div>';
+  const pathRows = Object.entries(byPath).map(([p, c]) =>
+    `<div class="flex-between"><span class="text-muted">${escapeHtml(p === 'stream' ? '流式' : '非流式')}</span><strong>${c}</strong></div>`
+  ).join('') || '<div class="text-muted">暂无</div>';
+  return `
+    <div class="kpi-card ${tone}">
+      <div class="kpi-label" style="margin-bottom:12px;">复读检测</div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div class="flex-between"><span class="text-muted">总触发次数</span><strong class="mono ${total > 0 ? 'text-warning' : 'text-success'}">${total}</strong></div>
+        <div class="flex-between"><span class="text-muted">最近 24h</span><strong class="mono">${recent24h}</strong></div>
+        <div style="margin-top:6px;padding-top:8px;border-top:1px solid var(--border);">
+          <div class="text-muted" style="font-size:11px;margin-bottom:4px;">按模型</div>
+          ${modelRows}
+        </div>
+        <div>
+          <div class="text-muted" style="font-size:11px;margin-bottom:4px;">按路径</div>
+          ${pathRows}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// === 按模型延迟统计卡片（v3 审核报告建议）===
+function renderModelLatencyCard(modelLatencies) {
+  modelLatencies = modelLatencies || {};
+  const entries = Object.entries(modelLatencies).sort((a, b) => (a[1].avg_ms || 0) - (b[1].avg_ms || 0));
+  if (entries.length === 0) {
+    return `
+      <div class="kpi-card">
+        <div class="kpi-label" style="margin-bottom:12px;">按模型延迟</div>
+        <div class="text-muted" style="font-size:13px;">暂无数据（发送请求后显示）</div>
+      </div>
+    `;
+  }
+  const rows = entries.slice(0, 8).map(([model, lat]) => {
+    const tone = lat.avg_ms < 2000 ? 'text-success' : lat.avg_ms < 5000 ? 'text-warning' : 'text-error';
+    return `
+      <div style="margin-bottom:8px;">
+        <div class="flex-between" style="margin-bottom:2px;">
+          <span class="mono text-muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(model)}">${escapeHtml(model)}</span>
+          <strong class="mono ${tone}" style="font-size:12px;">${lat.avg_ms}ms</strong>
+        </div>
+        <div class="text-muted" style="font-size:10px;">P50 ${lat.p50_ms}ms · P95 ${lat.p95_ms}ms · ${lat.count} 次</div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="kpi-card">
+      <div class="kpi-label" style="margin-bottom:12px;">按模型平均延迟（Top ${Math.min(entries.length, 8)}）</div>
+      <div>${rows}</div>
+    </div>
+  `;
 }
 
 // 紧凑数字格式：1234 → 1.2K，1234567 → 1.2M

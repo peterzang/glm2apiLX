@@ -106,6 +106,11 @@ class AdminStore:
         self._repetition_events: Deque[Dict[str, Any]] = collections.deque(maxlen=200)
         # _repetition_counter: {(model, path): count}
         self._repetition_counter: Dict[tuple, int] = collections.Counter()
+        # 按模型延迟统计（用于「按模型平均延迟」展示）
+        # _model_latencies: {model: list of duration_ms}，每个模型最多保留 100 条
+        self._model_latencies: Dict[str, Deque[int]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=100)
+        )
 
     # -----------------------------------------------------------------
     # Recording
@@ -123,6 +128,9 @@ class AdminStore:
                 self._total_errors += 1
             if rec.model:
                 self._model_counter[rec.model] += 1
+                # 按模型延迟统计（v3 审核报告建议：帮助用户选模型时参考）
+                if 200 <= rec.status < 300:  # 只统计成功请求
+                    self._model_latencies[rec.model].append(rec.duration_ms)
             self._protocol_counter[rec.protocol] = self._protocol_counter.get(rec.protocol, 0) + 1
             if rec.account_index >= 0:
                 stats = self._account_stats.setdefault(rec.account_index, {
@@ -349,7 +357,29 @@ class AdminStore:
                 "proto_breakdown": proto_breakdown,
                 # 复读检测统计
                 "repetition": self.get_repetition_stats_unlocked(),
+                # 按模型延迟统计（v3 审核报告建议）
+                "model_latencies": self._get_model_latencies_summary(),
             }
+
+    def _get_model_latencies_summary(self) -> Dict[str, Dict[str, float]]:
+        """返回每个模型的延迟统计摘要（avg / p50 / p95 / count）。"""
+        summary: Dict[str, Dict[str, float]] = {}
+        for model, latencies in self._model_latencies.items():
+            if not latencies:
+                continue
+            sorted_lats = sorted(latencies)
+            n = len(sorted_lats)
+            avg = sum(sorted_lats) / n
+            p50 = sorted_lats[n // 2]
+            p95_idx = int(n * 0.95)
+            p95 = sorted_lats[min(p95_idx, n - 1)]
+            summary[model] = {
+                "count": n,
+                "avg_ms": round(avg, 1),
+                "p50_ms": p50,
+                "p95_ms": p95,
+            }
+        return summary
 
     def get_repetition_stats_unlocked(self) -> Dict[str, Any]:
         """返回复读检测统计（已持锁版本，避免重入）。"""

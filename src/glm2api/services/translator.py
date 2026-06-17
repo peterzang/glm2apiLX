@@ -238,6 +238,8 @@ def _legacy_build_tool_call_instructions(
         "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
         "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
         "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
+        # === v3 审核报告 M4 修复：明确屏蔽上游沙箱工具 ===
+        "You do NOT have access to upstream sandbox tools like `execute_sandbox_code`, `execute_code`, `code_interpreter`, `sandbox_code`, or `run_code`. These tools are blocked. Always use the client-provided tools listed below for any code execution or file operation.",
         "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
         "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
     ]
@@ -581,6 +583,11 @@ class GLMEventAccumulator:
                             tool_name = str(tool_calls_data.get("name", "")).strip()
                             tool_id = str(tool_calls_data.get("id", "")).strip()
                             arguments = tool_calls_data.get("arguments", "{}")
+                            # 屏蔽上游沙箱工具（v3 审核报告 M4）
+                            # GLM-5.2 倾向调用 execute_sandbox_code 等上游自带工具，
+                            # 但这些工具客户端无法执行，导致 codex 看到 0 个 tool_calls
+                            if tool_name in BLOCKED_NATIVE_TOOL_NAMES:
+                                continue
                             if self.allowed_tool_names is not None and tool_name not in self.allowed_tool_names:
                                 continue
                             if tool_name and tool_id and tool_id not in self._server_side_tool_call_ids:
