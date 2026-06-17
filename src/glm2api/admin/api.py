@@ -33,7 +33,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..config import AppConfig
-from ..services.glm_client import GLMWebClient
+from ..core.model_variants import split_model_features
+from ..core.model_profiles import get_model_profile
+from ..services.glm_client import GLMWebClient, UpstreamAPIError, QueueTimeoutError
 from .store import (
     GLOBAL_STORE,
     RequestRecord,
@@ -334,6 +336,249 @@ def _handle_config(handler, config: AppConfig, glm_client: GLMWebClient, logger:
     _send_json(handler, HTTPStatus.OK, _sanitize_config(config), config)
 
 
+def _handle_models(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """列出当前服务暴露的所有模型（含变体）+ 元信息 + 最近探针结果。
+
+    返回结构：
+      {
+        "total": 74,
+        "base_count": 20,
+        "models": [
+          {
+            "id": "glm-4-flash",
+            "base": "glm-4-flash",
+            "features": [],
+            "is_variant": false,
+            "is_image_model": false,
+            "profile": {"native_function_calling": false, "preferred_format": "xml"},
+            "last_probe": null  或  { ts, ok, latency_ms, status, error, content_preview, account_index }
+          },
+          ...
+        ]
+      }
+    """
+    image_model = config.glm_image_model_name
+    probe_cache = get_store().get_model_probe_cache()
+    models: list[dict[str, Any]] = []
+    for model_id in config.exposed_models:
+        base, features = split_model_features(model_id)
+        profile = get_model_profile(base)
+        models.append({
+            "id": model_id,
+            "base": base,
+            "features": sorted(features),
+            "is_variant": bool(features),
+            "is_image_model": model_id == image_model,
+            "profile": {
+                "native_function_calling": profile.native_function_calling,
+                "preferred_format": profile.preferred_format,
+            },
+            "last_probe": probe_cache.get(model_id),
+        })
+    base_count = len({m["base"] for m in models})
+    _send_json(handler, HTTPStatus.OK, {
+        "total": len(models),
+        "base_count": base_count,
+        "models": models,
+    }, config)
+
+
+def _handle_probe_model(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """对单个模型发起最小请求，返回探针结果。
+
+    请求体：
+      { "model": "glm-4-flash", "prompt": "hi" (可选) }
+
+    返回：
+      {
+        "model": "glm-4-flash",
+        "ok": true,
+        "latency_ms": 1234,
+        "status": 200,
+        "content_preview": "你好...",
+        "usage": {...},
+        "account_index": 3,
+        "error": null
+      }
+    """
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    model = str(payload.get("model", "")).strip()
+    prompt = str(payload.get("prompt", "") or "hi").strip() or "hi"
+    if not model:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_model"}, config)
+        return
+    if model not in config.exposed_models:
+        _send_json(handler, HTTPStatus.NOT_FOUND, {
+            "error": "model_not_found",
+            "model": model,
+            "hint": "该模型不在当前服务暴露的模型列表中",
+        }, config)
+        return
+
+    # 构造最小探针请求：max_tokens=8 足够确认模型可用且消耗极小
+    probe_payload: dict[str, object] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 8,
+        "stream": False,
+    }
+    start = time.perf_counter()
+    try:
+        result, _conv_id = glm_client.chat_completion(probe_payload)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        # 提取内容预览
+        choices = result.get("choices") or []
+        content = ""
+        if choices and isinstance(choices[0], dict):
+            msg = choices[0].get("message") or {}
+            content = str(msg.get("content") or "")
+        probe_result = {
+            "model": model,
+            "ok": True,
+            "latency_ms": latency_ms,
+            "status": 200,
+            "content_preview": content[:200],
+            "usage": result.get("usage"),
+            "account_index": glm_client.get_last_account_index(),
+            "error": None,
+        }
+    except UpstreamAPIError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        probe_result = {
+            "model": model,
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": exc.status_code,
+            "content_preview": "",
+            "usage": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": str(exc),
+        }
+    except QueueTimeoutError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        probe_result = {
+            "model": model,
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": 503,
+            "content_preview": "",
+            "usage": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": f"队列超时: {exc}",
+        }
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        probe_result = {
+            "model": model,
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": 500,
+            "content_preview": "",
+            "usage": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    # 缓存到 store
+    get_store().record_model_probe(model, {
+        "ok": probe_result["ok"],
+        "latency_ms": probe_result["latency_ms"],
+        "status": probe_result["status"],
+        "content_preview": probe_result["content_preview"],
+        "account_index": probe_result["account_index"],
+        "error": probe_result["error"],
+    })
+    _send_json(handler, HTTPStatus.OK, probe_result, config)
+
+
+def _handle_probe(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """端点测试：接收完整 OpenAI Chat Completions 请求体，转发到上游，返回完整响应。
+
+    请求体：标准 OpenAI Chat Completions payload（model + messages + ...）
+    返回：
+      {
+        "ok": true,
+        "latency_ms": 1234,
+        "status": 200,
+        "response": { ...完整 OpenAI ChatCompletion 对象... },
+        "conversation_id": "...",
+        "account_index": 3,
+        "error": null
+      }
+    """
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    model = str(payload.get("model", "")).strip()
+    if not model:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_model"}, config)
+        return
+    if model not in config.exposed_models:
+        _send_json(handler, HTTPStatus.NOT_FOUND, {
+            "error": "model_not_found",
+            "model": model,
+        }, config)
+        return
+    if not isinstance(payload.get("messages"), list) or not payload.get("messages"):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_messages"}, config)
+        return
+    # 强制非流式（admin probe 不支持流式，避免长连接复杂度）
+    payload["stream"] = False
+
+    start = time.perf_counter()
+    try:
+        result, conv_id = glm_client.chat_completion(payload)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        _send_json(handler, HTTPStatus.OK, {
+            "ok": True,
+            "latency_ms": latency_ms,
+            "status": 200,
+            "response": result,
+            "conversation_id": conv_id,
+            "account_index": glm_client.get_last_account_index(),
+            "error": None,
+        }, config)
+    except UpstreamAPIError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        _send_json(handler, HTTPStatus.OK, {
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": exc.status_code,
+            "response": exc.payload,
+            "conversation_id": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": str(exc),
+        }, config)
+    except QueueTimeoutError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        _send_json(handler, HTTPStatus.OK, {
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": 503,
+            "response": None,
+            "conversation_id": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": f"队列超时: {exc}",
+        }, config)
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        logger.error("admin probe failed model=%s error=%s\n%s", model, exc, traceback.format_exc())
+        _send_json(handler, HTTPStatus.OK, {
+            "ok": False,
+            "latency_ms": latency_ms,
+            "status": 500,
+            "response": None,
+            "conversation_id": None,
+            "account_index": glm_client.get_last_account_index(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }, config)
+
+
 def _handle_system(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
     import resource
     import shutil
@@ -415,6 +660,9 @@ _API_ROUTES = {
     "logs": ("GET", _handle_logs),
     "rotates": ("GET", _handle_rotates),
     "accounts": ("GET", _handle_accounts),
+    "models": ("GET", _handle_models),
+    "probe_model": ("POST", _handle_probe_model),
+    "probe": ("POST", _handle_probe),
     "config": ("GET", _handle_config),
     "system": ("GET", _handle_system),
 }

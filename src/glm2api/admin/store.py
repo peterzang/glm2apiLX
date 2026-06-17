@@ -88,6 +88,9 @@ class AdminStore:
         self._started_at = time.time()
         # Rotate events (for audit log)
         self._rotate_events: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
+        # Model probe cache: model_id -> { ts, ok, latency_ms, status, error, content_preview, account_index }
+        # 用于 admin 面板「模型」页显示每个模型最近一次探针结果
+        self._model_probe_cache: Dict[str, Dict[str, Any]] = {}
 
     # -----------------------------------------------------------------
     # Recording
@@ -246,6 +249,29 @@ class AdminStore:
     def account_extra_stats(self, idx: int) -> Dict[str, Any]:
         with self._lock:
             return dict(self._account_stats.get(idx, {"success": 0, "error": 0, "last_used_ts": 0.0}))
+
+    # -----------------------------------------------------------------
+    # Model probe cache（用于 admin「模型」页面展示最近一次探针结果）
+    # -----------------------------------------------------------------
+
+    def record_model_probe(self, model: str, result: Dict[str, Any]) -> None:
+        """记录单模型最近一次探针结果，覆盖旧记录。"""
+        with self._lock:
+            self._model_probe_cache[model] = {
+                "ts": time.time(),
+                **result,
+            }
+
+    def get_model_probe_cache(self) -> Dict[str, Dict[str, Any]]:
+        """返回所有模型的最近探针结果（model_id -> result）。"""
+        with self._lock:
+            # 拷贝避免外部修改
+            return {k: dict(v) for k, v in self._model_probe_cache.items()}
+
+    def clear_model_probe_cache(self) -> None:
+        """清空所有探针缓存。"""
+        with self._lock:
+            self._model_probe_cache.clear()
 
 
 # ---------------------------------------------------------------------------
