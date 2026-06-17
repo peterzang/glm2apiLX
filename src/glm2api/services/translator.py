@@ -521,6 +521,18 @@ def convert_messages(
         transcript_parts.append(f"{title}: {item['content']}".strip())
 
     prompt = "\n\n".join(part for part in transcript_parts if part).strip()
+
+    # P11 修复：在 prompt 末尾（"Assistant: " 之前）加一条最强力的工具调用提醒
+    # 根因：工具指令在 prompt 开头，但 codex system prompt 很长（几千字符），
+    # GLM 读到末尾时已经"忘记"了开头的工具指令，生成描述性文本而非调工具。
+    # 解决：在末尾再放一条极短极强力的提醒，确保 GLM 最后看到的是"调工具"。
+    if tools and tool_choice_policy.get("mode") != "none":
+        prompt += (
+            "\n\n[SYSTEM REMINDER: Tools are available. "
+            "Your next response MUST be a tool call. "
+            "Do NOT write text explanations. Call a tool NOW.]"
+        )
+
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
 
 
@@ -542,6 +554,24 @@ def resolve_chat_mode(model: str, reasoning_effort: object, deep_research: objec
 
 def resolve_networking(model: str, web_search: object) -> bool:
     return bool(web_search) or model_requests_search(model)
+
+
+def _estimate_token_count(text: str) -> int:
+    """P12-2 修复：按内容语言动态估算 token 数。
+    中文字符 1 字符 ≈ 1-2 tokens，英文 4 字符 ≈ 1 token。
+    统计中文字符比例，动态选择 ÷2 或 ÷4。
+    """
+    if not text:
+        return 0
+    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
+    total = len(text)
+    if total == 0:
+        return 0
+    cjk_ratio = cjk_count / total
+    if cjk_ratio > 0.3:
+        return total // 2
+    else:
+        return total // 4
 
 
 @dataclass
@@ -676,9 +706,8 @@ class GLMEventAccumulator:
             # P9 修复：检查 max_tokens 限制
             if self.max_tokens_limit > 0 and not self._force_finished:
                 # 近似 token 计数：每 4 字符 ≈ 1 token
-                # P9/P12 修复：用 ÷3 更保守地估算 token（中文 1 字符≈1-2 token，英文 4 字符≈1 token）
-                # ÷3 让实际 token 数略低于 max_tokens，避免超限
-                approx_tokens = len(self._completion_text_buffer) // 3
+                # P9/P12-2 修复：按内容语言动态估算 token 数
+                approx_tokens = _estimate_token_count(self._completion_text_buffer)
                 if approx_tokens >= self.max_tokens_limit:
                     self._force_finished = True
                     if self.logger:
@@ -975,8 +1004,8 @@ class GLMEventAccumulator:
             and self.max_tokens_limit > 0
             and final_content
         ):
-            # P9/P12 修复：用 ÷3 更保守地估算 token
-            approx_tokens = len(final_content) // 3
+            # P9/P12-2 修复：按内容语言动态估算 token 数
+            approx_tokens = _estimate_token_count(final_content)
             if approx_tokens > self.max_tokens_limit:
                 # 截断到 max_tokens
                 final_content = final_content[: self.max_tokens_limit * 4]
