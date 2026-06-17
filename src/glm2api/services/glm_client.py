@@ -198,8 +198,9 @@ class GLMWebClient:
         if n_value > 1:
             return self._chat_completion_n(payload, n_value)
 
-        # 复读检测：第一次失败（触发复读）时自动重试 1 次
+        # 复读检测 + 描述性文本检测：第一次失败时自动重试 1 次
         # 审核报告 P1 问题：GLM-5.1 在长 prompt + 工具调用场景下偶发复读模式
+        # v4 改进：检测描述性文本（GLM 写 "I'll create..." 但不调工具）
         last_exc: Exception | None = None
         for attempt in range(2):  # 最多 2 次尝试（1 次正常 + 1 次重试）
             try:
@@ -223,12 +224,31 @@ class GLMWebClient:
                 return result, conv_id
             except Exception as exc:
                 last_exc = exc
+                # 描述性文本异常：重试一次
+                if attempt == 0 and "descriptive_text_without_tool_call" in str(exc):
+                    self.logger.warning(
+                        "检测到 GLM 描述性文本未调用工具 model=%s 重试中 (attempt=2/2)",
+                        payload.get("model", "unknown"),
+                    )
+                    continue
+                # 其他异常：重试一次
                 if attempt == 0:
                     self.logger.warning(
                         "GLM 请求失败 重试中 model=%s error=%s",
                         payload.get("model", "unknown"), exc,
                     )
                     continue
+                # 重试仍失败：如果是描述性文本异常，返回原始响应而不是报错
+                if "descriptive_text_without_tool_call" in str(exc):
+                    self.logger.warning(
+                        "GLM 描述性文本重试仍失败 model=%s 返回原始响应",
+                        payload.get("model", "unknown"),
+                    )
+                    # 直接再调一次但不检测描述性文本（返回原始响应给客户端）
+                    try:
+                        return self._chat_completion_single_no_descriptive_check(payload)
+                    except Exception:
+                        pass  # 如果这次也失败，走下面的 raise
                 raise
         if last_exc:
             raise last_exc
@@ -278,6 +298,53 @@ class GLMWebClient:
             return False
         except Exception:
             return False
+
+    def _chat_completion_single_no_descriptive_check(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
+        """跟 _chat_completion_single 一样，但跳过描述性文本检测。
+
+        用于重试仍失败时的兜底：返回原始响应给客户端，而不是抛 500 错误。
+        客户端收到描述性文本后可以自己决定如何处理。
+        """
+        _, allowed_tool_names = self._resolve_tools(payload)
+        lease = self.request_queue.acquire(f"chat:{payload.get('model', 'unknown')}")
+        try:
+            response, assistant_id = self._open_chat_stream(payload, preferred_account_index=self._get_preferred_account_index(lease.ticket))
+        except Exception:
+            lease.release()
+            raise
+        accumulator = GLMEventAccumulator(
+            model=str(payload["model"]),
+            allowed_tool_names=allowed_tool_names,
+            fallback_tool_url=extract_recent_user_url(list(payload.get("messages", []))), # type: ignore[arg-type]
+            debug_enabled=self.config.debug_dump_all,
+            logger=self.logger,
+            prompt_messages=list(payload.get("messages", [])) if isinstance(payload.get("messages"), list) else None,
+            tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
+        )
+        try:
+            for event in self._iter_sse_events(response):
+                if not event:
+                    continue
+                status = event.get("status")
+                self._raise_for_event_error(event, stream=False)
+                accumulator.consume_event(event)
+                if status in {"finish", "intervene"}:
+                    # 临时禁用描述性文本检测
+                    old_allowed = accumulator.allowed_tool_names
+                    accumulator.allowed_tool_names = None  # 禁用检测
+                    result = accumulator.build_response()
+                    accumulator.allowed_tool_names = old_allowed  # 恢复
+                    return result, accumulator.conversation_id
+        finally:
+            response.close() # type: ignore
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            lease.release()
+        # 临时禁用描述性文本检测
+        old_allowed = accumulator.allowed_tool_names
+        accumulator.allowed_tool_names = None
+        result = accumulator.build_response()
+        accumulator.allowed_tool_names = old_allowed
+        return result, accumulator.conversation_id
 
     def _chat_completion_single(self, payload: dict[str, object]) -> tuple[dict[str, object], str | None]:
         """单次 chat_completion 调用（无重试逻辑，由 chat_completion 包装重试）。"""

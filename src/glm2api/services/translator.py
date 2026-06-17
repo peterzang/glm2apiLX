@@ -242,6 +242,12 @@ def _legacy_build_tool_call_instructions(
         "You do NOT have access to upstream sandbox tools like `execute_sandbox_code`, `execute_code`, `code_interpreter`, `sandbox_code`, or `run_code`. These tools are blocked. Always use the client-provided tools listed below for any code execution or file operation.",
         "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
         "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
+        # === v4 改进：强制工具优先，禁止描述性文本 ===
+        "CRITICAL: When tools are available and the user asks you to create files, run commands, or perform actions, you MUST call the appropriate tool IMMEDIATELY in your first response.",
+        "Do NOT write descriptions like 'I will create...', 'Let me...', 'I'll start by...', or any planning text before calling a tool.",
+        "Do NOT write multi-paragraph explanations of what you plan to do. Call the tool directly.",
+        "If the task requires multiple steps, call the first tool now. After receiving the result, call the next tool. Never write a full plan without calling any tool.",
+        "Your first response to an action request must ALWAYS be a tool call, not text explanation.",
     ]
 
     if server_tools:
@@ -673,6 +679,46 @@ class GLMEventAccumulator:
                 len(self._server_side_tool_calls),
             )
 
+        # === v4 改进：当客户端提供了 tools 但 GLM 没调任何工具且文本超长时，检测是否是描述性文本 ===
+        # 这种场景下 GLM 生成了 "I will create..." 类型的长文本但不调工具
+        # 返回 error 让客户端重试（客户端如 codex 会重新发请求）
+        if (
+            not all_tool_calls
+            and self.allowed_tool_names is not None
+            and len(self.allowed_tool_names) > 0
+            and len(self._cached_full_text) > 500
+            and not self._is_useful_response()
+        ):
+            if self.logger:
+                self.logger.warning(
+                    "检测到 GLM 生成描述性文本但未调用工具 text_len=%d model=%s，返回 error 让客户端重试",
+                    len(self._cached_full_text),
+                    self.model,
+                )
+            # 记录到复读/描述性文本统计
+            try:
+                from ..admin.store import get_store as _get_admin_store
+                _get_admin_store().record_repetition_event(
+                    model=str(self.model),
+                    path="stream_descriptive",
+                )
+            except Exception:
+                pass
+            # 返回 error chunk（不发任何 content）
+            error_chunk = self._chunk_json({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                "error": {
+                    "message": "Model generated descriptive text without calling available tools. Please retry with a more specific prompt.",
+                    "type": "upstream_error",
+                    "code": "no_tool_call_descriptive_text",
+                },
+            })
+            return [error_chunk, "data: [DONE]\n\n"]
+
         chunks: list[str] = []
         final_text = self._deferred_visible_text + tail_text
         self._deferred_visible_text = ""
@@ -824,6 +870,33 @@ class GLMEventAccumulator:
             tc_copy["index"] = len(all_tool_calls)
             all_tool_calls.append(tc_copy)
 
+        # === v4 改进：非流式路径也检测描述性文本 ===
+        # 当客户端提供了 tools 但 GLM 没调任何工具且文本是描述性的，抛异常让 chat_completion 重试
+        if (
+            not all_tool_calls
+            and self.allowed_tool_names is not None
+            and len(self.allowed_tool_names) > 0
+            and len(full_text) > 500
+            and not self._is_useful_response()
+        ):
+            if self.logger:
+                self.logger.warning(
+                    "非流式路径检测到描述性文本但未调用工具 text_len=%d model=%s",
+                    len(full_text),
+                    self.model,
+                )
+            # 记录统计
+            try:
+                from ..admin.store import get_store as _get_admin_store
+                _get_admin_store().record_repetition_event(
+                    model=str(self.model),
+                    path="non_stream_descriptive",
+                )
+            except Exception:
+                pass
+            # 抛异常让 chat_completion 的重试逻辑捕获
+            raise RuntimeError("descriptive_text_without_tool_call")
+
         final_content = clean_content.strip()
         message: dict[str, object] = {
             "role": "assistant",
@@ -861,6 +934,42 @@ class GLMEventAccumulator:
             )
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
+
+    def _is_useful_response(self) -> bool:
+        """检测 GLM 生成的文本是否是"有用的响应"。
+
+        用于 v4 改进：当客户端提供了 tools 但 GLM 没调任何工具且文本超长时，
+        判断文本是否是：
+        - 纯描述性文本（"I will create...", "Let me..." 开头）→ 不是有用的 → 返回 False
+        - 实际的回答/代码/分析 → 是有用的 → 返回 True
+
+        判定规则：
+          1. 文本以 "I will" / "I'll" / "Let me" / "I'm going to" / "First," 开头 → 描述性
+          2. 文本前 200 字符里有 3+ 次 "I will" / "I'll" / "Let me" → 描述性
+          3. 其他情况 → 有用
+        """
+        text = (self._cached_full_text or "").strip()
+        if not text:
+            return True  # 空文本不算描述性
+        lower = text[:300].lower()
+        # 规则 1：开头是描述性短语
+        descriptive_starts = (
+            "i will ", "i'll ", "let me ", "i'm going to ",
+            "first, ", "sure, ", "certainly, ", "of course, ",
+        )
+        if lower.startswith(descriptive_starts):
+            # 检查是否后续真的调了工具（如果文本里含 XML tool call 标签，说明模型有尝试）
+            if "<ml_tool" in text or "tool_calls" in text:
+                return True  # 有工具调用尝试
+            # 检查是否是代码（有代码块）
+            if "```" in text[:500]:
+                return True  # 含代码块
+            return False  # 纯描述性
+        # 规则 2：前 300 字符里多次出现描述性短语
+        desc_count = sum(lower.count(phrase) for phrase in ("i will ", "i'll ", "let me "))
+        if desc_count >= 3:
+            return False
+        return True
 
     def _extract_reasoning_tool_calls(self, reasoning_text: str | None = None) -> list[dict[str, object]]:
         source = (reasoning_text if reasoning_text is not None else self.last_full_reasoning) or self._cached_full_reasoning
