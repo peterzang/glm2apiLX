@@ -175,11 +175,167 @@ def sanitize_tool_call_payload(
         final_command = cleaned.get("command")
         if isinstance(final_command, list) and len(final_command) >= 3:
             cmd_str = " ".join(str(p) for p in final_command)
-            converted = _heredoc_to_python_write(cmd_str)
+            # v17: 先尝试通用 shell 写入转换（支持 cat heredoc / echo > / printf > / tee），
+            # 失败时降级到原 _heredoc_to_python_write（保持向后兼容）
+            converted = _shell_write_to_python(cmd_str)
             if converted:
                 cleaned["command"] = converted
+            else:
+                converted = _heredoc_to_python_write(cmd_str)
+                if converted:
+                    cleaned["command"] = converted
 
     return cleaned
+
+
+def _shell_write_to_python(cmd_str: str) -> list[str] | None:
+    """通用 shell 文件写入命令转 python3 -c 写入。
+
+    支持格式（v17 新增）：
+      1. cat > file << 'EOF' ... EOF     （heredoc，多行/单行）
+      2. echo "content" > file            （echo 重定向，双引号）
+      3. echo 'content' > file            （echo 重定向，单引号）
+      4. echo content > file              （echo 裸内容，无引号或含字面引号）
+      5. echo "content" >> file           （echo 追加）
+      6. printf "fmt" > file              （printf 重定向）
+      7. echo "content" | tee file        （tee）
+      8. echo "content" | tee -a file     （tee 追加）
+
+    设计原则：
+      - 优先复用 _heredoc_to_python_write 处理 heredoc（已稳定）
+      - 新增 echo/printf/tee 处理逻辑，覆盖 GLM 其他写入方式
+      - 用 base64 编码 content 避免转义问题
+      - 自动创建父目录
+      - 使用 (start, end) 位置去重，避免同一字符被多个模式匹配
+
+    返回 None 表示不是写入命令或不适合转换。
+    """
+    import re as _re
+    import base64 as _b64
+
+    # 安全字符集：字母数字 _ - . / +
+    filepath_safe = r"[A-Za-z0-9_./\-+]+"
+
+    # 先尝试 heredoc（v15/v16 已稳定的逻辑）
+    heredoc_result = _heredoc_to_python_write(cmd_str)
+    if heredoc_result:
+        return heredoc_result
+
+    # 收集所有 (filepath, mode, content, span_start, span_end) 五元组
+    # span 用于去重（避免同一文本被多个模式重复匹配）
+    raw_matches: list[tuple[str, str, str, int, int]] = []
+
+    # === 模式 1：echo / printf + 引号字符串 + 重定向 ===
+    # 双引号：echo "..." > file 或 printf "..." > file
+    dq_pattern = _re.compile(
+        r"(?:echo|printf)\s+\"((?:[^\"\\]|\\.)*)\"\s*(>>?)\s*(" + filepath_safe + r")"
+    )
+    # 单引号：echo '...' > file 或 printf '...' > file
+    sq_pattern = _re.compile(
+        r"(?:echo|printf)\s+'((?:[^'\\]|\\.)*)'\s*(>>?)\s*(" + filepath_safe + r")"
+    )
+
+    # === 模式 2：echo + 裸内容（无引号）+ 重定向 ===
+    # 裸内容可能含字面双引号（GLM 没正确转义，如 echo print("hello") > file）
+    # 用非贪婪匹配到 > 或 >> 操作符
+    # 排除以引号开头的情况（已被 dq/sq 模式处理）
+    bare_pattern = _re.compile(
+        r"echo\s+([^\s\"'][^<>|&;]*?)\s*(>>?)\s*(" + filepath_safe + r")"
+    )
+
+    # === 模式 3：echo + 引号字符串 + | tee file ===
+    tee_dq_pattern = _re.compile(
+        r"echo\s+\"((?:[^\"\\]|\\.)*)\"\s*\|\s*tee\s+(-a)?\s*(" + filepath_safe + r")"
+    )
+    tee_sq_pattern = _re.compile(
+        r"echo\s+'((?:[^'\\]|\\.)*)'\s*\|\s*tee\s+(-a)?\s*(" + filepath_safe + r")"
+    )
+
+    def _unescape_dq(s: str) -> str:
+        """还原双引号字符串转义。"""
+        return (s.replace('\\"', '"')
+                 .replace('\\\\', '\\')
+                 .replace('\\$', '$')
+                 .replace('\\`', '`')
+                 .replace('\\\n', ''))
+
+    def _unescape_sq(s: str) -> str:
+        """还原单引号字符串转义。"""
+        return s.replace("\\'", "'").replace('\\\\', '\\')
+
+    # 扫描双引号模式
+    for m in dq_pattern.finditer(cmd_str):
+        content = _unescape_dq(m.group(1))
+        mode = m.group(2)
+        filepath = m.group(3)
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    # 扫描单引号模式
+    for m in sq_pattern.finditer(cmd_str):
+        content = _unescape_sq(m.group(1))
+        mode = m.group(2)
+        filepath = m.group(3)
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    # 扫描 tee 模式
+    for m in tee_dq_pattern.finditer(cmd_str):
+        content = _unescape_dq(m.group(1))
+        mode = ">>" if m.group(2) == "-a" else ">"
+        filepath = m.group(3)
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+    for m in tee_sq_pattern.finditer(cmd_str):
+        content = _unescape_sq(m.group(1))
+        mode = ">>" if m.group(2) == "-a" else ">"
+        filepath = m.group(3)
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    # 扫描裸内容模式（最后，且只保留不与已匹配位置重叠的）
+    for m in bare_pattern.finditer(cmd_str):
+        # 检查是否与已有 match 重叠
+        overlap = False
+        for _, _, _, s, e in raw_matches:
+            if m.start() < e and m.end() > s:
+                overlap = True
+                break
+        if overlap:
+            continue
+        content = m.group(1).strip()
+        mode = m.group(2)
+        filepath = m.group(3)
+        # 裸内容第一个 token 不能是命令关键字
+        first_token = content.split()[0] if content else ""
+        if first_token in ("cat", "printf", "tee", "echo", "ls", "cd", "mkdir", "rm", "cp", "mv"):
+            continue
+        # 裸内容不能含危险字符（; & $ ` 等）
+        # 注意：允许 ( ) " ' 字面量（GLM 生成的代码可能含这些）
+        if any(c in content for c in [";", "&", "$", "`", "<"]):
+            continue
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    if not raw_matches:
+        return None
+
+    # 按 span_start 排序，保持命令原始顺序
+    raw_matches.sort(key=lambda x: x[3])
+
+    # 为每个写入生成 python 语句
+    statements: list[str] = []
+    for filepath, mode, content, _, _ in raw_matches:
+        encoded = _b64.b64encode(content.encode("utf-8")).decode("ascii")
+        encoded_repr = repr(encoded)
+        filepath_repr = repr(filepath)
+        open_mode = "'a'" if mode == ">>" else "'w'"
+        stmt = (
+            f"import os,base64 as _b; "
+            f"_p={filepath_repr}; "
+            f"_d=os.path.dirname(_p); "
+            f"(_d and not os.path.isdir(_d) and os.makedirs(_d, exist_ok=True)); "
+            f"open(_p,{open_mode}).write(_b.b64decode({encoded_repr}).decode('utf-8'))"
+        )
+        statements.append(stmt)
+
+    full_script = "; ".join(statements)
+    return ["python3", "-c", full_script]
 
 
 def _heredoc_to_python_write(cmd_str: str) -> list[str] | None:
