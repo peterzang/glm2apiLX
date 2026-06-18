@@ -188,31 +188,68 @@ def _heredoc_to_python_write(cmd_str: str) -> list[str] | None:
     检测模式：cat > file << 'DELIMITER'\ncontent\nDELIMITER
     转为：python3 -c "with open('file','w') as f: f.write('content')"
 
+    v15 修复：支持命令字符串中包含**多个** heredoc（v15 报告 P16-2 task6 bug）。
+    之前用 search() 只匹配第一个，导致后续文件完全丢失（如 task6 的 app.py 没被创建）。
+    现在用 finditer() 收集所有 heredoc，每个生成独立的 open().write() 调用，
+    全部合并到一个 python3 -c 脚本中顺序执行。
+
     返回 None 表示不是 heredoc 命令或不适合转换。
     """
     import re as _re
     # 匹配 cat > file << 'DELIMITER' 或 cat << 'DELIMITER' > file
     # 也匹配 cat > file << DELIMITER（不带引号）
+    # 注意：DELIMITER 必须独占一行（前后只有空白），避免内容中含 EOF 字样的边界 bug
     heredoc_pattern = _re.compile(
-        r"cat\s+>\s*(\S+)\s*<<\s*['\"]?(\w+)['\"]?\n(.*?)\n\2",
+        r"cat\s+>\s*(\S+)\s*<<\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\2\s*(?:\n|$)",
         _re.DOTALL,
     )
-    match = heredoc_pattern.search(cmd_str)
-    if not match:
+
+    # 收集所有 heredoc 块（filepath, content）
+    matches = list(heredoc_pattern.finditer(cmd_str))
+    if not matches:
         return None
 
-    filepath = match.group(1)
-    content = match.group(3)
-
-    # 安全检查：filepath 不含危险字符
-    if any(c in filepath for c in [";", "|", "&", "$", "`", "(", ")"]):
+    # 安全检查：所有 filepath 都不含危险字符
+    safe_chars_ok = True
+    for m in matches:
+        filepath = m.group(1)
+        if any(c in filepath for c in [";", "|", "&", "$", "`", "(", ")", ">", "<"]):
+            safe_chars_ok = False
+            break
+    if not safe_chars_ok:
         return None
 
-    # 转义 content 中的单引号（用于 python3 -c '...' 格式）
-    escaped_content = content.replace("\\", "\\\\").replace("'", "\\'")
+    # 为每个 heredoc 生成一个 open().write() 语句
+    # 用 triple-quoted python 字符串避免单/双引号转义问题
+    # 写法：exec 多个 write 调用
+    statements: list[str] = []
+    for m in matches:
+        filepath = m.group(1)
+        content = m.group(3)
+        # 用 repr() 让 Python 自己处理转义（最安全）
+        # 注意：content 末尾通常无换行，但 heredoc 内容如果原本就有末尾换行会被吞掉
+        # 这里用 write 写入原始 content
+        # 用 base64 编码避免任何转义问题（最稳）
+        import base64 as _b64
+        encoded = _b64.b64encode(content.encode("utf-8")).decode("ascii")
+        # 自动创建父目录（codex 常写 src/app/main.py 这种带子目录的路径）
+        stmt = (
+            f"import os,base64 as _b; "
+            f"_p={filepath!r}; "
+            f"_d=os.path.dirname(_p); "
+            f"(_d and os.makedirs(_d, exist_ok=True)); "
+            f"open(_p,'w').write(_b.b64decode({_encoded_repr(encoded)}).decode('utf-8'))"
+        )
+        statements.append(stmt)
 
-    python_cmd = f"with open('{filepath}','w') as f: f.write('{escaped_content}')"
-    return ["python3", "-c", python_cmd]
+    # 合并为一个 python3 -c 脚本，语句之间用分号分隔
+    full_script = "; ".join(statements)
+    return ["python3", "-c", full_script]
+
+
+def _encoded_repr(b64_str: str) -> str:
+    """返回 base64 字符串的 Python 字面量（带引号）。"""
+    return repr(b64_str)
 
 
 def _fix_bash_quote_escaping(text: str) -> str:

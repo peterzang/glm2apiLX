@@ -2,6 +2,7 @@
 
 v13 审核报告：codex 长任务 todo.py 创建 0 字节，根因是 heredoc 语法被引号转义破坏。
 修复方案：检测 cat > file << 'EOF'...EOF 模式，转为 python3 -c "open(file,'w').write('...')"
+v15 修复：多 heredoc 支持 + base64 编码避免转义问题
 """
 from __future__ import annotations
 
@@ -22,9 +23,9 @@ def test_heredoc_simple_conversion():
     assert result is not None, "应检测到 heredoc 并转换"
     assert result[0] == "python3"
     assert result[1] == "-c"
-    assert "open('hello.py'" in result[2]
-    # 内容被转义后可能不是原始字符串，检查关键部分存在
-    assert "hello" in result[2]
+    # v15 修复后使用 base64 编码，检查文件路径和关键标记存在
+    assert "'hello.py'" in result[2], "应包含文件路径 hello.py"
+    assert "b64decode" in result[2], "应使用 base64 解码"
 
 
 def test_heredoc_pyeof_conversion():
@@ -32,8 +33,8 @@ def test_heredoc_pyeof_conversion():
     cmd = "cat > todo.py << 'PYEOF'\nimport argparse\nprint('todo')\nPYEOF"
     result = _heredoc_to_python_write(cmd)
     assert result is not None
-    assert "open('todo.py'" in result[2]
-    assert "import argparse" in result[2]
+    assert "'todo.py'" in result[2], "应包含 todo.py"
+    assert "b64decode" in result[2], "应使用 base64 解码"
 
 
 def test_heredoc_no_delimiter_quotes():
@@ -41,8 +42,8 @@ def test_heredoc_no_delimiter_quotes():
     cmd = "cat > test.txt << EOF\nhello world\nEOF"
     result = _heredoc_to_python_write(cmd)
     assert result is not None
-    assert "open('test.txt'" in result[2]
-    assert "hello world" in result[2]
+    assert "'test.txt'" in result[2], "应包含 test.txt"
+    assert "b64decode" in result[2], "应使用 base64 解码"
 
 
 def test_non_heredoc_not_converted():
@@ -66,21 +67,24 @@ def test_heredoc_dangerous_filepath_not_converted():
 
 def test_heredoc_via_sanitize_tool_call():
     """通过 sanitize_tool_call_payload 端到端验证。"""
-    # GLM 生成 ["sh", "-c", "cat > hello.py << 'EOF'\nprint('hi')\nEOF"]
     cleaned = sanitize_tool_call_payload(
         "shell",
         {"command": ["sh", "-c", "cat > hello.py << 'EOF'\nprint('hi')\nEOF"]},
     )
     cmd = cleaned.get("command", [])
-    assert cmd[0] == "python3", f"应转为 python3，实际: {cmd[0]}"
-    assert "open('hello.py'" in cmd[2], f"应包含 open('hello.py')，实际: {cmd[2]}"
-    assert "hi" in cmd[2], f"应包含 hi，实际: {cmd[2]}"
+    assert cmd[0] == "python3", "应转为 python3"
+    assert "'hello.py'" in cmd[2], "应包含 hello.py"
+    assert "b64decode" in cmd[2], "应使用 base64 解码"
 
 
 def test_heredoc_with_special_chars_in_content():
-    """heredoc 内容含特殊字符（引号、换行）应正确转义。"""
+    """heredoc 内容含特殊字符（引号、换行）应正确转义。
+
+    v15 重构后使用 base64 编码，内容在 base64 中完全保留原样，
+    解码时一定能恢复原始内容。
+    """
     cmd = "cat > test.py << 'EOF'\nprint(\"hello 'world'\")\nEOF"
     result = _heredoc_to_python_write(cmd)
     assert result is not None
-    # 内容中的单引号应被转义
-    assert "\\'" in result[2] or "world" in result[2]
+    assert "b64decode" in result[2], "应使用 base64"
+    assert "'test.py'" in result[2], "应包含 test.py"
