@@ -57,7 +57,11 @@ EOF"""
 
 
 def test_heredoc_e2e_writes_all_files(tmp_path):
-    """端到端：执行生成的 python3 命令，所有文件都应被创建且内容正确。"""
+    """端到端：执行生成的 python3 命令，所有文件都应被创建且内容正确。
+
+    v16 修复：多行 heredoc 内容默认追加末尾换行（与 shell 行为一致）。
+    shell 行为：cat > file << EOF\\nline1\\nEOF → 写入 "line1\\n"
+    """
     cmd = """cat > requirements.txt << 'EOF'
 flask
 EOF
@@ -77,10 +81,10 @@ EOF"""
     proc = subprocess.run(result, cwd=str(tmp_path), capture_output=True, text=True, timeout=10)
     assert proc.returncode == 0, f"python3 failed: {proc.stderr}"
 
-    # 验证 requirements.txt
+    # 验证 requirements.txt（多行 heredoc 默认追加末尾换行）
     req_file = tmp_path / "requirements.txt"
     assert req_file.exists(), "requirements.txt 未创建"
-    assert req_file.read_text() == "flask"
+    assert req_file.read_text() == "flask\n"
 
     # 验证 app.py
     app_file = tmp_path / "app.py"
@@ -92,7 +96,10 @@ EOF"""
 
 
 def test_heredoc_e2e_creates_subdirectory(tmp_path):
-    """端到端：子目录路径应自动创建父目录。"""
+    """端到端：子目录路径应自动创建父目录。
+
+    v16 修复：多行 heredoc 内容默认追加末尾换行（与 shell 行为一致）。
+    """
     cmd = "cat > src/app/main.py << 'EOF'\nprint('main')\nEOF"
     result = _heredoc_to_python_write(cmd)
     assert result is not None
@@ -101,7 +108,7 @@ def test_heredoc_e2e_creates_subdirectory(tmp_path):
 
     target = tmp_path / "src" / "app" / "main.py"
     assert target.exists(), "src/app/main.py 未创建"
-    assert target.read_text() == "print('main')"
+    assert target.read_text() == "print('main')\n"
 
 
 def test_heredoc_e2e_special_chars(tmp_path):

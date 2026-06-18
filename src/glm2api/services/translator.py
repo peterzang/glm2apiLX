@@ -185,71 +185,103 @@ def sanitize_tool_call_payload(
 def _heredoc_to_python_write(cmd_str: str) -> list[str] | None:
     """检测 heredoc 写入命令并转为 python3 -c 写入。
 
-    检测模式：cat > file << 'DELIMITER'\ncontent\nDELIMITER
-    转为：python3 -c "with open('file','w') as f: f.write('content')"
+    检测模式：
+      多行格式: cat > file << 'DELIMITER'\\ncontent\\nDELIMITER
+      单行格式: cat > file << 'DELIMITER' content DELIMITER  (GLM 实际输出)
 
-    v15 修复：支持命令字符串中包含**多个** heredoc（v15 报告 P16-2 task6 bug）。
-    之前用 search() 只匹配第一个，导致后续文件完全丢失（如 task6 的 app.py 没被创建）。
-    现在用 finditer() 收集所有 heredoc，每个生成独立的 open().write() 调用，
-    全部合并到一个 python3 -c 脚本中顺序执行。
+    转为：python3 -c "import os,base64; open('file','w').write(b64decode('...'))"
+
+    v15 修复：用 finditer() 收集所有 heredoc，每个生成独立的 open().write() 语句
+    v16 修复：支持单行 heredoc 格式（GLM 把 \\n 压成空格的实际输出）
+              + 支持 cat >> file 追加模式
+              + 自动跳过非 heredoc 段（mkdir/echo/ls 等命令）
 
     返回 None 表示不是 heredoc 命令或不适合转换。
     """
     import re as _re
-    # 匹配 cat > file << 'DELIMITER' 或 cat << 'DELIMITER' > file
-    # 也匹配 cat > file << DELIMITER（不带引号）
-    # 注意：DELIMITER 必须独占一行（前后只有空白），避免内容中含 EOF 字样的边界 bug
-    heredoc_pattern = _re.compile(
-        r"cat\s+>\s*(\S+)\s*<<\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\2\s*(?:\n|$)",
+    import base64 as _b64
+
+    # 安全检查：filepath 允许的字符集（字母数字 _ - . / +）
+    # 不允许 ; | & $ ` ( ) > < 空格 等
+    filepath_safe = r"[A-Za-z0-9_./\-+]+"
+
+    # 收集所有 heredoc 块（filepath, mode, content）
+    # 模式 1：多行格式（v15 支持）
+    #   cat > file << 'DELIMITER'\ncontent\nDELIMITER
+    #   cat >> file << 'DELIMITER'\ncontent\nDELIMITER
+    multi_line_pattern = _re.compile(
+        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\3\s*(?:\n|$)",
         _re.DOTALL,
     )
 
-    # 收集所有 heredoc 块（filepath, content）
-    matches = list(heredoc_pattern.finditer(cmd_str))
+    # 模式 2：单行格式（v16 新增，GLM 实际输出格式）
+    #   cat > file << 'DELIMITER' content DELIMITER
+    #   cat >> file << DELIMITER content DELIMITER
+    # 用命名分组避免反向引用混淆；content 用非贪婪 .*? 匹配到第一个定界符
+    single_line_pattern = _re.compile(
+        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<\s*['\"]?(?P<delim>\w+)['\"]?\s+(?P<content>.*?)(?<=\S)\s+(?P=delim)(?!\w)",
+    )
+
+    matches = []  # list of (filepath, mode, content)
+
+    # 先尝试多行格式
+    for m in multi_line_pattern.finditer(cmd_str):
+        mode = m.group(1)  # > or >>
+        filepath = m.group(2)
+        content = m.group(4)
+        # 多行 heredoc 内容默认追加末尾换行（与 shell 行为一致）
+        # shell 行为：cat > file << EOF\nline1\nEOF → 写入 "line1\n"
+        # 我们的实现：write(content + '\n') 模拟 shell 行为
+        if not content.endswith('\n'):
+            content = content + '\n'
+        matches.append((filepath, mode, content))
+
+    # 如果多行没匹配到，尝试单行格式
+    if not matches:
+        for m in single_line_pattern.finditer(cmd_str):
+            mode = m.group(1)  # > or >>
+            filepath = m.group(2)
+            content = m.group("content")
+            # 单行格式的 content 不应该跨多个 cat 命令（避免贪婪匹配错误）
+            # 如果 content 中含 "cat > " 字样，说明匹配跨越了边界，跳过
+            if "cat >" in content or "cat >>" in content:
+                continue
+            matches.append((filepath, mode, content))
+
     if not matches:
         return None
 
-    # 安全检查：所有 filepath 都不含危险字符
-    safe_chars_ok = True
-    for m in matches:
-        filepath = m.group(1)
-        if any(c in filepath for c in [";", "|", "&", "$", "`", "(", ")", ">", "<"]):
-            safe_chars_ok = False
-            break
-    if not safe_chars_ok:
-        return None
-
-    # 为每个 heredoc 生成一个 open().write() 语句
-    # 用 triple-quoted python 字符串避免单/双引号转义问题
-    # 写法：exec 多个 write 调用
+    # 为每个 heredoc 生成 open().write() 语句
     statements: list[str] = []
-    for m in matches:
-        filepath = m.group(1)
-        content = m.group(3)
-        # 用 repr() 让 Python 自己处理转义（最安全）
-        # 注意：content 末尾通常无换行，但 heredoc 内容如果原本就有末尾换行会被吞掉
-        # 这里用 write 写入原始 content
-        # 用 base64 编码避免任何转义问题（最稳）
-        import base64 as _b64
+    for filepath, mode, content in matches:
+        # 用 base64 编码避免任何转义问题
         encoded = _b64.b64encode(content.encode("utf-8")).decode("ascii")
+        encoded_repr = repr(encoded)
+        filepath_repr = repr(filepath)
         # 自动创建父目录（codex 常写 src/app/main.py 这种带子目录的路径）
-        stmt = (
-            f"import os,base64 as _b; "
-            f"_p={filepath!r}; "
-            f"_d=os.path.dirname(_p); "
-            f"(_d and os.makedirs(_d, exist_ok=True)); "
-            f"open(_p,'w').write(_b.b64decode({_encoded_repr(encoded)}).decode('utf-8'))"
-        )
+        if mode == ">>":
+            # 追加模式
+            stmt = (
+                f"import os,base64 as _b; "
+                f"_p={filepath_repr}; "
+                f"_d=os.path.dirname(_p); "
+                f"(_d and not os.path.isdir(_d) and os.makedirs(_d, exist_ok=True)); "
+                f"open(_p,'a').write(_b.b64decode({encoded_repr}).decode('utf-8'))"
+            )
+        else:
+            # 覆盖模式（默认）
+            stmt = (
+                f"import os,base64 as _b; "
+                f"_p={filepath_repr}; "
+                f"_d=os.path.dirname(_p); "
+                f"(_d and not os.path.isdir(_d) and os.makedirs(_d, exist_ok=True)); "
+                f"open(_p,'w').write(_b.b64decode({encoded_repr}).decode('utf-8'))"
+            )
         statements.append(stmt)
 
     # 合并为一个 python3 -c 脚本，语句之间用分号分隔
     full_script = "; ".join(statements)
     return ["python3", "-c", full_script]
-
-
-def _encoded_repr(b64_str: str) -> str:
-    """返回 base64 字符串的 Python 字面量（带引号）。"""
-    return repr(b64_str)
 
 
 def _fix_bash_quote_escaping(text: str) -> str:
