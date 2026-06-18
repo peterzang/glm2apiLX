@@ -191,7 +191,7 @@ def sanitize_tool_call_payload(
 def _shell_write_to_python(cmd_str: str) -> list[str] | None:
     """通用 shell 文件写入命令转 python3 -c 写入。
 
-    支持格式（v17 新增）：
+    支持格式（v17 新增 + v18 修复混合场景）：
       1. cat > file << 'EOF' ... EOF     （heredoc，多行/单行）
       2. echo "content" > file            （echo 重定向，双引号）
       3. echo 'content' > file            （echo 重定向，单引号）
@@ -201,12 +201,16 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
       7. echo "content" | tee file        （tee）
       8. echo "content" | tee -a file     （tee 追加）
 
+    v18 关键修复：支持**混合写入场景**。v17 实现先调 _heredoc_to_python_write，
+    成功就直接返回，导致 heredoc + echo 混合时 echo 部分被丢失。
+    v18 改为：先收集 heredoc 块的 span，再扫描 echo/printf/tee，
+    跳过与 heredoc 重叠的位置，最后合并所有写入操作到一个 python3 -c 脚本。
+
     设计原则：
-      - 优先复用 _heredoc_to_python_write 处理 heredoc（已稳定）
-      - 新增 echo/printf/tee 处理逻辑，覆盖 GLM 其他写入方式
+      - 同时支持 heredoc + echo/printf/tee 混合场景
       - 用 base64 编码 content 避免转义问题
       - 自动创建父目录
-      - 使用 (start, end) 位置去重，避免同一字符被多个模式匹配
+      - 用 (start, end) 位置去重，避免同一字符被多个模式匹配
 
     返回 None 表示不是写入命令或不适合转换。
     """
@@ -216,34 +220,55 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
     # 安全字符集：字母数字 _ - . / +
     filepath_safe = r"[A-Za-z0-9_./\-+]+"
 
-    # 先尝试 heredoc（v15/v16 已稳定的逻辑）
-    heredoc_result = _heredoc_to_python_write(cmd_str)
-    if heredoc_result:
-        return heredoc_result
-
     # 收集所有 (filepath, mode, content, span_start, span_end) 五元组
-    # span 用于去重（避免同一文本被多个模式重复匹配）
     raw_matches: list[tuple[str, str, str, int, int]] = []
 
-    # === 模式 1：echo / printf + 引号字符串 + 重定向 ===
+    # === 第 1 步：扫描所有 heredoc 块（多行 + 单行 + append）===
+    # 复用 _heredoc_to_python_write 的正则逻辑，但直接在这里收集 matches
+    # 多行格式（支持 << 和 <<- 缩进定界符）
+    multi_line_pattern = _re.compile(
+        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\3\s*(?:\n|$)",
+        _re.DOTALL,
+    )
+    # 单行格式
+    # 注意：用 [ \t]+ 而非 \s+，避免匹配多行场景的换行符
+    # content 用 [^\n]*? 确保不跨行
+    single_line_pattern = _re.compile(
+        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<\s*['\"]?(?P<delim>\w+)['\"]?[ \t]+(?P<content>[^\n]*?)(?<=\S)[ \t]+(?P=delim)(?!\w)",
+    )
+
+    for m in multi_line_pattern.finditer(cmd_str):
+        mode = m.group(1)
+        filepath = m.group(2)
+        content = m.group(4)
+        # 多行 heredoc 内容默认追加末尾换行（与 shell 行为一致）
+        if not content.endswith('\n'):
+            content = content + '\n'
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    for m in single_line_pattern.finditer(cmd_str):
+        mode = m.group(1)
+        filepath = m.group(2)
+        content = m.group("content")
+        # 单行格式的 content 不应该跨多个 cat 命令
+        if "cat >" in content or "cat >>" in content:
+            continue
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
+    # === 第 2 步：定义 echo/printf/tee 模式 ===
     # 双引号：echo "..." > file 或 printf "..." > file
     dq_pattern = _re.compile(
         r"(?:echo|printf)\s+\"((?:[^\"\\]|\\.)*)\"\s*(>>?)\s*(" + filepath_safe + r")"
     )
-    # 单引号：echo '...' > file 或 printf '...' > file
+    # 单引号
     sq_pattern = _re.compile(
         r"(?:echo|printf)\s+'((?:[^'\\]|\\.)*)'\s*(>>?)\s*(" + filepath_safe + r")"
     )
-
-    # === 模式 2：echo + 裸内容（无引号）+ 重定向 ===
-    # 裸内容可能含字面双引号（GLM 没正确转义，如 echo print("hello") > file）
-    # 用非贪婪匹配到 > 或 >> 操作符
-    # 排除以引号开头的情况（已被 dq/sq 模式处理）
+    # 裸内容（可能含字面双引号）
     bare_pattern = _re.compile(
         r"echo\s+([^\s\"'][^<>|&;]*?)\s*(>>?)\s*(" + filepath_safe + r")"
     )
-
-    # === 模式 3：echo + 引号字符串 + | tee file ===
+    # tee
     tee_dq_pattern = _re.compile(
         r"echo\s+\"((?:[^\"\\]|\\.)*)\"\s*\|\s*tee\s+(-a)?\s*(" + filepath_safe + r")"
     )
@@ -252,7 +277,6 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
     )
 
     def _unescape_dq(s: str) -> str:
-        """还原双引号字符串转义。"""
         return (s.replace('\\"', '"')
                  .replace('\\\\', '\\')
                  .replace('\\$', '$')
@@ -260,38 +284,64 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
                  .replace('\\\n', ''))
 
     def _unescape_sq(s: str) -> str:
-        """还原单引号字符串转义。"""
         return s.replace("\\'", "'").replace('\\\\', '\\')
 
-    # 扫描双引号模式
+    def _is_heredoc_overlap(start, end):
+        """检查位置是否与已收集的 heredoc 块重叠。"""
+        for _, _, _, s, e in raw_matches:
+            if start < e and end > s:
+                return True
+        return False
+
+    # === 第 3 步：扫描 echo/printf/tee（跳过 heredoc 重叠位置）===
+    # v18 安全：双引号字符串内含 $ ` 会导致 shell 变量展开/命令替换，
+    # 我们的转换器写死字面量会导致内容错误，所以含这些字符的直接跳过
+    def _has_shell_expansion(s: str) -> bool:
+        """检测字符串是否含 shell 变量展开或命令替换（无法安全转义）。"""
+        return "$" in s or "`" in s
+
     for m in dq_pattern.finditer(cmd_str):
+        if _is_heredoc_overlap(m.start(), m.end()):
+            continue
         content = _unescape_dq(m.group(1))
+        if _has_shell_expansion(content):
+            continue  # 含 $VAR 或 `cmd`，跳过（shell 会展开，我们写死会错）
         mode = m.group(2)
         filepath = m.group(3)
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
 
-    # 扫描单引号模式
     for m in sq_pattern.finditer(cmd_str):
+        if _is_heredoc_overlap(m.start(), m.end()):
+            continue
         content = _unescape_sq(m.group(1))
+        # 单引号内 $ 和 ` 是字面量，不会展开，所以可以保留
         mode = m.group(2)
         filepath = m.group(3)
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
 
-    # 扫描 tee 模式
     for m in tee_dq_pattern.finditer(cmd_str):
+        if _is_heredoc_overlap(m.start(), m.end()):
+            continue
         content = _unescape_dq(m.group(1))
+        if _has_shell_expansion(content):
+            continue
         mode = ">>" if m.group(2) == "-a" else ">"
         filepath = m.group(3)
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
+
     for m in tee_sq_pattern.finditer(cmd_str):
+        if _is_heredoc_overlap(m.start(), m.end()):
+            continue
         content = _unescape_sq(m.group(1))
         mode = ">>" if m.group(2) == "-a" else ">"
         filepath = m.group(3)
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
 
-    # 扫描裸内容模式（最后，且只保留不与已匹配位置重叠的）
+    # 裸内容（最后，跳过所有已有 match 重叠位置）
     for m in bare_pattern.finditer(cmd_str):
-        # 检查是否与已有 match 重叠
+        if _is_heredoc_overlap(m.start(), m.end()):
+            continue
+        # 检查与 echo/printf/tee 已有 match 重叠
         overlap = False
         for _, _, _, s, e in raw_matches:
             if m.start() < e and m.end() > s:
@@ -302,12 +352,9 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
         content = m.group(1).strip()
         mode = m.group(2)
         filepath = m.group(3)
-        # 裸内容第一个 token 不能是命令关键字
         first_token = content.split()[0] if content else ""
         if first_token in ("cat", "printf", "tee", "echo", "ls", "cd", "mkdir", "rm", "cp", "mv"):
             continue
-        # 裸内容不能含危险字符（; & $ ` 等）
-        # 注意：允许 ( ) " ' 字面量（GLM 生成的代码可能含这些）
         if any(c in content for c in [";", "&", "$", "`", "<"]):
             continue
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
