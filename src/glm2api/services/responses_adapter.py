@@ -7,6 +7,7 @@ chat/completions format so the existing GLM pipeline can be reused.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 
@@ -17,6 +18,9 @@ from ..core.openai_compat import (
     gen_response_id,
     system_fingerprint,
 )
+
+# v20 P1-3: 模块级 logger，用于记录 GLM 上游异常（output_tokens > 0 但 output 空）
+_logger = logging.getLogger("glm2api.responses_adapter")
 
 
 def _safe_json(obj: object) -> str:
@@ -269,6 +273,17 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
     usage = result.get("usage", {})
     input_tokens = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
     output_tokens = usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+
+    # v20 P1-3: GLM 上游异常检测 — output_tokens > 0 但 output 数组为空
+    # 这种情况说明 GLM 返回了 token 计数但实际内容为空（可能是 GLM 把内容放在了非标准字段，
+    # 或者上游接口异常）。记录 WARNING 日志方便排查。
+    if output_tokens > 0 and not output and not output_text_parts:
+        _logger.warning(
+            "glm upstream anomaly: output_tokens=%d but output array is empty "
+            "(model=%s, response_id=%s, input_tokens=%d). "
+            "GLM may have returned content in a non-standard field.",
+            output_tokens, model, response_id, input_tokens,
+        )
 
     return {
         "id": response_id,
