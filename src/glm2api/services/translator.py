@@ -160,12 +160,6 @@ def sanitize_tool_call_payload(
                     cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
 
         # === M3 修复：bash heredoc 引号转义修复 ===
-        # GLM-5.2 在生成含 heredoc + 嵌套引号的 bash 命令时，引号转义能力不足：
-        #   #"'!/usr/bin/env python3  →  应为 #!/usr/bin/env python3
-        #   task['"'id']              →  应为 task['id']
-        #   task['"'title']           →  应为 task['title']
-        # 这些诡异转义破坏了 bash 语法，导致 heredoc 文件创建失败。
-        # 在这里对 shell 命令做后处理修复。
         final_command = cleaned.get("command")
         if isinstance(final_command, list):
             cleaned["command"] = [
@@ -175,7 +169,50 @@ def sanitize_tool_call_payload(
         elif isinstance(final_command, str):
             cleaned["command"] = _fix_bash_quote_escaping(final_command)
 
+        # === P16-2 修复：heredoc 写入失败 → 自动转为 python3 -c 写入 ===
+        # v13 审核报告：codex 长任务 todo.py 创建 0 字节，根因是 heredoc 语法被引号转义破坏
+        # 修复方案：检测 cat > file << 'EOF'...EOF 模式，转为 python3 -c "open(file,'w').write('...')"
+        final_command = cleaned.get("command")
+        if isinstance(final_command, list) and len(final_command) >= 3:
+            cmd_str = " ".join(str(p) for p in final_command)
+            converted = _heredoc_to_python_write(cmd_str)
+            if converted:
+                cleaned["command"] = converted
+
     return cleaned
+
+
+def _heredoc_to_python_write(cmd_str: str) -> list[str] | None:
+    """检测 heredoc 写入命令并转为 python3 -c 写入。
+
+    检测模式：cat > file << 'DELIMITER'\ncontent\nDELIMITER
+    转为：python3 -c "with open('file','w') as f: f.write('content')"
+
+    返回 None 表示不是 heredoc 命令或不适合转换。
+    """
+    import re as _re
+    # 匹配 cat > file << 'DELIMITER' 或 cat << 'DELIMITER' > file
+    # 也匹配 cat > file << DELIMITER（不带引号）
+    heredoc_pattern = _re.compile(
+        r"cat\s+>\s*(\S+)\s*<<\s*['\"]?(\w+)['\"]?\n(.*?)\n\2",
+        _re.DOTALL,
+    )
+    match = heredoc_pattern.search(cmd_str)
+    if not match:
+        return None
+
+    filepath = match.group(1)
+    content = match.group(3)
+
+    # 安全检查：filepath 不含危险字符
+    if any(c in filepath for c in [";", "|", "&", "$", "`", "(", ")"]):
+        return None
+
+    # 转义 content 中的单引号（用于 python3 -c '...' 格式）
+    escaped_content = content.replace("\\", "\\\\").replace("'", "\\'")
+
+    python_cmd = f"with open('{filepath}','w') as f: f.write('{escaped_content}')"
+    return ["python3", "-c", python_cmd]
 
 
 def _fix_bash_quote_escaping(text: str) -> str:
