@@ -172,9 +172,24 @@ def sanitize_tool_call_payload(
         # === P16-2 修复：heredoc 写入失败 → 自动转为 python3 -c 写入 ===
         # v13 审核报告：codex 长任务 todo.py 创建 0 字节，根因是 heredoc 语法被引号转义破坏
         # 修复方案：检测 cat > file << 'EOF'...EOF 模式，转为 python3 -c "open(file,'w').write('...')"
+        # v19 修复：command 数组长度 >= 1 时就尝试转换（之前要求 >= 3，
+        # 导致 GLM 生成的 ["cat > app.py << 'EOF'...", "echo flask > requirements.txt"]
+        # 这种长度为 2 的多命令数组被跳过）
         final_command = cleaned.get("command")
-        if isinstance(final_command, list) and len(final_command) >= 3:
-            cmd_str = " ".join(str(p) for p in final_command)
+        if isinstance(final_command, list) and len(final_command) >= 1:
+            # 拼接 command 数组：每个元素可能本身就是完整命令（如 "cat > file << EOF..."）
+            # 也可能是命令 token（如 ["sh", "-c", "cat > file << EOF..."]）
+            # 用换行符拼接多命令元素，用空格拼接 token
+            # 启发式：如果元素含空格或 > << 等操作符，说明是完整命令，用换行拼接
+            parts = [str(p) for p in final_command]
+            # 检测是否是 ["sh", "-c", "..."] / ["bash", "-c", "..."] 这种 token 数组
+            if len(parts) >= 3 and parts[0] in ("sh", "bash", "zsh", "/bin/sh", "/bin/bash") and parts[1] == "-c":
+                # token 数组：["sh", "-c", "actual command"]
+                cmd_str = parts[2] if len(parts) == 3 else " ".join(parts[2:])
+            else:
+                # 完整命令数组：["cat > file << EOF...", "echo > file2..."]
+                # 用换行符拼接（每个元素是独立命令）
+                cmd_str = "\n".join(parts)
             # v17: 先尝试通用 shell 写入转换（支持 cat heredoc / echo > / printf > / tee），
             # 失败时降级到原 _heredoc_to_python_write（保持向后兼容）
             converted = _shell_write_to_python(cmd_str)
@@ -223,21 +238,41 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
     # 收集所有 (filepath, mode, content, span_start, span_end) 五元组
     raw_matches: list[tuple[str, str, str, int, int]] = []
 
-    # === 第 1 步：扫描所有 heredoc 块（多行 + 单行 + append）===
+    # === 第 1 步：扫描所有 heredoc 块（多行 + 单行 + <<- 缩进 + 两种顺序）===
     # 复用 _heredoc_to_python_write 的正则逻辑，但直接在这里收集 matches
-    # 多行格式（支持 << 和 <<- 缩进定界符）
-    multi_line_pattern = _re.compile(
+    # v18 修复 P0-2：支持两种 heredoc 顺序：
+    #   1. cat > file << EOF\n...\nEOF  （重定向在前，常见格式）
+    #   2. cat << EOF > file\n...\nEOF  （heredoc 在前，GLM 实际输出格式）
+    # 多行格式 v1（重定向在前）
+    multi_line_v1 = _re.compile(
         r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<-?\s*['\"]?(\w+)['\"]?\n(.*?)\n\s*\3\s*(?:\n|$)",
         _re.DOTALL,
     )
-    # 单行格式
+    # 多行格式 v2（heredoc 在前，GLM 实际输出）
+    multi_line_v2 = _re.compile(
+        r"cat\s*<<-?\s*['\"]?(\w+)['\"]?\s*(>>?)\s*(" + filepath_safe + r")\n(.*?)\n\s*\1\s*(?:\n|$)",
+        _re.DOTALL,
+    )
+    # 单行格式 v1（重定向在前）
     # 注意：用 [ \t]+ 而非 \s+，避免匹配多行场景的换行符
     # content 用 [^\n]*? 确保不跨行
-    single_line_pattern = _re.compile(
-        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<\s*['\"]?(?P<delim>\w+)['\"]?[ \t]+(?P<content>[^\n]*?)(?<=\S)[ \t]+(?P=delim)(?!\w)",
+    single_line_v1 = _re.compile(
+        r"cat\s+(>>?)\s*(" + filepath_safe + r")\s*<<\s*['\"]?(?P<delim1>\w+)['\"]?[ \t]+(?P<content1>[^\n]*?)(?<=\S)[ \t]+(?P=delim1)(?!\w)",
+    )
+    # 单行格式 v2（heredoc 在前，GLM 实际输出）
+    single_line_v2 = _re.compile(
+        r"cat\s*<<\s*['\"]?(?P<delim2>\w+)['\"]?[ \t]+(?P<content2>[^\n]*?)(?<=\S)[ \t]+(?P=delim2)[ \t]*(>>?)\s*(" + filepath_safe + r")(?!\w)",
     )
 
-    for m in multi_line_pattern.finditer(cmd_str):
+    # 收集所有匹配，用 span 去重（同一位置可能被 v1/v2 两个 pattern 同时匹配）
+    heredoc_spans: list[tuple[int, int]] = []
+
+    def _is_span_seen(s, e):
+        return any(s < se and e > ss for ss, se in heredoc_spans)
+
+    for m in multi_line_v1.finditer(cmd_str):
+        if _is_span_seen(m.start(), m.end()):
+            continue
         mode = m.group(1)
         filepath = m.group(2)
         content = m.group(4)
@@ -245,15 +280,40 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
         if not content.endswith('\n'):
             content = content + '\n'
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
+        heredoc_spans.append((m.start(), m.end()))
 
-    for m in single_line_pattern.finditer(cmd_str):
+    for m in multi_line_v2.finditer(cmd_str):
+        if _is_span_seen(m.start(), m.end()):
+            continue
+        mode = m.group(2)
+        filepath = m.group(3)
+        content = m.group(4)
+        if not content.endswith('\n'):
+            content = content + '\n'
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+        heredoc_spans.append((m.start(), m.end()))
+
+    for m in single_line_v1.finditer(cmd_str):
+        if _is_span_seen(m.start(), m.end()):
+            continue
         mode = m.group(1)
         filepath = m.group(2)
-        content = m.group("content")
-        # 单行格式的 content 不应该跨多个 cat 命令
-        if "cat >" in content or "cat >>" in content:
+        content = m.group("content1")
+        if "cat >" in content or "cat >>" in content or "cat <<" in content:
             continue
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
+        heredoc_spans.append((m.start(), m.end()))
+
+    for m in single_line_v2.finditer(cmd_str):
+        if _is_span_seen(m.start(), m.end()):
+            continue
+        content = m.group("content2")
+        if "cat >" in content or "cat >>" in content or "cat <<" in content:
+            continue
+        mode = m.group(3)
+        filepath = m.group(4)
+        raw_matches.append((filepath, mode, content, m.start(), m.end()))
+        heredoc_spans.append((m.start(), m.end()))
 
     # === 第 2 步：定义 echo/printf/tee 模式 ===
     # 双引号：echo "..." > file 或 printf "..." > file
