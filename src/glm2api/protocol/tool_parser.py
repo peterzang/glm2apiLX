@@ -145,7 +145,13 @@ def _repair_malformed_dsml(block: str) -> str:
 
 def _normalize_dsml_to_xml(block: str) -> str:
     repaired = _repair_malformed_dsml(block)
-    return DSML_TAG_PATTERN.sub(lambda match: match.group(0).replace("|DSML|", ""), repaired)
+    xml_block = DSML_TAG_PATTERN.sub(lambda match: match.group(0).replace("|DSML|", ""), repaired)
+    # v19 修复 P0-5：GLM 输出 CDATA 内容含 ] 字符时会产生双 ]]>]]>
+    # 第一个 ]]> 是 GLM 误判的 CDATA 关闭符，第二个 ]]> 才是真正的关闭符
+    # XML 解析器遇到第一个 ]]> 就关闭 CDATA，剩余内容成为无效字符，整个 DSML 块解析失败
+    # 修复：把连续的 ]]>]]> (或更多) 替换为单个 ]]>
+    xml_block = re.sub(r"(?:\]\]>){2,}", "]]>", xml_block)
+    return xml_block
 
 
 def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -> bool:
@@ -155,13 +161,19 @@ def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -
 
 
 def _balanced_text(value: str) -> str:
-    """规范化 DSML CDATA 文本，保留换行符。
+    """规范化 DSML 文本节点的无关空白。
+
+    注意：此函数只应用于普通 XML 文本节点（非 CDATA）。
+    CDATA 内容是字面量，含 Python 代码缩进、JSON 缩进等结构信息，
+    不应该被规范化。_leaf_text 会区分两者。
 
     v18 修复（P0-1）：旧实现用 re.sub(r"\\s+", " ", value) 把所有空白字符
     （包括换行符 \\n 和 tab \\t）替换成单个空格，导致 GLM 输出的多行 heredoc、
     多行 echo 内容、多行 Python 代码全部被压成单行，破坏语句分隔。
 
-    新实现：只规范化行内空格和 tab（多个空格变一个），保留换行符。
+    v19 修复（P0-4）：v18 的修复仍用 line.strip() 把每行首尾空格去掉，
+    导致 Python 代码缩进丢失（4 空格变 0 空格），IndentationError。
+    现在 _balanced_text 只用于普通文本节点，CDATA 由 _leaf_text 直接返回原样。
     """
     # 只规范化空格和 tab，保留换行符
     value = re.sub(r"[ \t]+", " ", value)
@@ -171,7 +183,18 @@ def _balanced_text(value: str) -> str:
 
 
 def _leaf_text(element: ET.Element) -> str:
-    return _balanced_text("".join(element.itertext()))
+    """提取元素的文本内容，CDATA 内容原样返回不规范化。
+
+    v19 修复（P0-4）：CDATA 内容是字面量（含 Python 代码缩进、JSON 缩进等），
+    不应该经过 _balanced_text 规范化（会 strip 掉行首缩进）。
+    用启发式：如果文本含换行符，说明是多行 CDATA，直接返回原样。
+    """
+    text = "".join(element.itertext())
+    # CDATA 内容（多行）原样返回，保留缩进
+    if "\n" in text:
+        return text
+    # 单行文本节点（XML 文本）可以规范化
+    return _balanced_text(text)
 
 
 def _coerce_leaf_value(text: str) -> object:
