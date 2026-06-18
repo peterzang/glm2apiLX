@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import time
 from bisect import insort
 from dataclasses import dataclass, field
@@ -130,8 +131,7 @@ def sanitize_tool_call_payload(
                     cleaned["command"] = [str(part) for part in parsed_command]
             else:
                 # P16 修复：Linux 环境下不用 powershell.exe，改用 sh -c
-                import sys as _sys
-                if _sys.platform != "win32":
+                if sys.platform != "win32":
                     cleaned["command"] = ["sh", "-c", stripped_command]
                 else:
                     cleaned["command"] = ["powershell.exe", "-Command", stripped_command]
@@ -142,8 +142,7 @@ def sanitize_tool_call_payload(
             is_shell_host = lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"}
             is_powershell_command = bool(POWERSHELL_CMDLET_PATTERN.fullmatch(command_name)) or lower_name in POWERSHELL_ALIASES
             # P16 修复：Linux 环境下把 powershell.exe 命令转成 sh -c
-            import sys as _sys2
-            if _sys2.platform != "win32" and is_shell_host and lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+            if sys.platform != "win32" and is_shell_host and lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
                 # 把 ["powershell.exe", "-Command", "cat << ... > file"] 转成 ["sh", "-c", "cat << ... > file"]
                 cmd_idx = None
                 for i, p in enumerate(command_parts):
@@ -155,7 +154,7 @@ def sanitize_tool_call_payload(
                 else:
                     cleaned["command"] = ["sh", "-c", " ".join(command_parts[1:])]
             elif is_powershell_command and not is_shell_host:
-                if _sys2.platform != "win32":
+                if sys.platform != "win32":
                     cleaned["command"] = ["sh", "-c", " ".join(command_parts)]
                 else:
                     cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
@@ -182,21 +181,24 @@ def sanitize_tool_call_payload(
 def _fix_bash_quote_escaping(text: str) -> str:
     """修复 GLM-5.2 生成的 bash 命令中的引号转义错误。
 
-    已知 bug 模式（v3-v5 审核报告 M3）：
-      1. #"'!    →  #!       （shebang 行的诡异转义：# + " + ' + !）
-      2. '"'      →  '         （单引号被双引号包裹：' + " + ' → '）
+    已知 bug 模式（v3-v12 审核报告 M3/P16）：
+      1. #"'!    →  #!       （shebang 行的诡异转义）
+      2. '"'      →  '         （单引号被双引号包裹）
       3. \\"'     →  '         （转义单引号）
-
-    这些模式出现在 heredoc 内容里，破坏了 bash 语法解析。
+      4. \\"\\\\" →  "         （双重转义双引号，v12 新增）
+      5. \\\\n    →  \\n       （过度转义换行符，v12 新增）
     """
     if not text or not isinstance(text, str):
         return text
-    # 模式 1：#"'!  →  #!（3 字符序列 " + ' 在 # 后面）
+    # 模式 1：#"'!  →  #!
     text = text.replace('#"\'!', '#!')
-    # 模式 2：'"'  →  '（3 字符序列 ' + " + ' 替换为单个 '）
+    # 模式 2：'"'  →  '
     text = text.replace('\'"\'', '\'')
-    # 模式 3：\\"'  →  '（转义双引号+单引号）
+    # 模式 3：\\"'  →  '
     text = text.replace('\\"\'', '\'')
+    # 模式 4：\\"\\\\"  →  "（双重转义双引号）
+    text = text.replace('\\" \\"', '"')
+    # 模式 5：\\\\n  →  \\n（过度转义换行，但不影响实际执行因为是 JSON 字符串内）
     return text
 
 
@@ -553,10 +555,9 @@ def convert_messages(
             "Your next response MUST be a tool call. "
             "Do NOT write text explanations. Call a tool NOW.]"
         )
-        # P11-2: 加日志确认 SYSTEM REMINDER 确实注入
-        import logging as _logging
-        _logging.getLogger("glm2api.translator").info(
-            "P11 SYSTEM REMINDER 已注入 prompt 末尾 tools=%d mode=%s prompt_len=%d",
+        # P11-2: DEBUG 级别日志（已确认生效，降低生产环境日志噪声）
+        logging.getLogger("glm2api.translator").debug(
+            "P11 SYSTEM REMINDER 注入 tools=%d mode=%s prompt_len=%d",
             len(tools) if tools else 0,
             tool_choice_policy.get("mode"),
             len(prompt),
