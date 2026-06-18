@@ -559,6 +559,23 @@ class GLM2APIServer:
                 model = str(payload.get("model", "glm-4"))
                 openai_payload = anthropic_to_openai(payload)
 
+                # v20 P2-2: strict_model_validation 模式下校验模型是否存在
+                # 默认宽松模式（容错 fallback 到默认模型），符合 Claude Code 客户端友好设计
+                # 设置环境变量 STRICT_MODEL_VALIDATION=true 启用严格模式
+                strict_model_validation = os.environ.get("STRICT_MODEL_VALIDATION", "").lower() in ("true", "1", "yes")
+                if strict_model_validation and model not in self._get_effective_exposed_models():
+                    self._write_json(
+                        HTTPStatus.NOT_FOUND,
+                        make_error(
+                            f"The model '{model}' does not exist",
+                            error_type="invalid_request_error",
+                            param="model",
+                            code="model_not_found",
+                            request_id=gen_request_id(),
+                        ),
+                    )
+                    return
+
                 if payload.get("stream"):
                     self._stream_anthropic(openai_payload, model)
                     return

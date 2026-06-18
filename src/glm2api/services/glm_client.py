@@ -219,6 +219,16 @@ class GLMWebClient:
                         pass
                     payload = self._inject_retry_hint(payload)
                     continue
+                # v20 P3: 检测 GLM 上游空 output 异常（output_tokens > 0 但 content 空）
+                # task9 失败根因：GLM 返回 output_tokens=286 但 output 数组为空
+                if attempt < MAX_ATTEMPTS - 1 and self._is_empty_output_anomaly(result):
+                    self.logger.warning(
+                        "检测到 GLM 上游空 output 异常 model=%s 重试中 (attempt=%d/%d) "
+                        "(output_tokens>0 but content empty)",
+                        payload.get("model", "unknown"), attempt + 2, MAX_ATTEMPTS,
+                    )
+                    payload = self._inject_retry_hint(payload)
+                    continue
                 return result, conv_id
             except Exception as exc:
                 last_exc = exc
@@ -271,7 +281,7 @@ class GLMWebClient:
 
     def _is_repetition_loop(self, result: dict[str, object]) -> bool:
         """检测响应是否陷入复读模式（同一句话重复 N 次以上）。
-        
+
         判定规则：
           - 提取 choices[0].message.content 文本
           - 按句号/换行切分为句子
@@ -310,6 +320,47 @@ class GLMWebClient:
                 else:
                     consecutive = 1
             return False
+        except Exception:
+            return False
+
+    def _is_empty_output_anomaly(self, result: dict[str, object]) -> bool:
+        """检测 GLM 上游异常：output_tokens > 0 但 content 为空。
+
+        v20 报告 P3：task9 失败——GLM 返回 output_tokens=286 但 output 数组为空。
+        这种情况说明 GLM 返回了 token 计数但实际内容为空（可能是 GLM 把内容
+        放在了非标准字段，或者上游接口异常）。
+
+        检测条件：
+          - usage.completion_tokens > 0
+          - choices[0].message.content 为空
+          - choices[0].message.tool_calls 为空或不存在
+        满足以上条件时判定为异常，触发自动重试。
+        """
+        try:
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return False
+            choice = choices[0] if isinstance(choices[0], dict) else None
+            if not choice:
+                return False
+            msg = choice.get("message")
+            if not isinstance(msg, dict):
+                return False
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
+            # content 为空且无 tool_calls
+            content_empty = not content or (isinstance(content, str) and not content.strip())
+            tool_calls_empty = not tool_calls or (isinstance(tool_calls, list) and len(tool_calls) == 0)
+            if not (content_empty and tool_calls_empty):
+                return False
+            # usage.completion_tokens > 0
+            usage = result.get("usage")
+            if not isinstance(usage, dict):
+                return False
+            completion_tokens = usage.get("completion_tokens", 0)
+            if not isinstance(completion_tokens, (int, float)) or completion_tokens <= 0:
+                return False
+            return True
         except Exception:
             return False
 

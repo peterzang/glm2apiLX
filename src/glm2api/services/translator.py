@@ -922,7 +922,10 @@ def convert_messages(
         prompt += (
             "\n\n[SYSTEM REMINDER: Tools are available. "
             "Your next response MUST be a tool call. "
-            "Do NOT write text explanations. Call a tool NOW.]"
+            "Do NOT write text explanations. Call a tool NOW. "
+            # v20 P2-1: 4 空格缩进提示，缓解 GLM 输出 1 空格缩进导致 Python IndentationError
+            # v20 报告 task2 失败根因：GLM 输出 1 空格缩进，for 循环体与 for 同级
+            "When writing Python code, ALWAYS use 4-space indentation.]"
         )
         # P11-2: DEBUG 级别日志（已确认生效，降低生产环境日志噪声）
         logging.getLogger("glm2api.translator").debug(
