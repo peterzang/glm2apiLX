@@ -420,7 +420,20 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
         raw_matches.append((filepath, mode, content, m.start(), m.end()))
 
     if not raw_matches:
-        return None
+        # v21 P3: 检测 cat > file - （从 stdin 读，会导致 shell 挂起）
+        # GLM 偶尔输出 cat >sort.py - 这种命令，codex_sim 执行时 stdin 关闭，
+        # cat 会等待 stdin 输入导致 30s timeout。检测到这种模式时创建空文件避免挂起。
+        stdin_cat_pattern = _re.compile(
+            r"cat\s+(>>?)\s*(" + filepath_safe + r")\s+(?:-\s*$|-\s*(?:;|&&|\||$))"
+        )
+        stdin_matches = []
+        for m in stdin_cat_pattern.finditer(cmd_str):
+            mode = m.group(1)
+            filepath = m.group(2)
+            stdin_matches.append((filepath, mode, "", m.start(), m.end()))
+        if not stdin_matches:
+            return None
+        raw_matches = stdin_matches
 
     # 按 span_start 排序，保持命令原始顺序
     raw_matches.sort(key=lambda x: x[3])
