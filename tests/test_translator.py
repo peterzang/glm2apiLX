@@ -229,9 +229,16 @@ def test_sanitize_shell_command_argument_from_plain_string():
         },
     )
 
-    assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem"],
-    }
+    # P16: Linux 环境下 powershell.exe 被替换为 sh -c
+    import sys
+    if sys.platform != "win32":
+        assert cleaned == {
+            "command": ["sh", "-c", "Get-ChildItem"],
+        }
+    else:
+        assert cleaned == {
+            "command": ["powershell.exe", "-Command", "Get-ChildItem"],
+        }
 
 
 def test_sanitize_shell_command_argument_wraps_powershell_cmdlet_array():
@@ -242,9 +249,16 @@ def test_sanitize_shell_command_argument_wraps_powershell_cmdlet_array():
         },
     )
 
-    assert cleaned == {
-        "command": ["powershell.exe", "-Command", "Get-ChildItem -Recurse -Filter *.txt"],
-    }
+    # P16: Linux 环境下 powershell.exe 被替换为 sh -c
+    import sys
+    if sys.platform != "win32":
+        assert cleaned == {
+            "command": ["sh", "-c", "Get-ChildItem -Recurse -Filter *.txt"],
+        }
+    else:
+        assert cleaned == {
+            "command": ["powershell.exe", "-Command", "Get-ChildItem -Recurse -Filter *.txt"],
+        }
 
 
 def test_sanitize_shell_command_argument_keeps_native_executable_array():
@@ -288,7 +302,12 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
     assert chunks == []
     assert "我将创建文件" not in "".join(final_chunks)
     assert '"tool_calls"' in final_chunks[1]
-    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+    # P16: Linux 环境下 powershell.exe 被替换为 sh -c
+    import sys as _sys
+    if _sys.platform != "win32":
+        assert '\\"command\\":[\\"sh\\",\\"-c\\",\\"pwd\\"]' in final_chunks[1]
+    else:
+        assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
 
 
 def test_accumulator_defers_visible_text_when_tools_available():

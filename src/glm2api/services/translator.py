@@ -129,15 +129,36 @@ def sanitize_tool_call_payload(
                 if isinstance(parsed_command, list):
                     cleaned["command"] = [str(part) for part in parsed_command]
             else:
-                cleaned["command"] = ["powershell.exe", "-Command", stripped_command]
+                # P16 修复：Linux 环境下不用 powershell.exe，改用 sh -c
+                import sys as _sys
+                if _sys.platform != "win32":
+                    cleaned["command"] = ["sh", "-c", stripped_command]
+                else:
+                    cleaned["command"] = ["powershell.exe", "-Command", stripped_command]
         elif isinstance(command, list) and command:
             command_parts = [str(part) for part in command]
             command_name = command_parts[0].strip()
             lower_name = command_name.lower()
             is_shell_host = lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"}
             is_powershell_command = bool(POWERSHELL_CMDLET_PATTERN.fullmatch(command_name)) or lower_name in POWERSHELL_ALIASES
-            if is_powershell_command and not is_shell_host:
-                cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
+            # P16 修复：Linux 环境下把 powershell.exe 命令转成 sh -c
+            import sys as _sys2
+            if _sys2.platform != "win32" and is_shell_host and lower_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+                # 把 ["powershell.exe", "-Command", "cat << ... > file"] 转成 ["sh", "-c", "cat << ... > file"]
+                cmd_idx = None
+                for i, p in enumerate(command_parts):
+                    if p.strip().lower() in ("-command", "-c"):
+                        cmd_idx = i + 1
+                        break
+                if cmd_idx is not None and cmd_idx < len(command_parts):
+                    cleaned["command"] = ["sh", "-c", command_parts[cmd_idx]]
+                else:
+                    cleaned["command"] = ["sh", "-c", " ".join(command_parts[1:])]
+            elif is_powershell_command and not is_shell_host:
+                if _sys2.platform != "win32":
+                    cleaned["command"] = ["sh", "-c", " ".join(command_parts)]
+                else:
+                    cleaned["command"] = ["powershell.exe", "-Command", " ".join(command_parts)]
 
         # === M3 修复：bash heredoc 引号转义修复 ===
         # GLM-5.2 在生成含 heredoc + 嵌套引号的 bash 命令时，引号转义能力不足：
@@ -565,21 +586,27 @@ def resolve_networking(model: str, web_search: object) -> bool:
 
 
 def _estimate_token_count(text: str) -> int:
-    """P12-2 修复：按内容语言动态估算 token 数。
-    中文字符 1 字符 ≈ 1-2 tokens，英文 4 字符 ≈ 1 token。
-    统计中文字符比例，动态选择 ÷2 或 ÷4。
+    """P12-2/P15-2 修复：使用项目已有的 count_tokens 精确估算。
+    
+    之前用简单的 ÷2/÷4 估算，现在用 core/tokenizer.py 的 count_tokens，
+    它已经实现了 CJK 字符分类 + ASCII 词计数 + 数字 + 标点的精确估算。
     """
     if not text:
         return 0
-    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
-    total = len(text)
-    if total == 0:
-        return 0
-    cjk_ratio = cjk_count / total
-    if cjk_ratio > 0.3:
-        return total // 2
-    else:
-        return total // 4
+    try:
+        from ..core.tokenizer import count_tokens
+        return count_tokens(text)
+    except Exception:
+        # 兜底：简单估算
+        cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
+        total = len(text)
+        if total == 0:
+            return 0
+        cjk_ratio = cjk_count / total
+        if cjk_ratio > 0.3:
+            return total // 2
+        else:
+            return total // 4
 
 
 @dataclass
@@ -785,16 +812,19 @@ class GLMEventAccumulator:
                 len(self._server_side_tool_calls),
             )
 
-        # === v4/v6 改进：当客户端提供了 tools 但 GLM 没调任何工具时，检测是否是描述性文本 ===
-        # P10 修复：阈值从 500 降到 30 字符，覆盖 GLM 生成短描述性文本就退出的场景
-        # （v6 报告：GLM 只生成 22 tokens 的 "I'll create..." 就退出，500 阈值太高没触发）
-        DESCRIPTIVE_MIN_LEN = 30  # v6: 从 500 降到 30
+        # === v4/v6/v10 改进：当客户端提供了 tools 但 GLM 没调任何工具时，检测是否是描述性文本 ===
+        # P10 修复：阈值从 500 降到 30 字符
+        # P17 修复：多轮对话后期 GLM 可能生成正常的总结性文本（如 "All files created"），
+        # 这不应该被误判为描述性文本。增加规则：如果文本包含 "created"/"done"/"completed"/
+        # "successfully"/"file" 等完成类关键词，不触发检测。
+        DESCRIPTIVE_MIN_LEN = 30
         if (
             not all_tool_calls
             and self.allowed_tool_names is not None
             and len(self.allowed_tool_names) > 0
             and len(self._cached_full_text) > DESCRIPTIVE_MIN_LEN
             and not self._is_useful_response()
+            and not self._is_completion_summary()  # P17: 不误判总结性文本
         ):
             if self.logger:
                 self.logger.warning(
@@ -1064,6 +1094,31 @@ class GLMEventAccumulator:
             )
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
+
+    def _is_completion_summary(self) -> bool:
+        """P17 修复：检测是否是多轮对话后期的正常总结性文本。
+
+        codex 长任务后期 GLM 可能生成 "All files created successfully" 这类总结，
+        不是描述性文本，不应该被检测拦截。
+        """
+        text = (self._cached_full_text or "").strip().lower()
+        if not text or len(text) < 10:
+            return False
+        # 完成类关键词
+        completion_keywords = [
+            "created", "done", "completed", "successfully", "file",
+            "built", "installed", "passed", "failed", "error",
+            "all ", "now ", "finished", "ready",
+            "创建", "完成", "成功", "失败", "文件", "已",
+        ]
+        keyword_count = sum(1 for kw in completion_keywords if kw in text)
+        # 如果包含 2+ 个完成类关键词，判定为总结性文本
+        if keyword_count >= 2:
+            return True
+        # 如果文本短且包含 "created"/"done"/"completed"，也判定为总结
+        if len(text) < 200 and any(kw in text for kw in ("created", "done", "completed", "successfully")):
+            return True
+        return False
 
     def _is_useful_response(self) -> bool:
         """检测 GLM 生成的文本是否是"有用的响应"。
