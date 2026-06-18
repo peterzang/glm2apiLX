@@ -25,11 +25,18 @@ async function api(name, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   const token = getToken();
   if (token) headers['X-Admin-Token'] = token;
-  const resp = await fetch(`${API_BASE}/${name}`, {
-    method: opts.method || 'GET',
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  let resp;
+  try {
+    resp = await fetch(`${API_BASE}/${name}`, {
+      method: opts.method || 'GET',
+      headers,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+  } catch (networkErr) {
+    // 网络错误：服务可能挂了，显示横幅提示
+    showNetworkError('网络连接失败：服务可能未运行');
+    throw networkErr;
+  }
   if (resp.status === 401) {
     clearToken();
     showLogin();
@@ -41,7 +48,28 @@ async function api(name, opts = {}) {
     const msg = (data && data.error) || `HTTP ${resp.status}`;
     throw new Error(msg);
   }
+  // 成功 → 隐藏网络错误横幅
+  hideNetworkError();
   return data;
+}
+
+// =========================================================================
+// Network error banner (网络错误提示条)
+// =========================================================================
+function showNetworkError(msg) {
+  let banner = document.getElementById('network-error-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'network-error-banner';
+    banner.className = 'network-error-banner';
+    document.body.appendChild(banner);
+  }
+  banner.innerHTML = `<span>⚠</span><span>${escapeHtml(msg)}</span>`;
+  banner.style.display = 'flex';
+}
+function hideNetworkError() {
+  const banner = document.getElementById('network-error-banner');
+  if (banner) banner.style.display = 'none';
 }
 
 function fmtTime(ts) {
@@ -77,6 +105,191 @@ function escapeHtml(s) {
 function shortHash(s, n = 8) {
   if (!s) return '-';
   return s.length <= n ? s : s.slice(0, n);
+}
+
+// =========================================================================
+// Neural Network Background Animation (神经网络背景动画)
+// 纯 Canvas 实现，~30 节点浮动 + 距离阈值连线 + 节点呼吸
+// =========================================================================
+const NeuralBg = (() => {
+  let canvas, ctx, nodes = [], animationId = null, mouseX = -1000, mouseY = -1000;
+
+  function init() {
+    canvas = document.getElementById('neural-bg');
+    if (!canvas) return;
+    ctx = canvas.getContext('2d');
+    resize();
+    window.addEventListener('resize', resize);
+    document.addEventListener('mousemove', e => {
+      mouseX = e.clientX;
+      mouseY = e.clientY;
+    });
+    document.addEventListener('mouseleave', () => {
+      mouseX = -1000;
+      mouseY = -1000;
+    });
+    createNodes();
+    start();
+  }
+
+  function resize() {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+  }
+
+  function createNodes() {
+    nodes = [];
+    const count = 32;
+    const w = window.innerWidth, h = window.innerHeight;
+    for (let i = 0; i < count; i++) {
+      nodes.push({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.3,
+        vy: (Math.random() - 0.5) * 0.3,
+        r: 1.5 + Math.random() * 1.5,
+        pulse: Math.random() * Math.PI * 2,
+      });
+    }
+  }
+
+  function getNodeColor() {
+    return getComputedStyle(document.documentElement).getPropertyValue('--neural-node').trim() || 'rgba(139, 92, 246, 0.45)';
+  }
+  function getLineColor() {
+    return getComputedStyle(document.documentElement).getPropertyValue('--neural-line').trim() || 'rgba(99, 102, 241, 0.18)';
+  }
+
+  function animate() {
+    if (!ctx || !canvas) return;
+    const w = window.innerWidth, h = window.innerHeight;
+    ctx.clearRect(0, 0, w, h);
+
+    const lineColor = getLineColor();
+    const nodeColor = getNodeColor();
+
+    // 画连线
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 180) {
+          const alpha = (1 - dist / 180) * 0.6;
+          ctx.strokeStyle = applyAlpha(lineColor, alpha);
+          ctx.lineWidth = 0.6;
+          ctx.beginPath();
+          ctx.moveTo(nodes[i].x, nodes[i].y);
+          ctx.lineTo(nodes[j].x, nodes[j].y);
+          ctx.stroke();
+        }
+      }
+      // 鼠标连线（更亮）
+      const mdx = nodes[i].x - mouseX;
+      const mdy = nodes[i].y - mouseY;
+      const mdist = Math.sqrt(mdx * mdx + mdy * mdy);
+      if (mdist < 220) {
+        const alpha = (1 - mdist / 220) * 0.9;
+        ctx.strokeStyle = applyAlpha(lineColor, alpha);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(nodes[i].x, nodes[i].y);
+        ctx.lineTo(mouseX, mouseY);
+        ctx.stroke();
+      }
+    }
+
+    // 画节点 + 移动 + 呼吸
+    for (const node of nodes) {
+      node.x += node.vx;
+      node.y += node.vy;
+      if (node.x < 0 || node.x > w) node.vx *= -1;
+      if (node.y < 0 || node.y > h) node.vy *= -1;
+      node.pulse += 0.02;
+      const r = Math.max(0.5, node.r + Math.sin(node.pulse) * 0.8);
+      ctx.fillStyle = nodeColor;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      // 光晕
+      ctx.fillStyle = applyAlpha(nodeColor, 0.15);
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, r * 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    animationId = requestAnimationFrame(animate);
+  }
+
+  function applyAlpha(rgbaStr, alpha) {
+    // 形如 "rgba(99, 102, 241, 0.18)" → 替换最后一个数字
+    const m = rgbaStr.match(/rgba?\(([^)]+)\)/);
+    if (!m) return rgbaStr;
+    const parts = m[1].split(',').map(s => s.trim());
+    if (parts.length >= 3) {
+      return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+    }
+    return rgbaStr;
+  }
+
+  function start() {
+    if (animationId) return;
+    animate();
+  }
+  function stop() {
+    if (animationId) cancelAnimationFrame(animationId);
+    animationId = null;
+  }
+
+  return { init, start, stop };
+})();
+
+// =========================================================================
+// Theme Toggle (亮色/暗色主题切换)
+// =========================================================================
+const Theme = (() => {
+  const STORAGE_KEY = 'glm2api_admin_theme';
+  function init() {
+    const saved = localStorage.getItem(STORAGE_KEY) || 'dark';
+    applyTheme(saved);
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.addEventListener('click', toggle);
+  }
+  function toggle() {
+    const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    const next = cur === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    localStorage.setItem(STORAGE_KEY, next);
+    showToast(`已切换到${next === 'dark' ? '暗色' : '亮色'}主题`, 'info');
+  }
+  function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    const icon = document.getElementById('theme-icon');
+    if (icon) icon.textContent = theme === 'dark' ? '🌙' : '☀️';
+  }
+  return { init, toggle };
+})();
+
+// =========================================================================
+// Mobile sidebar toggle
+// =========================================================================
+function initMobileMenu() {
+  const btn = document.getElementById('mobile-menu-btn');
+  const sidebar = document.getElementById('sidebar');
+  if (!btn || !sidebar) return;
+  btn.addEventListener('click', () => sidebar.classList.toggle('open'));
+  // 点击导航项后关闭侧边栏
+  document.querySelectorAll('.nav-item').forEach(a => {
+    a.addEventListener('click', () => {
+      if (window.innerWidth <= 768) sidebar.classList.remove('open');
+    });
+  });
 }
 
 // =========================================================================
@@ -159,8 +372,10 @@ function stopAutoRefresh() {
   refreshTimer = null;
 }
 
-async function refresh() {
+async function refresh(force = false) {
   if (!getToken()) return;
+  // 强制刷新时重置 dashboard 哈希，绕过增量更新跳过逻辑
+  if (force) _lastDashboardHash = '';
   try {
     switch (currentView) {
       case 'dashboard': await refreshDashboard(); break;
@@ -183,6 +398,10 @@ async function refresh() {
 // Dashboard view（参考 Qwen2API_Go overview-tab 重写：2 行 4 列 KPI + 主图表 + 侧边卡片 + 底部 4 卡）
 // =========================================================================
 
+// 缓存上一次的 dashboard 数据，用于增量更新与脉冲动画
+let _lastDashboardSnapshot = null;
+let _lastDashboardHash = '';
+
 async function refreshDashboard() {
   const d = await api('dashboard');
 
@@ -200,27 +419,51 @@ async function refreshDashboard() {
   const accountsTotal = d.accounts_total || 0;
   const protoBreakdown = d.proto_breakdown || {};
 
+  // === 增量更新策略 ===
+  // 1) 计算当前快照 hash
+  const snapshot = {
+    total: all.total, success: all.success, ce: all.client_errors, se: all.server_errors,
+    sr: r5.success_rate, sr_s: r5.success, sr_t: r5.total,
+    rpm, avgRpm, peakRpm, requests30m,
+    tp: tokenTotals.prompt, tc: tokenTotals.completion, tt: tokenTotals.total,
+    t30p: token30m.prompt, t30c: token30m.completion,
+    aa: accountsActive, at: accountsTotal, uptime: d.uptime_seconds,
+    p50: r5.p50_ms, p95: r5.p95_ms, p99: r5.p99_ms,
+    pb: protoBreakdown, top_models: d.top_models,
+    repetition: d.repetition, model_latencies: d.model_latencies,
+    hourly_len: (d.hourly || []).length,
+    hourly_last_total: (d.hourly || []).slice(-1)[0]?.total || 0,
+  };
+  const newHash = JSON.stringify(snapshot);
+  const isFirstRender = _lastDashboardHash === '';
+  const dataChanged = newHash !== _lastDashboardHash;
+  _lastDashboardHash = newHash;
+  _lastDashboardSnapshot = d;
+
+  // 2) 如果数据没变，跳过重渲染（避免闪烁 + 减少 CPU 占用）
+  if (!isFirstRender && !dataChanged) return;
+
   // === KPI Row 1 ===
   const kpiRow1 = `
     <div class="kpi-grid">
       <div class="kpi-card info">
         <div class="kpi-label">总请求数</div>
-        <div class="kpi-value">${(all.total || 0).toLocaleString()}</div>
+        <div class="kpi-value" data-metric="total-requests">${(all.total || 0).toLocaleString()}</div>
         <div class="kpi-sub">成功 ${all.success} · 4xx ${all.client_errors} · 5xx ${all.server_errors}</div>
       </div>
       <div class="kpi-card ${successRateColor}">
         <div class="kpi-label">5分钟成功率</div>
-        <div class="kpi-value">${(r5.success_rate || 0).toFixed(1)}%</div>
+        <div class="kpi-value" data-metric="success-rate">${(r5.success_rate || 0).toFixed(1)}%</div>
         <div class="kpi-sub">${r5.success}/${r5.total} 请求</div>
       </div>
       <div class="kpi-card success">
         <div class="kpi-label">活跃账号</div>
-        <div class="kpi-value">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
+        <div class="kpi-value" data-metric="active-accounts">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
         <div class="kpi-sub">已使用过的账号</div>
       </div>
       <div class="kpi-card warning">
         <div class="kpi-label">运行时长</div>
-        <div class="kpi-value" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
+        <div class="kpi-value" data-metric="uptime" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
         <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
       </div>
     </div>
@@ -231,22 +474,22 @@ async function refreshDashboard() {
     <div class="kpi-grid">
       <div class="kpi-card info">
         <div class="kpi-label">当前 RPM</div>
-        <div class="kpi-value">${rpm}</div>
+        <div class="kpi-value" data-metric="rpm">${rpm}</div>
         <div class="kpi-sub">30m 平均 ${avgRpm} rpm · 峰值 ${peakRpm}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">P95 延迟</div>
-        <div class="kpi-value">${r5.p95_ms}ms</div>
+        <div class="kpi-value" data-metric="p95">${r5.p95_ms}ms</div>
         <div class="kpi-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
       </div>
       <div class="kpi-card warning">
         <div class="kpi-label">Prompt Tokens</div>
-        <div class="kpi-value">${fmtCompactNum(tokenTotals.prompt)}</div>
+        <div class="kpi-value" data-metric="prompt-tokens">${fmtCompactNum(tokenTotals.prompt)}</div>
         <div class="kpi-sub">30m ${fmtCompactNum(token30m.prompt)}</div>
       </div>
       <div class="kpi-card" style="border-left:3px solid var(--purple);">
         <div class="kpi-label">Completion Tokens</div>
-        <div class="kpi-value">${fmtCompactNum(tokenTotals.completion)}</div>
+        <div class="kpi-value" data-metric="completion-tokens">${fmtCompactNum(tokenTotals.completion)}</div>
         <div class="kpi-sub">总计 ${fmtCompactNum(tokenTotals.total)}</div>
       </div>
     </div>
@@ -281,6 +524,15 @@ async function refreshDashboard() {
   `;
 
   document.getElementById('view-dashboard').innerHTML = kpiRow1 + kpiRow2 + mainArea + bottomCards;
+
+  // === 数据变化时触发脉冲发光动画 ===
+  // 非首次渲染 + 数据真的变了 → 给所有 KPI 数值加 updated class
+  if (!isFirstRender && dataChanged) {
+    document.querySelectorAll('#view-dashboard .kpi-value[data-metric]').forEach(el => {
+      el.classList.add('updated');
+      setTimeout(() => el.classList.remove('updated'), 700);
+    });
+  }
 }
 
 // === 复读率监控卡片（v3 审核报告建议）===
@@ -1469,11 +1721,26 @@ async function refreshLogs() {
 // =========================================================================
 
 async function refreshRotates() {
-  const data = await api('rotates');
+  let data;
+  try {
+    data = await api('rotates');
+  } catch (err) {
+    document.getElementById('rotates-table-wrapper').innerHTML = renderErrorState(
+      '加载轮换事件失败',
+      err.message,
+      '🔄',
+      'refreshRotates()'
+    );
+    return;
+  }
   const events = data.events || [];
   const wrapper = document.getElementById('rotates-table-wrapper');
   if (events.length === 0) {
-    wrapper.innerHTML = `<div class="empty-state">暂无轮换事件</div>`;
+    wrapper.innerHTML = renderEmptyState(
+      '暂无轮换事件',
+      '当前账号未发生 device_id 轮换。当账号请求次数达到阈值或手动触发轮换时，事件会出现在这里。',
+      '🔄'
+    );
     return;
   }
   const rows = events.map(e => {
@@ -1499,6 +1766,32 @@ async function refreshRotates() {
         </thead>
         <tbody>${rows}</tbody>
       </table>
+    </div>
+  `;
+}
+
+// 通用空状态渲染（带图标 + 标题 + 描述）
+function renderEmptyState(title, desc, icon = '📭') {
+  return `
+    <div class="empty-state">
+      <span class="empty-state-icon">${icon}</span>
+      <div class="empty-state-title">${escapeHtml(title)}</div>
+      <div class="empty-state-desc">${escapeHtml(desc)}</div>
+    </div>
+  `;
+}
+
+// 通用错误状态渲染
+function renderErrorState(title, desc, icon = '⚠️', retryFn = '') {
+  const retryBtn = retryFn
+    ? `<button class="btn btn-ghost btn-sm" style="margin-top:10px;" onclick="${escapeHtml(retryFn)}">重试</button>`
+    : '';
+  return `
+    <div class="error-state">
+      <span class="error-state-icon">${icon}</span>
+      <div class="empty-state-title" style="color:var(--error);">${escapeHtml(title)}</div>
+      <div class="empty-state-desc">${escapeHtml(desc)}</div>
+      ${retryBtn}
     </div>
   `;
 }
@@ -1552,7 +1845,27 @@ async function refreshConfig() {
 // =========================================================================
 
 async function refreshSystem() {
-  const sys = await api('system');
+  let sys;
+  try {
+    sys = await api('system');
+  } catch (err) {
+    document.getElementById('view-system').innerHTML = renderErrorState(
+      '加载系统监控失败',
+      err.message + '。该功能依赖服务器端资源监控能力，可能服务未提供 system 端点。',
+      '💻',
+      'refreshSystem()'
+    );
+    return;
+  }
+  // 防御：缺字段时显示友好提示
+  if (!sys || !sys.process || !sys.memory) {
+    document.getElementById('view-system').innerHTML = renderEmptyState(
+      '系统监控暂不可用',
+      '服务器返回的数据不完整。这通常发生在容器化或受限运行环境中。',
+      '💻'
+    );
+    return;
+  }
   const memPctOfRss = 0; // unknown; just show rss
   document.getElementById('view-system').innerHTML = `
     <div class="kpi-grid">
@@ -1619,10 +1932,17 @@ async function refreshSystem() {
 // =========================================================================
 
 document.addEventListener('DOMContentLoaded', () => {
+  // 初始化神经网络背景
+  NeuralBg.init();
+  // 初始化主题切换
+  Theme.init();
+  // 初始化移动端菜单
+  initMobileMenu();
+
   document.getElementById('login-form').addEventListener('submit', handleLoginSubmit);
   document.getElementById('logout-btn').addEventListener('click', handleLogout);
   document.getElementById('auto-refresh').addEventListener('change', startAutoRefresh);
-  document.getElementById('manual-refresh').addEventListener('click', refresh);
+  document.getElementById('manual-refresh').addEventListener('click', () => refresh(true));
   document.getElementById('logs-only-errors').addEventListener('change', refreshLogs);
   document.getElementById('logs-limit').addEventListener('change', refreshLogs);
 

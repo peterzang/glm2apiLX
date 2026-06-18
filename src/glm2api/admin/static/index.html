@@ -9,6 +9,14 @@
 </head>
 <body>
 
+<!-- Neural Network Background Canvas -->
+<canvas id="neural-bg" class="neural-bg"></canvas>
+
+<!-- Theme Toggle Button -->
+<button id="theme-toggle" class="theme-toggle" title="切换主题" aria-label="切换亮色/暗色主题">
+  <span id="theme-icon">🌙</span>
+</button>
+
 <!-- ===================== Login Screen ===================== -->
 <div id="login-screen" class="login-screen">
   <div class="login-card">
@@ -26,7 +34,7 @@
 <!-- ===================== Main App ===================== -->
 <div id="app" class="app hidden">
   <!-- Sidebar -->
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-brand">
       <div class="brand-logo">GLM</div>
       <div class="brand-text">
@@ -68,7 +76,10 @@
   <!-- Main content -->
   <main class="main">
     <header class="topbar">
-      <div class="topbar-title" id="topbar-title">仪表盘</div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button id="mobile-menu-btn" class="mobile-menu-btn" aria-label="菜单">☰</button>
+        <div class="topbar-title" id="topbar-title">仪表盘</div>
+      </div>
       <div class="topbar-actions">
         <label class="auto-refresh">
           <input type="checkbox" id="auto-refresh" checked />
