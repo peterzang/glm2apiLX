@@ -391,13 +391,27 @@ class GLM2APIServer:
                         return
 
                     # --- Chat completions ---
-                    if not isinstance(payload.get("messages"), list) or not payload.get("model"):
+                    # v19 修复 P2：空 messages 数组早期校验，避免发到上游导致挂起
+                    messages = payload.get("messages")
+                    if not isinstance(messages, list) or not payload.get("model"):
                         self._write_json(
                             HTTPStatus.BAD_REQUEST,
                             make_error(
                                 "you must provide a model and messages parameter",
                                 error_type=ERROR_INVALID_REQUEST,
-                                param="messages" if not payload.get("messages") else "model",
+                                param="messages" if not messages else "model",
+                                request_id=gen_request_id(),
+                            ),
+                        )
+                        return
+                    # v19 P2: messages 是空数组时返回错误（避免上游 GLM 挂起）
+                    if len(messages) == 0:
+                        self._write_json(
+                            HTTPStatus.BAD_REQUEST,
+                            make_error(
+                                "messages array must not be empty",
+                                error_type=ERROR_INVALID_REQUEST,
+                                param="messages",
                                 request_id=gen_request_id(),
                             ),
                         )
