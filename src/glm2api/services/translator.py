@@ -441,6 +441,11 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
     # 为每个写入生成 python 语句
     statements: list[str] = []
     for filepath, mode, content, _, _ in raw_matches:
+        # v21 P4: Python 代码缩进规范化（安全版本）
+        # 只对 .py 文件做缩进修复，且只修复"1 空格缩进"为"4 空格缩进"
+        # 风险控制：不修改 .json/.txt/.md 等非 Python 文件
+        if filepath.endswith('.py') and content:
+            content = _normalize_python_indentation(content)
         encoded = _b64.b64encode(content.encode("utf-8")).decode("ascii")
         encoded_repr = repr(encoded)
         filepath_repr = repr(filepath)
@@ -456,6 +461,39 @@ def _shell_write_to_python(cmd_str: str) -> list[str] | None:
 
     full_script = "; ".join(statements)
     return ["python3", "-c", full_script]
+
+
+def _normalize_python_indentation(content: str) -> str:
+    """规范化 Python 代码缩进（安全版本，仅修复 1 空格缩进为 4 空格）。
+
+    v21 报告 P4：GLM 偶尔输出 1 空格缩进（而非 4 空格），导致 Python IndentationError。
+    例如：'for i in range(10):\\n print(i)' （print 只有 1 空格缩进）
+
+    修复策略（保守）：
+    - 只修复"行首恰好 1 个空格"的缩进为 4 个空格
+    - 不修改 2/3/4/8 等其他缩进（避免破坏正确的缩进）
+    - 不修改空行和注释行
+    - 不修改行内空格
+
+    风险：可能误修改 1 空格缩进的合法代码（如 continuation lines），但 Python
+    continuation 通常用 4+ 空格，1 空格几乎总是错误的。
+    """
+    if not content or '\n' not in content:
+        return content
+    lines = content.split('\n')
+    normalized = []
+    for line in lines:
+        # 空行或纯空白行保持原样
+        if not line or line.isspace():
+            normalized.append(line)
+            continue
+        # 检测行首恰好 1 个空格（后跟非空白字符）
+        if line.startswith(' ') and not line.startswith('  '):
+            # 1 空格缩进 → 4 空格缩进
+            normalized.append('    ' + line[1:])
+        else:
+            normalized.append(line)
+    return '\n'.join(normalized)
 
 
 def _heredoc_to_python_write(cmd_str: str) -> list[str] | None:
