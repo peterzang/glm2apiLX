@@ -155,7 +155,19 @@ def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -
 
 
 def _balanced_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+    """规范化 DSML CDATA 文本，保留换行符。
+
+    v18 修复（P0-1）：旧实现用 re.sub(r"\\s+", " ", value) 把所有空白字符
+    （包括换行符 \\n 和 tab \\t）替换成单个空格，导致 GLM 输出的多行 heredoc、
+    多行 echo 内容、多行 Python 代码全部被压成单行，破坏语句分隔。
+
+    新实现：只规范化行内空格和 tab（多个空格变一个），保留换行符。
+    """
+    # 只规范化空格和 tab，保留换行符
+    value = re.sub(r"[ \t]+", " ", value)
+    # 行首尾去空格但保留换行
+    value = "\n".join(line.strip() for line in value.split("\n"))
+    return value.strip()
 
 
 def _leaf_text(element: ET.Element) -> str:
