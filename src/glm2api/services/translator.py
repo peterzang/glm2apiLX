@@ -976,7 +976,9 @@ def convert_messages(
             "Do NOT write text explanations. Call a tool NOW. "
             # v20 P2-1: 4 空格缩进提示，缓解 GLM 输出 1 空格缩进导致 Python IndentationError
             # v20 报告 task2 失败根因：GLM 输出 1 空格缩进，for 循环体与 for 同级
-            "When writing Python code, ALWAYS use 4-space indentation.]"
+            # v22 P5: 重复 4 空格要求（双重提示，进一步缓解 GLM 不听话）
+            "When writing Python code, ALWAYS use 4-space indentation. "
+            "This is mandatory — 1-space or 2-space indentation will cause SyntaxError.]"
         )
         # P11-2: DEBUG 级别日志（已确认生效，降低生产环境日志噪声）
         logging.getLogger("glm2api.translator").debug(
