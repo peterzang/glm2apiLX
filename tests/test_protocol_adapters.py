@@ -195,7 +195,7 @@ def test_responses_http_stream_sends_keepalive_while_upstream_is_idle(monkeypatc
         port=0,
         api_prefix="/v1",
         cors_allow_origin="*",
-        server_api_keys=[],
+        server_api_keys=["test-key"],
         debug_dump_all=False,
         exposed_models=["glm-4"],
     )
@@ -209,7 +209,7 @@ def test_responses_http_stream_sends_keepalive_while_upstream_is_idle(monkeypatc
             f"http://127.0.0.1:{port}/v1/responses",
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             stream_text = response.read().decode("utf-8")
