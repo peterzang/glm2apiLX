@@ -30,6 +30,11 @@ from .services.responses_adapter import (
     openai_to_responses,
     responses_to_openai,
 )
+from .services.responses_v2 import (
+    ResponsesV2StreamAccumulator,
+    openai_to_responses_v2,
+    responses_v2_to_openai,
+)
 from .core.openai_compat import (
     ERROR_API,
     ERROR_AUTHENTICATION,
@@ -174,6 +179,8 @@ class GLM2APIServer:
                         f"{config.api_prefix}/images/variations",
                         f"{config.api_prefix}/messages",
                         f"{config.api_prefix}/responses",
+                        f"{config.api_prefix}/responses_v2",
+                        "/v2/responses",
                         f"{config.api_prefix}/embeddings",
                         f"{config.api_prefix}/moderations",
                         f"{config.api_prefix}/audio/transcriptions",
@@ -273,10 +280,16 @@ class GLM2APIServer:
                         self._handle_anthropic_messages(payload)
                         return
 
-                    # --- OpenAI Responses API ---
+                    # --- OpenAI Responses API v1 (legacy) ---
                     if path == f"{config.api_prefix}/responses":
-                        logger.info("收到 Responses 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
+                        logger.info("收到 Responses v1 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
                         self._handle_responses(payload)
+                        return
+
+                    # --- OpenAI Responses API v2 (新版，完整适配 2025 规范) ---
+                    if path == f"{config.api_prefix}/responses_v2" or path == "/v2/responses":
+                        logger.info("收到 Responses v2 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
+                        self._handle_responses_v2(payload)
                         return
 
                     # --- Image generation ---
@@ -717,6 +730,102 @@ class GLM2APIServer:
                         pass
 
                 logger.info("Responses 流式请求完成 model=%s", model)
+
+            # ---- OpenAI Responses API v2 (新版，完整适配 2025 规范) ----
+
+            def _handle_responses_v2(self, payload: dict[str, object]) -> None:
+                model = str(payload.get("model", "glm-4"))
+                openai_payload = responses_v2_to_openai(payload)
+
+                if payload.get("stream"):
+                    self._stream_responses_v2(openai_payload, model, payload)
+                    return
+
+                result, _ = glm_client.chat_completion(openai_payload)
+                response = openai_to_responses_v2(result, model, request_payload=payload)
+                self._record_token_usage(result)
+                self._discover_dynamic_model(result)
+                self._write_json(HTTPStatus.OK, response)
+
+            def _stream_responses_v2(
+                self, openai_payload: dict[str, object], model: str, request_payload: dict[str, object]
+            ) -> None:
+                openai_payload["stream"] = True
+                stream_iter = glm_client.stream_chat_completion(openai_payload)
+                accumulator = ResponsesV2StreamAccumulator(model=model, request_payload=request_payload)
+
+                self.send_response(HTTPStatus.OK)
+                self._send_common_headers()
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
+                try:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
+                        if not chunk:
+                            continue
+                        # chunk 是 OpenAI SSE 格式的 bytes，需要解析为 dict
+                        try:
+                            chunk_str = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+                            # 解析 SSE data 行
+                            for line in chunk_str.split("\n"):
+                                if line.startswith("data: "):
+                                    data_str = line[6:].strip()
+                                    if data_str == "[DONE]":
+                                        continue
+                                    try:
+                                        chunk_dict = json.loads(data_str)
+                                        events = accumulator.consume_chunk(chunk_dict)
+                                        for event_type, event_data in events:
+                                            sse_event = f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                                            self.wfile.write(sse_event.encode("utf-8"))
+                                            self.wfile.flush()
+                                    except (json.JSONDecodeError, ValueError):
+                                        pass
+                        except _CLIENT_DISCONNECTED:
+                            return
+
+                    # 流结束，发送 finalize 事件
+                    for event_type, event_data in accumulator.finalize():
+                        sse_event = f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                        self.wfile.write(sse_event.encode("utf-8"))
+                        self.wfile.flush()
+
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Responses v2 流式响应过程中断开 model=%s error=%s", model, exc)
+                    return
+                except Exception as exc:
+                    logger.error("Responses v2 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+
+                logger.info("Responses v2 流式请求完成 model=%s", model)
 
             # ---- Chat completions (original) ----
 
