@@ -2003,38 +2003,24 @@ async function refreshApiKeys() {
       const name = nameInput.value.trim() || '未命名';
       try {
         const result = await api('apikeys/create', { method: 'POST', body: { name } });
-        // 创建后显示完整 key + 复制按钮
-        showToast(`✅ API Key 已创建`, 'success');
-        // 弹出完整 key 让用户复制
-        const fullKey = result.key;
-        const copyModal = document.createElement('div');
-        copyModal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;';
-        copyModal.innerHTML = `
-          <div style="background:var(--glass-bg-strong);backdrop-filter:var(--glass-blur);border:1px solid var(--glass-border);border-radius:16px;padding:32px;max-width:520px;width:90%;box-shadow:var(--shadow-lg);">
-            <div style="font-size:18px;font-weight:700;margin-bottom:8px;color:var(--success);">✅ API Key 创建成功</div>
-            <div style="color:var(--text-muted);font-size:13px;margin-bottom:16px;">请立即复制保存，此 Key 仅显示一次。服务重启后自定义 Key 会丢失。</div>
-            <div style="display:flex;gap:8px;align-items:center;margin-bottom:20px;">
-              <input type="text" value="${escapeHtml(fullKey)}" readonly style="flex:1;padding:10px 14px;background:var(--bg-elevated);border:1px solid var(--border-light);border-radius:8px;color:var(--text);font-family:ui-monospace,monospace;font-size:13px;outline:none;" id="created-key-input" />
-              <button class="btn btn-primary" id="copy-created-key" style="padding:10px 16px;">📋 复制</button>
-            </div>
-            <button class="btn btn-ghost" id="close-key-modal" style="width:100%;padding:10px;">关闭</button>
-          </div>
-        `;
-        document.body.appendChild(copyModal);
-        const keyInput = document.getElementById('created-key-input');
-        keyInput.focus();
-        keyInput.select();
-        document.getElementById('copy-created-key').addEventListener('click', () => {
-          keyInput.select();
+        // 自动复制到剪贴板 + 显示完整 key
+        const fullKey = result.key || '';
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = fullKey;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
           document.execCommand('copy');
-          showToast('✅ 已复制到剪贴板', 'success');
-        });
-        document.getElementById('close-key-modal').addEventListener('click', () => {
-          copyModal.remove();
-        });
-        copyModal.addEventListener('click', (e) => {
-          if (e.target === copyModal) copyModal.remove();
-        });
+          document.body.removeChild(ta);
+        } catch(e) {}
+        var el = document.getElementById('toast');
+        el.className = 'toast success';
+        el.innerHTML = '<div style="font-weight:600;margin-bottom:4px;">API Key 已创建并复制到剪贴板</div><div style="font-family:monospace;font-size:12px;word-break:break-all;">' + escapeHtml(fullKey) + '</div><div style="margin-top:4px;font-size:11px;color:var(--text-muted);">也可在下方列表中点击复制按钮</div>';
+        el.classList.remove('hidden');
+        clearTimeout(showToast._t);
+        showToast._t = setTimeout(function(){ el.classList.add('hidden'); }, 8000);
         createForm.style.display = 'none';
         nameInput.value = '';
         refreshApiKeys();
