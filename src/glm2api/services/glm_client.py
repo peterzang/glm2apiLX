@@ -861,7 +861,10 @@ class GLMWebClient:
                     "channel": "",
                     "chat_mode": chat_mode,
                     "draft_id": "",
-                    "if_plus_model": True,
+                    # P0 修复：if_plus_model 控制使用 GLM-5.2（plus）还是基础模型
+                    # glm-5.x 系列 → if_plus_model=true（使用 GLM-5.2 plus 模型）
+                    # glm-4.x 及以下 → if_plus_model=false（使用基础模型，不升级到 5.2）
+                    "if_plus_model": base_model.startswith("glm-5"),
                     "input_question_type": "xxxx",
                     "is_networking": is_networking,
                     "is_test": False,
