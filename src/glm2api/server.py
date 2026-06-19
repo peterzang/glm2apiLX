@@ -106,6 +106,21 @@ class GLM2APIServer:
                         self._write_json(HTTPStatus.OK, {"status": "ok"})
                         return
 
+                    # 硬限制：所有 /v1/ API 端点都需要 API key 认证（和官方版 API 一样）
+                    if path.startswith(f"{config.api_prefix}/"):
+                        if not self._authorize():
+                            logger.warning("认证失败 path=%s ip=%s", self.path, self.client_address[0])
+                            self._write_json(
+                                HTTPStatus.UNAUTHORIZED,
+                                make_error(
+                                    "Incorrect API key provided. You can find your API key at https://platform.openai.com/account/api-keys.",
+                                    error_type=ERROR_AUTHENTICATION,
+                                    code="invalid_api_key",
+                                    request_id=gen_request_id(),
+                                ),
+                            )
+                            return
+
                     if path == f"{config.api_prefix}/models":
                         self._write_json(
                             HTTPStatus.OK,
@@ -1223,17 +1238,14 @@ class GLM2APIServer:
             # ---- Auth ----
 
             def _authorize(self) -> bool:
-                # 如果没有配置任何 API key（环境变量 + 面板创建），允许所有请求
+                # 硬限制：所有 API 调用必须通过 API key 认证（和官方版 API 一样）
+                # 即使没有配置任何 key，也不允许无 key 访问
                 from .admin.store import get_store as _get_admin_store_for_auth
                 store = _get_admin_store_for_auth()
                 # 同步环境变量 key 到 store
                 store.init_env_api_keys(list(config.server_api_keys))
 
                 has_env_keys = bool(config.server_api_keys)
-                # 检查是否有任何 key（环境变量或面板创建）
-                api_keys_list = store.get_api_keys()
-                if not has_env_keys and not api_keys_list:
-                    return True  # 没有任何 key，允许所有请求
 
                 # Support both Bearer token and x-api-key header (Anthropic style)
                 authorization = self.headers.get("Authorization", "")
@@ -1256,6 +1268,7 @@ class GLM2APIServer:
                     if store.get_api_key_for_auth(x_api_key):
                         self._admin_api_key = x_api_key
                         return True
+                # 没有匹配任何 key → 拒绝
                 return False
 
             # ---- Helpers ----
