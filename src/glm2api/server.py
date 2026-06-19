@@ -1213,19 +1213,39 @@ class GLM2APIServer:
             # ---- Auth ----
 
             def _authorize(self) -> bool:
-                if not config.server_api_keys:
-                    return True
+                # 如果没有配置任何 API key（环境变量 + 面板创建），允许所有请求
+                from .admin.store import get_store as _get_admin_store_for_auth
+                store = _get_admin_store_for_auth()
+                # 同步环境变量 key 到 store
+                store.init_env_api_keys(list(config.server_api_keys))
+
+                has_env_keys = bool(config.server_api_keys)
+                # 检查是否有任何 key（环境变量或面板创建）
+                api_keys_list = store.get_api_keys()
+                if not has_env_keys and not api_keys_list:
+                    return True  # 没有任何 key，允许所有请求
+
                 # Support both Bearer token and x-api-key header (Anthropic style)
                 authorization = self.headers.get("Authorization", "")
                 if authorization.startswith("Bearer "):
                     token = authorization[7:].strip()
-                    if token in config.server_api_keys:
-                        self._admin_api_key = token  # 记录用于 per-key 用量统计
+                    # 先检查环境变量 key
+                    if has_env_keys and token in config.server_api_keys:
+                        self._admin_api_key = token
+                        return True
+                    # 再检查面板创建的 key
+                    if store.get_api_key_for_auth(token):
+                        self._admin_api_key = token
                         return True
                 x_api_key = self.headers.get("x-api-key", "")
-                if x_api_key and x_api_key.strip() in config.server_api_keys:
-                    self._admin_api_key = x_api_key.strip()
-                    return True
+                if x_api_key:
+                    x_api_key = x_api_key.strip()
+                    if has_env_keys and x_api_key in config.server_api_keys:
+                        self._admin_api_key = x_api_key
+                        return True
+                    if store.get_api_key_for_auth(x_api_key):
+                        self._admin_api_key = x_api_key
+                        return True
                 return False
 
             # ---- Helpers ----
