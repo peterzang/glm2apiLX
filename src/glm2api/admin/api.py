@@ -738,6 +738,75 @@ def _handle_system(handler, config: AppConfig, glm_client: GLMWebClient, logger:
 # Main dispatcher
 # ---------------------------------------------------------------------------
 
+# API Key 管理端点
+
+def _handle_apikeys(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """返回所有 API keys（含用量统计）。"""
+    from .store import get_store
+    store = get_store()
+    store.init_env_api_keys(list(config.server_api_keys))
+    keys = store.get_api_keys()
+    _send_json(handler, HTTPStatus.OK, {
+        "keys": keys,
+        "total": len(keys),
+        "env_keys_count": sum(1 for k in keys if k.get("is_env")),
+        "custom_keys_count": sum(1 for k in keys if not k.get("is_env")),
+    }, config)
+
+
+def _handle_apikey_create(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """创建新 API key。请求体: {"name": "my-key-name"}"""
+    from .store import get_store
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    name = str(payload.get("name", "")).strip() or "未命名"
+    result = get_store().create_api_key(name)
+    logger.info("admin created api key name=%s", name)
+    _send_json(handler, HTTPStatus.OK, result, config)
+
+
+def _handle_apikey_delete(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """删除 API key。请求体: {"key": "sk-glm2api-xxx"}"""
+    from .store import get_store
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    key = str(payload.get("key", "")).strip()
+    if not key:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_key"}, config)
+        return
+    ok = get_store().delete_api_key(key)
+    if ok:
+        logger.info("admin deleted api key")
+        _send_json(handler, HTTPStatus.OK, {"ok": True}, config)
+    else:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cannot_delete_env_key_or_not_found"}, config)
+
+
+def _handle_apikey_toggle(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """启用/禁用 API key。请求体: {"key": "xxx", "enabled": true/false}"""
+    from .store import get_store
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    key = str(payload.get("key", "")).strip()
+    enabled = bool(payload.get("enabled", True))
+    if not key:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_key"}, config)
+        return
+    ok = get_store().toggle_api_key(key, enabled)
+    _send_json(handler, HTTPStatus.OK if ok else HTTPStatus.BAD_REQUEST, {
+        "ok": ok, "enabled": enabled,
+    }, config)
+
+
 # Map of /admin/api/<name> -> handler function (POST or GET both accepted
 # where appropriate; each handler is method-agnostic)
 _API_ROUTES = {
@@ -753,6 +822,11 @@ _API_ROUTES = {
     "probe": ("POST", _handle_probe),
     "config": ("GET", _handle_config),
     "system": ("GET", _handle_system),
+    # API Key 管理
+    "apikeys": ("GET", _handle_apikeys),
+    "apikeys/create": ("POST", _handle_apikey_create),
+    "apikeys/delete": ("POST", _handle_apikey_delete),
+    "apikeys/toggle": ("POST", _handle_apikey_toggle),
 }
 
 

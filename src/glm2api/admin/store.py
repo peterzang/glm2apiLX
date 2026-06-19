@@ -20,6 +20,24 @@ from typing import Any, Deque, Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
+class ApiKeyRecord:
+    """An API key for tracking usage (created via admin panel or from env vars)."""
+    key: str                          # the actual API key string
+    name: str                         # human-readable name (e.g. "production", "test")
+    created_at: float                 # epoch seconds
+    is_env: bool                      # True if from SERVER_API_KEYS env var (not deletable)
+    enabled: bool                     # whether this key is active
+    # Per-key usage stats
+    total_requests: int = 0
+    total_success: int = 0
+    total_errors: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    last_used_ts: float = 0.0
+
+
+@dataclass(slots=True)
 class RequestRecord:
     """One completed (or failed) HTTP request through the gateway."""
     ts: float                          # epoch seconds
@@ -111,6 +129,8 @@ class AdminStore:
         self._model_latencies: Dict[str, Deque[int]] = collections.defaultdict(
             lambda: collections.deque(maxlen=100)
         )
+        # API Key 管理：{key_string: ApiKeyRecord}
+        self._api_keys: Dict[str, ApiKeyRecord] = {}
 
     # -----------------------------------------------------------------
     # Recording
@@ -451,6 +471,112 @@ class AdminStore:
         """清空所有探针缓存。"""
         with self._lock:
             self._model_probe_cache.clear()
+
+    # -----------------------------------------------------------------
+    # API Key 管理
+    # -----------------------------------------------------------------
+
+    def init_env_api_keys(self, env_keys: List[str]) -> None:
+        """从环境变量 SERVER_API_KEYS 初始化 API keys（不可删除）。"""
+        with self._lock:
+            for key in env_keys:
+                key = key.strip()
+                if key and key not in self._api_keys:
+                    self._api_keys[key] = ApiKeyRecord(
+                        key=key,
+                        name="环境变量",
+                        created_at=self._started_at,
+                        is_env=True,
+                        enabled=True,
+                    )
+
+    def create_api_key(self, name: str) -> Dict[str, Any]:
+        """创建一个新的 API key，返回 {key, name}。"""
+        with self._lock:
+            new_key = f"sk-glm2api-{uuid.uuid4().hex[:32]}"
+            self._api_keys[new_key] = ApiKeyRecord(
+                key=new_key,
+                name=name or "未命名",
+                created_at=time.time(),
+                is_env=False,
+                enabled=True,
+            )
+            return {"key": new_key, "name": name or "未命名"}
+
+    def delete_api_key(self, key: str) -> bool:
+        """删除一个 API key（环境变量的不可删除）。"""
+        with self._lock:
+            rec = self._api_keys.get(key)
+            if rec is None:
+                return False
+            if rec.is_env:
+                return False
+            del self._api_keys[key]
+            return True
+
+    def toggle_api_key(self, key: str, enabled: bool) -> bool:
+        """启用/禁用一个 API key。"""
+        with self._lock:
+            rec = self._api_keys.get(key)
+            if rec is None:
+                return False
+            rec.enabled = enabled
+            return True
+
+    def record_api_key_usage(
+        self, key: str, success: bool, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
+        """记录某 API key 的一次请求使用量。"""
+        with self._lock:
+            rec = self._api_keys.get(key)
+            if rec is None:
+                return
+            rec.total_requests += 1
+            if success:
+                rec.total_success += 1
+            else:
+                rec.total_errors += 1
+            rec.prompt_tokens += max(0, prompt_tokens)
+            rec.completion_tokens += max(0, completion_tokens)
+            rec.total_tokens += max(0, prompt_tokens + completion_tokens)
+            rec.last_used_ts = time.time()
+
+    def get_api_keys(self) -> List[Dict[str, Any]]:
+        """返回所有 API key 的信息（含用量统计），key 脱敏显示。"""
+        with self._lock:
+            result = []
+            for rec in self._api_keys.values():
+                # 脱敏：只显示前 8 位和后 4 位
+                if len(rec.key) > 16:
+                    masked_key = rec.key[:8] + "..." + rec.key[-4:]
+                else:
+                    masked_key = rec.key[:4] + "..."
+                result.append({
+                    "key": masked_key,
+                    "full_key": rec.key if not rec.is_env else None,  # 完整 key 仅非环境变量返回
+                    "name": rec.name,
+                    "created_at": rec.created_at,
+                    "is_env": rec.is_env,
+                    "enabled": rec.enabled,
+                    "total_requests": rec.total_requests,
+                    "total_success": rec.total_success,
+                    "total_errors": rec.total_errors,
+                    "prompt_tokens": rec.prompt_tokens,
+                    "completion_tokens": rec.completion_tokens,
+                    "total_tokens": rec.total_tokens,
+                    "last_used_ts": rec.last_used_ts,
+                })
+            # 按 total_requests 降序
+            result.sort(key=lambda x: x["total_requests"], reverse=True)
+            return result
+
+    def get_api_key_for_auth(self, key: str) -> bool:
+        """检查 API key 是否有效（存在且启用）。"""
+        with self._lock:
+            rec = self._api_keys.get(key)
+            if rec is None:
+                return False
+            return rec.enabled
 
 
 # ---------------------------------------------------------------------------

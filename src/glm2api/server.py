@@ -517,6 +517,7 @@ class GLM2APIServer:
                 self._admin_method = method
                 self._admin_status = 200
                 self._admin_model = ""
+                self._admin_api_key = getattr(self, "_admin_api_key", "")  # 保留 auth 阶段设置的 key
                 self._admin_account = -1
                 self._admin_stream = False
                 self._admin_error = ""
@@ -872,9 +873,7 @@ class GLM2APIServer:
             def _record_token_usage(self, result: object) -> None:
                 """从 chat_completion 响应中提取 token 用量并记录到 admin store。
 
-                用于仪表盘 KPI（token_totals / token_30m / RPM）。
-                在 /v1/chat/completions / /v1/messages / /v1/responses 三个端点的
-                非流式成功路径调用。流式路径暂不记录（需要从累加器提取，复杂度高）。
+                用于仪表盘 KPI（token_totals / token_30m / RPM）+ API Key per-key 用量。
                 """
                 try:
                     if not isinstance(result, dict):
@@ -882,11 +881,15 @@ class GLM2APIServer:
                     usage = result.get("usage")
                     if not isinstance(usage, dict):
                         return
+                    pt = int(usage.get("prompt_tokens", 0) or 0)
+                    ct = int(usage.get("completion_tokens", 0) or 0)
                     from .admin.store import get_store as _get_admin_store
-                    _get_admin_store().record_token_usage(
-                        int(usage.get("prompt_tokens", 0) or 0),
-                        int(usage.get("completion_tokens", 0) or 0),
-                    )
+                    store = _get_admin_store()
+                    store.record_token_usage(pt, ct)
+                    # per-key 用量统计
+                    api_key = getattr(self, "_admin_api_key", "")
+                    if api_key:
+                        store.record_api_key_usage(api_key, success=True, prompt_tokens=pt, completion_tokens=ct)
                 except Exception:
                     pass  # 永不让 metrics 影响主请求
 
@@ -1217,9 +1220,11 @@ class GLM2APIServer:
                 if authorization.startswith("Bearer "):
                     token = authorization[7:].strip()
                     if token in config.server_api_keys:
+                        self._admin_api_key = token  # 记录用于 per-key 用量统计
                         return True
                 x_api_key = self.headers.get("x-api-key", "")
                 if x_api_key and x_api_key.strip() in config.server_api_keys:
+                    self._admin_api_key = x_api_key.strip()
                     return True
                 return False
 

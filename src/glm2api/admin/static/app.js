@@ -341,6 +341,7 @@ const VIEW_TITLES = {
   logs: '请求日志',
   rotates: '轮换事件',
   config: '配置查看',
+  apikeys: 'API 管理',
   system: '系统监控',
 };
 
@@ -385,6 +386,7 @@ async function refresh(force = false) {
       case 'logs': await refreshLogs(); break;
       case 'rotates': await refreshRotates(); break;
       case 'config': await refreshConfig(); break;
+      case 'apikeys': await refreshApiKeys(); break;
       case 'system': await refreshSystem(); break;
     }
   } catch (err) {
@@ -1855,6 +1857,183 @@ async function refreshConfig() {
       </div>
     </div>
   `;
+}
+
+// =========================================================================
+// API Keys view (API 管理)
+// =========================================================================
+
+async function refreshApiKeys() {
+  const data = await api('apikeys');
+  const keys = data.keys || [];
+  const total = data.total || 0;
+  const envCount = data.env_keys_count || 0;
+  const customCount = data.custom_keys_count || 0;
+
+  // 汇总统计
+  const totalRequests = keys.reduce((s, k) => s + (k.total_requests || 0), 0);
+  const totalTokens = keys.reduce((s, k) => s + (k.total_tokens || 0), 0);
+  const totalErrors = keys.reduce((s, k) => s + (k.total_errors || 0), 0);
+
+  let html = `
+    <div class="kpi-grid">
+      <div class="kpi-card info">
+        <div class="kpi-label">API Key 总数</div>
+        <div class="kpi-value">${total}</div>
+        <div class="kpi-sub">环境变量 ${envCount} · 自定义 ${customCount}</div>
+      </div>
+      <div class="kpi-card success">
+        <div class="kpi-label">总请求数</div>
+        <div class="kpi-value">${totalRequests.toLocaleString()}</div>
+        <div class="kpi-sub">所有 Key 累计</div>
+      </div>
+      <div class="kpi-card warning">
+        <div class="kpi-label">Token 用量</div>
+        <div class="kpi-value">${fmtCompactNum(totalTokens)}</div>
+        <div class="kpi-sub">所有 Key 累计</div>
+      </div>
+      <div class="kpi-card ${totalErrors > 0 ? 'error' : 'success'}">
+        <div class="kpi-label">错误请求</div>
+        <div class="kpi-value">${totalErrors}</div>
+        <div class="kpi-sub">所有 Key 累计</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">API Key 列表</div>
+        <div class="panel-meta">
+          <button id="apikey-create-btn" class="btn btn-primary btn-sm">+ 创建新 Key</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="apikey-create-form" style="display:none;margin-bottom:16px;gap:10px;align-items:center;" class="flex">
+          <input type="text" id="apikey-name-input" placeholder="Key 名称（如 production / test）" class="probe-input" style="width:240px;" />
+          <button id="apikey-create-confirm" class="btn btn-primary btn-sm">确认创建</button>
+          <button id="apikey-create-cancel" class="btn btn-ghost btn-sm">取消</button>
+        </div>
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>API Key</th>
+                <th>来源</th>
+                <th>状态</th>
+                <th>请求数</th>
+                <th>成功 / 错误</th>
+                <th>Prompt Tokens</th>
+                <th>Completion Tokens</th>
+                <th>总 Tokens</th>
+                <th>最后使用</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${keys.length === 0 ? '<tr><td colspan="11" class="empty-state">暂无 API Key</td></tr>' : keys.map(k => `
+                <tr>
+                  <td><strong>${escapeHtml(k.name)}</strong></td>
+                  <td class="mono" style="font-size:11px;">${escapeHtml(k.key)}</td>
+                  <td>${k.is_env ? '<span class="badge badge-info">环境变量</span>' : '<span class="badge badge-purple">自定义</span>'}</td>
+                  <td>${k.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-muted">禁用</span>'}</td>
+                  <td class="mono">${k.total_requests || 0}</td>
+                  <td class="mono"><span class="text-success">${k.total_success || 0}</span> / <span class="text-error">${k.total_errors || 0}</span></td>
+                  <td class="mono">${fmtCompactNum(k.prompt_tokens || 0)}</td>
+                  <td class="mono">${fmtCompactNum(k.completion_tokens || 0)}</td>
+                  <td class="mono"><strong>${fmtCompactNum(k.total_tokens || 0)}</strong></td>
+                  <td class="text-muted" style="font-size:11px;">${k.last_used_ts ? fmtTimeShort(k.last_used_ts) : '-'}</td>
+                  <td>
+                    ${k.is_env ? '<span class="text-muted" style="font-size:11px;">不可删除</span>' : `
+                      <button class="btn btn-ghost btn-sm" data-apikey-toggle="${escapeHtml(k.full_key || k.key)}" data-enabled="${!k.enabled}">${k.enabled ? '禁用' : '启用'}</button>
+                      <button class="btn btn-danger btn-sm" data-apikey-delete="${escapeHtml(k.full_key || k.key)}">删除</button>
+                    `}
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    ${customCount > 0 ? `
+    <div class="panel" style="margin-top:20px;">
+      <div class="panel-header">
+        <div class="panel-title">使用说明</div>
+      </div>
+      <div class="panel-body" style="font-size:13px;color:var(--text-muted);line-height:1.8;">
+        <p><strong>环境变量 Key：</strong>从 Render 环境变量 <code>SERVER_API_KEYS</code> 读取，Render 重启后不会丢失。<br/>
+        在 Render Dashboard → Environment 中添加 <code>SERVER_API_KEYS=key1,key2</code>（逗号分隔多个 key）。</p>
+        <p><strong>自定义 Key：</strong>通过管理面板创建，服务重启后会丢失（仅存于内存）。如需持久化请添加到环境变量。</p>
+        <p><strong>使用方式：</strong>在 API 请求头中添加 <code>Authorization: Bearer your-key</code> 或 <code>x-api-key: your-key</code>。</p>
+      </div>
+    </div>
+    ` : ''}
+  `;
+
+  document.getElementById('view-apikeys').innerHTML = html;
+
+  // 绑定创建按钮
+  const createBtn = document.getElementById('apikey-create-btn');
+  const createForm = document.getElementById('apikey-create-form');
+  const createConfirm = document.getElementById('apikey-create-confirm');
+  const createCancel = document.getElementById('apikey-create-cancel');
+  const nameInput = document.getElementById('apikey-name-input');
+
+  if (createBtn) {
+    createBtn.addEventListener('click', () => {
+      createForm.style.display = 'flex';
+      nameInput.focus();
+    });
+  }
+  if (createCancel) {
+    createCancel.addEventListener('click', () => {
+      createForm.style.display = 'none';
+      nameInput.value = '';
+    });
+  }
+  if (createConfirm) {
+    createConfirm.addEventListener('click', async () => {
+      const name = nameInput.value.trim() || '未命名';
+      try {
+        const result = await api('apikeys/create', { method: 'POST', body: { name } });
+        showToast(`✅ API Key 已创建: ${result.key.substring(0, 16)}...`, 'success');
+        createForm.style.display = 'none';
+        nameInput.value = '';
+        refreshApiKeys();
+      } catch (err) {
+        showToast('创建失败: ' + err.message, 'error');
+      }
+    });
+  }
+
+  // 绑定删除/禁用按钮
+  document.querySelectorAll('[data-apikey-delete]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.apikeyDelete;
+      if (!confirm('确认删除此 API Key？删除后使用此 Key 的请求将被拒绝。')) return;
+      try {
+        await api('apikeys/delete', { method: 'POST', body: { key } });
+        showToast('✅ 已删除', 'success');
+        refreshApiKeys();
+      } catch (err) {
+        showToast('删除失败: ' + err.message, 'error');
+      }
+    });
+  });
+  document.querySelectorAll('[data-apikey-toggle]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.apikeyToggle;
+      const enabled = btn.dataset.enabled === 'true';
+      try {
+        await api('apikeys/toggle', { method: 'POST', body: { key, enabled } });
+        showToast(`✅ 已${enabled ? '启用' : '禁用'}`, 'success');
+        refreshApiKeys();
+      } catch (err) {
+        showToast('操作失败: ' + err.message, 'error');
+      }
+    });
+  });
 }
 
 // =========================================================================
