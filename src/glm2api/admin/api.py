@@ -604,7 +604,7 @@ def _handle_probe(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
                 "prompt": prompt or "a cat",
                 "size": payload.get("size", "1024x1024"),
             }
-            result = glm_client.generate_image(image_payload)
+            result = glm_client.generate_images(image_payload)
             latency_ms = int((time.perf_counter() - start) * 1000)
             _send_json(handler, HTTPStatus.OK, {
                 "ok": True,
