@@ -1054,6 +1054,7 @@ class GLMEventAccumulator:
     _known_logic_ids_for_reasoning: list[str] = field(default_factory=list)
     tool_parser: StreamingToolParser = field(default_factory=StreamingToolParser)
     emitted_role: bool = False
+    _finish_reason_sent: bool = False  # P0: 防止重复发送 finish_reason
     _render_cache_dirty: bool = True
     _cached_full_text: str = ""
     _cached_full_reasoning: str = ""
@@ -1191,6 +1192,7 @@ class GLMEventAccumulator:
                             }
                         )
                     )
+                    self._finish_reason_sent = True  # P0: 标记已发送 finish_reason
                     return chunks, "finish"
             if self.allowed_tool_names is not None:
                 self._deferred_visible_text += visible_text_delta
@@ -1383,21 +1385,24 @@ class GLMEventAccumulator:
                 )
 
         finish_reason = "tool_calls" if all_tool_calls else "stop"
-        # Per OpenAI spec: chunk with finish_reason (no usage here)
-        chunks.append(
-            self._chunk_json(
-                {
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                            "logprobs": None,
-                        }
-                    ],
-                }
+        # P0 修复：如果 consume_event 已经发送了 finish_reason（如 "length"），
+        # finalize 不再重复发送 finish_reason chunk
+        if not self._finish_reason_sent:
+            # Per OpenAI spec: chunk with finish_reason (no usage here)
+            chunks.append(
+                self._chunk_json(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": finish_reason,
+                                "logprobs": None,
+                            }
+                        ],
+                    }
+                )
             )
-        )
         # Final usage chunk (matches OpenAI stream_options.include_usage behavior)
         # choices is empty array here per spec
         chunks.append(
