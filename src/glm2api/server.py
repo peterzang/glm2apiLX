@@ -960,7 +960,6 @@ class GLM2APIServer:
                 # Determine model capabilities based on naming convention
                 lower = model_id.lower()
                 capabilities = {
-                    "type": "model",
                     "id": model_id,
                     "object": "model",
                     "created": 1700000000,
