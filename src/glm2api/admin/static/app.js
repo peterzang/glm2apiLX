@@ -1708,14 +1708,15 @@ async function refreshLogs() {
       <tr>
         <td class="mono text-muted" style="font-size:11px;">${fmtTime(l.ts)}</td>
         <td class="mono">${escapeHtml(l.method)}</td>
-        <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.path)}">${escapeHtml(l.path)}</td>
+        <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.path)}">${escapeHtml(l.path)}</td>
         <td><span class="badge ${l.protocol.startsWith('anthropic') ? 'badge-purple' : l.protocol.includes('responses') ? 'badge-info' : 'badge-success'}">${escapeHtml(l.protocol)}</span></td>
-        <td class="mono text-muted">${escapeHtml(l.model || '-')}</td>
+        <td class="mono">${escapeHtml(l.model || '-')}</td>
+        <td class="mono text-muted" style="font-size:11px;">${escapeHtml(l.api_key || '-')}</td>
         <td class="mono"><span class="${statusClass}">${l.status}</span></td>
         <td class="mono">${l.duration_ms}ms</td>
         <td class="mono text-muted">${l.stream ? 'stream' : 'sync'}</td>
         <td class="mono text-muted">${l.account_index >= 0 ? '#' + l.account_index : '-'}</td>
-        <td class="mono text-muted" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.error || '')}">${escapeHtml(l.error || '') || '-'}</td>
+        <td class="mono text-muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.error || '')}">${escapeHtml(l.error || '') || '-'}</td>
         <td class="mono text-muted" style="font-size:11px;">${escapeHtml(shortHash(l.request_id, 12))}</td>
       </tr>
     `;
@@ -1725,7 +1726,7 @@ async function refreshLogs() {
       <table class="data-table">
         <thead>
           <tr>
-            <th>时间</th><th>方法</th><th>路径</th><th>协议</th><th>模型</th>
+            <th>时间</th><th>方法</th><th>路径</th><th>协议</th><th>模型</th><th>API Key</th>
             <th>状态</th><th>延迟</th><th>模式</th><th>账号</th><th>错误</th><th>请求ID</th>
           </tr>
         </thead>
@@ -1933,7 +1934,12 @@ async function refreshApiKeys() {
               ${keys.length === 0 ? '<tr><td colspan="11" class="empty-state">暂无 API Key</td></tr>' : keys.map(k => `
                 <tr>
                   <td><strong>${escapeHtml(k.name)}</strong></td>
-                  <td class="mono" style="font-size:11px;">${escapeHtml(k.key)}</td>
+                  <td class="mono" style="font-size:11px;">
+                    ${k.full_key ? `
+                      <span class="apikey-full">${escapeHtml(k.full_key)}</span>
+                      <button class="btn btn-ghost btn-sm apikey-copy-btn" data-copy-key="${escapeHtml(k.full_key)}" title="复制 API Key" style="padding:2px 6px;font-size:11px;margin-left:4px;">📋</button>
+                    ` : escapeHtml(k.key)}
+                  </td>
                   <td>${k.is_env ? '<span class="badge badge-info">环境变量</span>' : '<span class="badge badge-purple">自定义</span>'}</td>
                   <td>${k.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-muted">禁用</span>'}</td>
                   <td class="mono">${k.total_requests || 0}</td>
@@ -1997,7 +2003,38 @@ async function refreshApiKeys() {
       const name = nameInput.value.trim() || '未命名';
       try {
         const result = await api('apikeys/create', { method: 'POST', body: { name } });
-        showToast(`✅ API Key 已创建: ${result.key.substring(0, 16)}...`, 'success');
+        // 创建后显示完整 key + 复制按钮
+        showToast(`✅ API Key 已创建`, 'success');
+        // 弹出完整 key 让用户复制
+        const fullKey = result.key;
+        const copyModal = document.createElement('div');
+        copyModal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;';
+        copyModal.innerHTML = `
+          <div style="background:var(--glass-bg-strong);backdrop-filter:var(--glass-blur);border:1px solid var(--glass-border);border-radius:16px;padding:32px;max-width:520px;width:90%;box-shadow:var(--shadow-lg);">
+            <div style="font-size:18px;font-weight:700;margin-bottom:8px;color:var(--success);">✅ API Key 创建成功</div>
+            <div style="color:var(--text-muted);font-size:13px;margin-bottom:16px;">请立即复制保存，此 Key 仅显示一次。服务重启后自定义 Key 会丢失。</div>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:20px;">
+              <input type="text" value="${escapeHtml(fullKey)}" readonly style="flex:1;padding:10px 14px;background:var(--bg-elevated);border:1px solid var(--border-light);border-radius:8px;color:var(--text);font-family:ui-monospace,monospace;font-size:13px;outline:none;" id="created-key-input" />
+              <button class="btn btn-primary" id="copy-created-key" style="padding:10px 16px;">📋 复制</button>
+            </div>
+            <button class="btn btn-ghost" id="close-key-modal" style="width:100%;padding:10px;">关闭</button>
+          </div>
+        `;
+        document.body.appendChild(copyModal);
+        const keyInput = document.getElementById('created-key-input');
+        keyInput.focus();
+        keyInput.select();
+        document.getElementById('copy-created-key').addEventListener('click', () => {
+          keyInput.select();
+          document.execCommand('copy');
+          showToast('✅ 已复制到剪贴板', 'success');
+        });
+        document.getElementById('close-key-modal').addEventListener('click', () => {
+          copyModal.remove();
+        });
+        copyModal.addEventListener('click', (e) => {
+          if (e.target === copyModal) copyModal.remove();
+        });
         createForm.style.display = 'none';
         nameInput.value = '';
         refreshApiKeys();
@@ -2006,6 +2043,27 @@ async function refreshApiKeys() {
       }
     });
   }
+
+  // 绑定复制按钮
+  document.querySelectorAll('.apikey-copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.copyKey;
+      // 创建临时 textarea 复制
+      const textarea = document.createElement('textarea');
+      textarea.value = key;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        document.execCommand('copy');
+        showToast('✅ 已复制到剪贴板', 'success');
+      } catch (e) {
+        showToast('复制失败', 'error');
+      }
+      document.body.removeChild(textarea);
+    });
+  });
 
   // 绑定删除/禁用按钮
   document.querySelectorAll('[data-apikey-delete]').forEach(btn => {

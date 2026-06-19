@@ -52,6 +52,7 @@ class RequestRecord:
     stream: bool
     error: str                         # "" on success
     request_id: str                    # internal request_id (for cross-correlation)
+    api_key: str = ""                  # API key name used (masked, for log display)
 
 
 @dataclass(slots=True)
@@ -437,6 +438,7 @@ class AdminStore:
                 "stream": r.stream,
                 "error": r.error,
                 "request_id": r.request_id,
+                "api_key": r.api_key,
             }
             for r in records
         ]

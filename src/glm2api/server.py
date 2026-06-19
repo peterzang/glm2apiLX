@@ -551,6 +551,15 @@ class GLM2APIServer:
                         except Exception:
                             account_index = -1
                     duration_ms = int((time.monotonic() - self._admin_start) * 1000)
+                    # 获取 API key 的掩码名称用于日志显示
+                    api_key_display = ""
+                    raw_key = getattr(self, "_admin_api_key", "")
+                    if raw_key:
+                        # 掩码处理：前8位...后4位
+                        if len(raw_key) > 16:
+                            api_key_display = raw_key[:8] + "..." + raw_key[-4:]
+                        else:
+                            api_key_display = raw_key[:4] + "..."
                     admin_record_request(
                         method=getattr(self, "_admin_method", ""),
                         path=path,
@@ -563,6 +572,7 @@ class GLM2APIServer:
                         stream=getattr(self, "_admin_stream", False),
                         error=getattr(self, "_admin_error", ""),
                         request_id=getattr(self, "_admin_request_id", ""),
+                        api_key=api_key_display,
                     )
                 except Exception:
                     pass  # never let metrics break the request

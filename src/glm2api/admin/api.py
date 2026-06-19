@@ -884,6 +884,7 @@ def handle_admin_request(handler, config: AppConfig, glm_client: GLMWebClient, l
             return True
 
         if name not in _API_ROUTES:
+            logger.warning("admin api unknown endpoint name=%r path=%r command=%r", name, path, handler.command)
             _send_json(handler, HTTPStatus.NOT_FOUND, {"error": "unknown_endpoint"}, config)
             return True
 
@@ -928,6 +929,7 @@ def record_request(
     stream: bool,
     error: str,
     request_id: str,
+    api_key: str = "",
 ) -> None:
     """Called by main server after every request to record it in the admin store."""
     rec = RequestRecord(
@@ -943,5 +945,6 @@ def record_request(
         stream=stream,
         error=error,
         request_id=request_id,
+        api_key=api_key,
     )
     get_store().record_request(rec)
