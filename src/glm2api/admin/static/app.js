@@ -1637,6 +1637,23 @@ function renderProbeResult(result, payload, elapsed) {
   const contentBox = document.getElementById('probe-content-box');
   if (!result.ok) {
     contentBox.innerHTML = `<span class="text-error">❌ ${escapeHtml(result.error || '未知错误')}</span>`;
+  } else if (result.is_image) {
+    // P2 修复：图像模型返回图片 URL，显示图片而非文字
+    const resp = result.response || {};
+    const images = resp.data || [];
+    let html = '<div class="probe-content-block"><div class="probe-content-label">生成的图片</div>';
+    if (images.length === 0) {
+      html += '<span class="text-muted">(无图片返回)</span>';
+    } else {
+      images.forEach((img, i) => {
+        const url = img.url || (img.b64_json ? 'data:image/png;base64,' + img.b64_json : '');
+        if (url) {
+          html += `<div style="margin:10px 0;"><img src="${escapeHtml(url)}" alt="Generated Image ${i+1}" style="max-width:100%;border-radius:8px;border:1px solid var(--border);" onerror="this.style.display='none';this.nextElementSibling.style.display='block';" /><div style="display:none;color:var(--text-muted);font-size:12px;">图片加载失败，URL: ${escapeHtml(url.substring(0, 100))}...</div></div>`;
+        }
+      });
+    }
+    html += '</div>';
+    contentBox.innerHTML = html;
   } else {
     const resp = result.response || {};
     const choices = resp.choices || [];

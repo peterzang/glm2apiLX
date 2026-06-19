@@ -787,6 +787,11 @@ class GLMWebClient:
     def _open_chat_stream(self, openai_payload: dict[str, object], preferred_account_index: int | None = None):
         requested_model = str(openai_payload.get("model", "glm-4"))
         upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
+        # P0 修复：提取 base_model 用于 meta_data.chat_model
+        # GLM 上游通过 chat_model 字段选择实际模型（如 "glm-5.1" / "glm-4.7"），
+        # 之前不传此字段导致所有请求都被默认当作 glm-5.2
+        from ..core.model_variants import split_model_features
+        base_model, _ = split_model_features(requested_model)
         filtered_tools, _ = self._resolve_tools(openai_payload)
         # Translate response_format (json_object / json_schema) into a system instruction
         # GLM doesn't have a native JSON mode, but it can follow instructions reliably.
@@ -863,6 +868,9 @@ class GLMWebClient:
                     "platform": "pc",
                     "quote_log_id": "",
                     "cogview": {"rm_label_watermark": False},
+                    # P0 修复：chat_model 字段告诉 GLM 上游使用哪个模型
+                    # 之前留空导致所有请求都被 GLM 默认当作 glm-5.2 处理
+                    "chat_model": base_model,
                 },
             },
             ensure_ascii=False,

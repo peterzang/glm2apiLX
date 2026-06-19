@@ -575,19 +575,61 @@ def _handle_probe(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
     # 强制非流式（admin probe 不支持流式，避免长连接复杂度）
     payload["stream"] = False
 
+    # P2 修复：检测图像模型，走图像生成路径而非 chat completions
+    # 图像模型（cogView / glm-image-1）应该返回图片 URL 而非文字
+    is_image_model = model in (
+        config.glm_image_model_name,
+        "cogView-4-250304",
+    ) or model.startswith("cogView")
+
     start = time.perf_counter()
     try:
-        result, conv_id = glm_client.chat_completion(payload)
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        _send_json(handler, HTTPStatus.OK, {
-            "ok": True,
-            "latency_ms": latency_ms,
-            "status": 200,
-            "response": result,
-            "conversation_id": conv_id,
-            "account_index": glm_client.get_last_account_index(),
-            "error": None,
-        }, config)
+        if is_image_model:
+            # 图像模型：走 image generation 路径
+            # 从 messages 提取 prompt
+            prompt = ""
+            for msg in payload.get("messages", []):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        prompt = content
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                prompt = str(part.get("text", ""))
+                                break
+                    break
+            image_payload = {
+                "model": model,
+                "prompt": prompt or "a cat",
+                "size": payload.get("size", "1024x1024"),
+            }
+            result = glm_client.generate_image(image_payload)
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            _send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "latency_ms": latency_ms,
+                "status": 200,
+                "response": result,
+                "conversation_id": None,
+                "account_index": glm_client.get_last_account_index(),
+                "error": None,
+                "is_image": True,
+            }, config)
+        else:
+            # 普通对话模型：走 chat completions 路径
+            result, conv_id = glm_client.chat_completion(payload)
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            _send_json(handler, HTTPStatus.OK, {
+                "ok": True,
+                "latency_ms": latency_ms,
+                "status": 200,
+                "response": result,
+                "conversation_id": conv_id,
+                "account_index": glm_client.get_last_account_index(),
+                "error": None,
+                "is_image": False,
+            }, config)
     except UpstreamAPIError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
         _send_json(handler, HTTPStatus.OK, {
