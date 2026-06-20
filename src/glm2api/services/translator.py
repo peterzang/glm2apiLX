@@ -1547,7 +1547,7 @@ class GLMEventAccumulator:
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,
-            "system_fingerprint": system_fingerprint(),
+            "system_fingerprint": system_fingerprint(self.model),
             "choices": [
                 {
                     "index": 0,
@@ -1734,7 +1734,7 @@ class GLMEventAccumulator:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "system_fingerprint": system_fingerprint(),
+            "system_fingerprint": system_fingerprint(self.model),
         }
         payload.update(patch)
         return "data: " + safe_json_dumps(payload) + "\n\n"

@@ -299,7 +299,7 @@ def openai_to_responses(result: dict[str, object], model: str) -> dict[str, obje
         "parallel_tool_calls": True,
         "previous_response_id": None,
         "store": False,
-        "system_fingerprint": system_fingerprint(),
+        "system_fingerprint": system_fingerprint(model),
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -370,7 +370,7 @@ class ResponsesStreamAccumulator:
             "previous_response_id": None,
             "reasoning": {"effort": None, "summary": None},
             "store": False,
-            "system_fingerprint": system_fingerprint(),
+            "system_fingerprint": system_fingerprint(self.model),
             "temperature": 1,
             "text": {"format": {"type": "text"}},
             "tool_choice": "auto",

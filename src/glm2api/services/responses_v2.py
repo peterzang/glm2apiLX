@@ -465,7 +465,7 @@ def openai_to_responses_v2(
         "parallel_tool_calls": bool(parallel_tool_calls),
         "previous_response_id": previous_response_id if isinstance(previous_response_id, str) else None,
         "store": bool(store),
-        "system_fingerprint": system_fingerprint(),
+        "system_fingerprint": system_fingerprint(model),
         "temperature": temperature if isinstance(temperature, (int, float)) else None,
         "top_p": top_p if isinstance(top_p, (int, float)) else None,
         "tool_choice": tool_choice,

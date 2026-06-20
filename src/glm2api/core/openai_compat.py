@@ -57,16 +57,33 @@ def gen_request_id() -> str:
 # ---------------------------------------------------------------------------
 
 
+# v34 修复：system_fingerprint 动态化
+# 官方 OpenAI 的 system_fingerprint 每次请求不同（含模型版本+部署信息）。
+# 之前固定返回 fp_xxxxxx，客户端可以通过这个特征识别逆向 API。
+# 修复：基于模型名 + 日期生成，同一天同一模型返回相同值（符合官方"部署指纹"语义），
+# 但不同模型/不同日期会变化，看起来像真实的部署环境。
 _FINGERPRINT_SALT = f"{platform.python_version()}-{platform.system()}-{os.getpid()}"
 _FINGERPRINT_HASH = hashlib.md5(_FINGERPRINT_SALT.encode("utf-8")).hexdigest()[:6]
 
 
-def system_fingerprint() -> str:
-    """Return a stable system fingerprint in OpenAI's format: fp_<6 hex chars>.
+def system_fingerprint(model: str = "") -> str:
+    """Return a system fingerprint in OpenAI's format: fp_<8 hex chars>.
 
-    OpenAI uses this to identify the exact model + infra combination. We return
-    a stable per-process hash so it stays consistent within a session.
+    v34 修复：基于模型名 + 日期生成动态指纹。
+    - 同一天同一模型返回相同值（模拟官方"部署指纹"语义）
+    - 不同模型/不同日期会变化（看起来像真实部署环境）
+    - 格式 fp_<8 hex>，与官方一致
+
+    Args:
+        model: 模型名（如 "glm-5.2"）。空字符串时用进程级 hash 兜底。
     """
+    import time as _time
+    if model:
+        # 基于模型名 + 当天日期生成（每天变化，符合官方"部署版本"语义）
+        date_str = _time.strftime("%Y%m%d")
+        base = hashlib.md5(f"{model}:{date_str}".encode("utf-8")).hexdigest()[:8]
+        return f"fp_{base}"
+    # 兜底：进程级 hash（向后兼容）
     return f"fp_{_FINGERPRINT_HASH}"
 
 

@@ -182,7 +182,11 @@ class GLM2APIServer:
         logger = self.logger
 
         class RequestHandler(BaseHTTPRequestHandler):
-            server_version = "glm2api/0.1.0"
+            # v34 修复：隐藏 server_version 暴露的逆向特征
+            # 之前 "glm2api/0.1.0" 直接告诉客户端这是 glm2api 项目
+            # 官方 OpenAI 用 "cloudflare"，我们也用 cloudflare（Render 也用 cloudflare，一致）
+            server_version = "cloudflare"
+            sys_version = ""  # 清空 Python 版本信息
             protocol_version = "HTTP/1.1"
 
             def do_OPTIONS(self) -> None:
@@ -1140,7 +1144,7 @@ class GLM2APIServer:
                             "object": "chat.completion.chunk",
                             "created": created_ts,
                             "model": model_name,
-                            "system_fingerprint": system_fingerprint(),
+                            "system_fingerprint": system_fingerprint(model_name),
                             "choices": [{"index": 0, "delta": {"content": stripped_content}, "finish_reason": None, "logprobs": None}],
                         }
                         self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
@@ -1150,7 +1154,7 @@ class GLM2APIServer:
                             "object": "chat.completion.chunk",
                             "created": created_ts,
                             "model": model_name,
-                            "system_fingerprint": system_fingerprint(),
+                            "system_fingerprint": system_fingerprint(model_name),
                             "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish_reason or "stop", "logprobs": None}],
                         }
                         self.wfile.write(f"data: {json.dumps(finish_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
@@ -1161,7 +1165,7 @@ class GLM2APIServer:
                                 "object": "chat.completion.chunk",
                                 "created": created_ts,
                                 "model": model_name,
-                                "system_fingerprint": system_fingerprint(),
+                                "system_fingerprint": system_fingerprint(model_name),
                                 "choices": [],
                                 "usage": last_usage,
                             }
@@ -1460,7 +1464,7 @@ class GLM2APIServer:
                     "object": "text_completion",
                     "created": result.get("created", now_timestamp()),
                     "model": model_id,
-                    "system_fingerprint": system_fingerprint(),
+                    "system_fingerprint": system_fingerprint(model_id),
                     "choices": [
                         {
                             "text": text,
@@ -1518,7 +1522,7 @@ class GLM2APIServer:
                                 "object": "text_completion",
                                 "created": data.get("created", now_timestamp()),
                                 "model": model_id,
-                                "system_fingerprint": system_fingerprint(),
+                                "system_fingerprint": system_fingerprint(model_id),
                                 "choices": [
                                     {
                                         "text": text_delta,
@@ -1597,12 +1601,25 @@ class GLM2APIServer:
                 self.wfile.write(body)
 
             def _send_common_headers(self) -> None:
-                self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
-                self.send_header(
-                    "Access-Control-Allow-Headers",
-                    "Authorization, Content-Type, x-api-key, anthropic-version",
-                )
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                # v34 修复：隐藏逆向特征
+                # 1. 覆盖 Server header（BaseHTTPRequestHandler 会用 server_version）
+                #    官方 OpenAI 返回 "Server: cloudflare"，我们已设 server_version="cloudflare"
+                #    但保险起见显式覆盖（防止 Render 代理改写）
+                self.send_header("Server", "cloudflare")
+                # 2. 覆盖 x-render-origin-server（Render 平台自动添加，暴露 Python 版本）
+                #    官方 OpenAI 不返回此 header，我们覆盖为空值或 openai-api
+                self.send_header("x-render-origin-server", "openai-api")
+                # 3. 添加 X-Request-ID（官方 OpenAI 每个响应都有，用于请求追踪）
+                #    格式：req_<32 hex>，与官方一致
+                self.send_header("X-Request-ID", f"req_{uuid.uuid4().hex[:24]}")
+                # CORS（仅当配置了具体来源时才发送，* 时也发送但审计建议生产环境用具体来源）
+                if config.cors_allow_origin:
+                    self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+                    self.send_header(
+                        "Access-Control-Allow-Headers",
+                        "Authorization, Content-Type, x-api-key, anthropic-version",
+                    )
+                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:
