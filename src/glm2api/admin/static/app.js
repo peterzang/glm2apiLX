@@ -317,6 +317,7 @@ async function handleLoginSubmit(e) {
     const data = await api('login', { method: 'POST', body: { password: pw } });
     setToken(data.token);
     showApp();
+    startAutoRefresh();
   } catch (err) {
     errEl.textContent = '登录失败：' + err.message;
     errEl.hidden = false;
@@ -325,6 +326,7 @@ async function handleLoginSubmit(e) {
 
 async function handleLogout() {
   try { await api('logout', { method: 'POST' }); } catch (_) {}
+  stopAutoRefresh();
   clearToken();
   showLogin();
 }
@@ -363,10 +365,14 @@ function switchView(name) {
 // =========================================================================
 
 let refreshTimer = null;
+// 自动刷新间隔：1 天（86400000ms）
+// 原默认 5s 太频繁，对正常使用的 dashboard 来说没必要那么实时
+// 1 天一次保证长期打开页面时偶尔会刷新，需要看实时数据时点"刷新"按钮即可
+const AUTO_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 function startAutoRefresh() {
   stopAutoRefresh();
   if (document.getElementById('auto-refresh').checked) {
-    refreshTimer = setInterval(() => refresh(), 5000);
+    refreshTimer = setInterval(() => refresh(), AUTO_REFRESH_INTERVAL_MS);
   }
 }
 function stopAutoRefresh() {
@@ -426,7 +432,9 @@ async function refreshDashboard() {
   // 1) 计算当前快照 hash
   const snapshot = {
     total: all.total, success: all.success, ce: all.client_errors, se: all.server_errors,
+    apiTotal: all.api_total, modelsTotal: all.models_total, otherTotal: all.other_total,
     sr: r5.success_rate, sr_s: r5.success, sr_t: r5.total,
+    r5Api: r5.api_total, r5Models: r5.models_total, r5Other: r5.other_total,
     rpm, avgRpm, peakRpm, requests30m,
     tp: tokenTotals.prompt, tc: tokenTotals.completion, tt: tokenTotals.total,
     t30p: token30m.prompt, t30c: token30m.completion,
@@ -447,27 +455,44 @@ async function refreshDashboard() {
   if (!isFirstRender && !dataChanged) return;
 
   // === KPI Row 1 ===
+  // 把"总请求数"拆成 3 张卡：API 业务请求 / Models 元信息 / 其他
+  // 让用户能一眼分清 chat/completions 等业务请求 vs /v1/models 查询 vs 杂项
+  const apiTotal = all.api_total ?? 0;
+  const apiSuccess = all.api_success ?? 0;
+  const apiClientErr = all.api_client_errors ?? 0;
+  const apiServerErr = all.api_server_errors ?? 0;
+  const modelsTotal = all.models_total ?? 0;
+  const modelsSuccess = all.models_success ?? 0;
+  const otherTotal = all.other_total ?? 0;
+  // 5 分钟窗口同样拆分（sub 里展示最近活动）
+  const r5Api = r5.api_total ?? 0;
+  const r5Models = r5.models_total ?? 0;
+  const r5Other = r5.other_total ?? 0;
   const kpiRow1 = `
     <div class="kpi-grid">
       <div class="kpi-card info">
-        <div class="kpi-label">总请求数</div>
-        <div class="kpi-value" data-metric="total-requests">${(all.total || 0).toLocaleString()}</div>
-        <div class="kpi-sub">成功 ${all.success} · 4xx ${all.client_errors} · 5xx ${all.server_errors}</div>
+        <div class="kpi-label">API 请求</div>
+        <div class="kpi-value" data-metric="api-requests">${(apiTotal).toLocaleString()}</div>
+        <div class="kpi-sub">成功 ${apiSuccess} · 4xx ${apiClientErr} · 5xx ${apiServerErr}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Api} · chat/responses/anthropic 等</div>
+      </div>
+      <div class="kpi-card" style="border-left:3px solid var(--purple);">
+        <div class="kpi-label">Models 请求</div>
+        <div class="kpi-value" data-metric="models-requests">${(modelsTotal).toLocaleString()}</div>
+        <div class="kpi-sub">成功 ${modelsSuccess} · /v1/models 元信息查询</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Models} · SDK 启动会拉取</div>
       </div>
       <div class="kpi-card ${successRateColor}">
         <div class="kpi-label">5分钟成功率</div>
         <div class="kpi-value" data-metric="success-rate">${(r5.success_rate || 0).toFixed(1)}%</div>
         <div class="kpi-sub">${r5.success}/${r5.total} 请求</div>
-      </div>
-      <div class="kpi-card success">
-        <div class="kpi-label">活跃账号</div>
-        <div class="kpi-value" data-metric="active-accounts">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
-        <div class="kpi-sub">已使用过的账号</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">API ${r5Api} · Models ${r5Models} · 其他 ${r5Other}</div>
       </div>
       <div class="kpi-card warning">
         <div class="kpi-label">运行时长</div>
         <div class="kpi-value" data-metric="uptime" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
         <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">其他请求 ${otherTotal} · 历史累计 ${all.total}</div>
       </div>
     </div>
   `;
@@ -485,15 +510,16 @@ async function refreshDashboard() {
         <div class="kpi-value" data-metric="p95">${r5.p95_ms}ms</div>
         <div class="kpi-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
       </div>
-      <div class="kpi-card warning">
-        <div class="kpi-label">Prompt Tokens</div>
-        <div class="kpi-value" data-metric="prompt-tokens">${fmtCompactNum(tokenTotals.prompt)}</div>
-        <div class="kpi-sub">30m ${fmtCompactNum(token30m.prompt)}</div>
+      <div class="kpi-card success">
+        <div class="kpi-label">活跃账号</div>
+        <div class="kpi-value" data-metric="active-accounts">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
+        <div class="kpi-sub">已使用过的账号</div>
       </div>
       <div class="kpi-card" style="border-left:3px solid var(--purple);">
-        <div class="kpi-label">Completion Tokens</div>
-        <div class="kpi-value" data-metric="completion-tokens">${fmtCompactNum(tokenTotals.completion)}</div>
-        <div class="kpi-sub">总计 ${fmtCompactNum(tokenTotals.total)}</div>
+        <div class="kpi-label">Token 累计</div>
+        <div class="kpi-value" data-metric="total-tokens" style="font-size:22px;">${fmtCompactNum(tokenTotals.total)}</div>
+        <div class="kpi-sub">P ${fmtCompactNum(tokenTotals.prompt)} · C ${fmtCompactNum(tokenTotals.completion)}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">30m ${fmtCompactNum(token30m.total)}</div>
       </div>
     </div>
   `;

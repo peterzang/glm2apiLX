@@ -100,6 +100,15 @@ class AdminStore:
         self._total_success = 0          # 2xx
         self._total_errors = 0           # 5xx or exceptions
         self._total_client_errors = 0    # 4xx
+        # 按请求类别拆分的历史总计数（让仪表盘能区分 API 业务请求 vs Models 元信息请求 vs 其他）
+        # api:    chat / completions / responses / anthropic 等业务请求
+        # models: /v1/models 元信息查询 + /health 健康检查
+        # other:  上述之外的杂项（embeddings / moderations / admin 等）
+        self._category_totals: Dict[str, Dict[str, int]] = {
+            "api":    {"total": 0, "success": 0, "client_errors": 0, "server_errors": 0},
+            "models": {"total": 0, "success": 0, "client_errors": 0, "server_errors": 0},
+            "other":  {"total": 0, "success": 0, "client_errors": 0, "server_errors": 0},
+        }
         # Per-account stats (kept by store, fed by auth manager via hooks)
         self._account_stats: Dict[int, Dict[str, int]] = {}
         # Per-model stats
@@ -154,6 +163,16 @@ class AdminStore:
                 self._total_client_errors += 1
             else:
                 self._total_errors += 1
+            # 同步更新按类别拆分计数器（让仪表盘能区分 API/Models/Other）
+            cat = classify_category(rec.protocol)
+            cat_stats = self._category_totals[cat]
+            cat_stats["total"] += 1
+            if 200 <= rec.status < 300:
+                cat_stats["success"] += 1
+            elif 400 <= rec.status < 500:
+                cat_stats["client_errors"] += 1
+            else:
+                cat_stats["server_errors"] += 1
             if rec.model:
                 self._model_counter[rec.model] += 1
                 # 按模型延迟统计（v3 审核报告建议：帮助用户选模型时参考）
@@ -314,9 +333,17 @@ class AdminStore:
             p95 = recent_latencies[min(p95_idx, len(recent_latencies) - 1)] if recent_latencies else 0
             p99_idx = int(len(recent_latencies) * 0.99)
             p99 = recent_latencies[min(p99_idx, len(recent_latencies) - 1)] if recent_latencies else 0
+            # 5 分钟窗口按类别拆分（让仪表盘能看到最近 5 分钟的 API/Models/Other 占比）
+            recent_by_category = {"api": 0, "models": 0, "other": 0}
+            for r in recent:
+                recent_by_category[classify_category(r.protocol)] += 1
             # All-time
             all_total = self._total_requests
             all_success_rate = (self._total_success / all_total * 100) if all_total else 0.0
+            # 按类别拆分的历史总计数快照（深拷贝避免外部修改）
+            category_totals = {
+                cat: dict(stats) for cat, stats in self._category_totals.items()
+            }
             # Hourly histogram (oldest first)
             hourly = list(self._hourly)
             # Top models
@@ -361,6 +388,14 @@ class AdminStore:
                     "client_errors": self._total_client_errors,
                     "server_errors": self._total_errors,
                     "success_rate": round(all_success_rate, 2),
+                    # 按类别拆分（让仪表盘 KPI 能区分 API 业务请求 vs Models 元信息 vs 其他）
+                    "api_total": category_totals["api"]["total"],
+                    "api_success": category_totals["api"]["success"],
+                    "api_client_errors": category_totals["api"]["client_errors"],
+                    "api_server_errors": category_totals["api"]["server_errors"],
+                    "models_total": category_totals["models"]["total"],
+                    "models_success": category_totals["models"]["success"],
+                    "other_total": category_totals["other"]["total"],
                 },
                 "recent_5m": {
                     "total": recent_total,
@@ -369,6 +404,10 @@ class AdminStore:
                     "p50_ms": p50,
                     "p95_ms": p95,
                     "p99_ms": p99,
+                    # 5 分钟窗口按类别拆分
+                    "api_total": recent_by_category["api"],
+                    "models_total": recent_by_category["models"],
+                    "other_total": recent_by_category["other"],
                 },
                 "hourly": hourly,
                 "top_models": [{"model": m, "count": c} for m, c in top_models],
@@ -642,6 +681,21 @@ def classify_protocol(path: str, payload: Optional[dict] = None) -> str:
         return "openai-images"
     if path == "/health" or path.endswith("/models"):
         return "meta"
+    return "other"
+
+
+def classify_category(protocol: str) -> str:
+    """把细分协议归到 3 大类，用于仪表盘 KPI 拆分显示。
+
+    - "api":    业务请求（chat/completions/responses/anthropic/images/embeddings/moderations）
+    - "models": 元信息查询（/v1/models + /health）
+    - "other":  上述之外的杂项
+    """
+    if protocol in ("openai-chat", "anthropic", "openai-responses", "openai-legacy",
+                    "openai-images", "openai-embeddings", "openai-moderations"):
+        return "api"
+    if protocol == "meta":
+        return "models"
     return "other"
 
 
