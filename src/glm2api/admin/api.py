@@ -188,14 +188,34 @@ def _read_json_body(handler) -> Dict[str, Any]:
 _login_failures: dict[str, list[float]] = {}  # ip -> [timestamps]
 _LOGIN_MAX_FAILURES = 5
 _LOGIN_LOCKOUT_SECONDS = 900  # 15 分钟
+_login_check_counter = 0  # P2-5: 定期清理计数器
+
+
+def _get_client_ip(handler) -> str:
+    """P2-6: 获取真实客户端 IP，优先检查 X-Forwarded-For。"""
+    xff = handler.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0] if handler.client_address else "unknown"
 
 
 def _check_brute_force(ip: str) -> bool:
     """检查 IP 是否被锁定。返回 True 表示允许登录。"""
+    global _login_check_counter
     import time as _time
     now = _time.time()
+    # P2-5: 每 100 次检查时全局清理过期记录
+    _login_check_counter += 1
+    if _login_check_counter >= 100:
+        _login_check_counter = 0
+        for check_ip in list(_login_failures.keys()):
+            failures = _login_failures[check_ip]
+            failures = [ts for ts in failures if now - ts < _LOGIN_LOCKOUT_SECONDS]
+            if not failures:
+                del _login_failures[check_ip]
+            else:
+                _login_failures[check_ip] = failures
     failures = _login_failures.get(ip, [])
-    # 清理过期的失败记录
     failures = [ts for ts in failures if now - ts < _LOGIN_LOCKOUT_SECONDS]
     _login_failures[ip] = failures
     return len(failures) < _LOGIN_MAX_FAILURES
@@ -210,7 +230,7 @@ def _record_login_failure(ip: str) -> None:
 
 
 def _handle_login(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
-    client_ip = handler.client_address[0] if handler.client_address else "unknown"
+    client_ip = _get_client_ip(handler)  # P2-6: 使用 X-Forwarded-For 获取真实 IP
     # P1-4: 防暴力破解检查
     if not _check_brute_force(client_ip):
         _send_json(handler, HTTPStatus.TOO_MANY_REQUESTS, {

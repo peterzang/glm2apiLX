@@ -21,8 +21,13 @@ from typing import Any, Deque, Dict, List, Optional
 
 @dataclass(slots=True)
 class ApiKeyRecord:
-    """An API key for tracking usage (created via admin panel or from env vars)."""
-    key: str                          # the actual API key string
+    """An API key for tracking usage (created via admin panel or from env vars).
+
+    P1-2 修复：key_hash 存储 SHA256 哈希，不再明文存储。
+    key_preview 存储前8后4用于显示。
+    """
+    key_hash: str                     # SHA256 hash of the key (for auth comparison)
+    key_preview: str                  # masked preview for display (sk-glm2a...xxxx)
     name: str                         # human-readable name (e.g. "production", "test")
     created_at: float                 # epoch seconds
     is_env: bool                      # True if from SERVER_API_KEYS env var (not deletable)
@@ -35,6 +40,8 @@ class ApiKeyRecord:
     completion_tokens: int = 0
     total_tokens: int = 0
     last_used_ts: float = 0.0
+    # P1-2: 仅在创建时短暂保存完整 key 用于一次性显示，不长期存储
+    _full_key_cache: str = ""         # 创建后一次性返回，不持久化
 
 
 @dataclass(slots=True)
@@ -130,7 +137,7 @@ class AdminStore:
         self._model_latencies: Dict[str, Deque[int]] = collections.defaultdict(
             lambda: collections.deque(maxlen=100)
         )
-        # API Key 管理：{key_string: ApiKeyRecord}
+        # API Key 管理：{key_hash: ApiKeyRecord}
         self._api_keys: Dict[str, ApiKeyRecord] = {}
 
     # -----------------------------------------------------------------
@@ -478,14 +485,31 @@ class AdminStore:
     # API Key 管理
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _hash_key(key: str) -> str:
+        """P1-2: SHA256 哈希 API key，用于存储和认证对比。"""
+        import hashlib
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        """脱敏显示：前8位...后4位。"""
+        if len(key) > 16:
+            return key[:8] + "..." + key[-4:]
+        return key[:4] + "..."
+
     def init_env_api_keys(self, env_keys: List[str]) -> None:
         """从环境变量 SERVER_API_KEYS 初始化 API keys（不可删除）。"""
         with self._lock:
             for key in env_keys:
                 key = key.strip()
-                if key and key not in self._api_keys:
-                    self._api_keys[key] = ApiKeyRecord(
-                        key=key,
+                if not key:
+                    continue
+                key_hash = self._hash_key(key)
+                if key_hash not in self._api_keys:
+                    self._api_keys[key_hash] = ApiKeyRecord(
+                        key_hash=key_hash,
+                        key_preview=self._mask_key(key),
                         name="环境变量",
                         created_at=self._started_at,
                         is_env=True,
@@ -493,11 +517,13 @@ class AdminStore:
                     )
 
     def create_api_key(self, name: str) -> Dict[str, Any]:
-        """创建一个新的 API key，返回 {key, name}。"""
+        """创建一个新的 API key，返回 {key, name}。完整 key 仅此一次返回。"""
         with self._lock:
             new_key = f"sk-glm2api-{uuid.uuid4().hex[:32]}"
-            self._api_keys[new_key] = ApiKeyRecord(
-                key=new_key,
+            key_hash = self._hash_key(new_key)
+            self._api_keys[key_hash] = ApiKeyRecord(
+                key_hash=key_hash,
+                key_preview=self._mask_key(new_key),
                 name=name or "未命名",
                 created_at=time.time(),
                 is_env=False,
@@ -508,18 +534,20 @@ class AdminStore:
     def delete_api_key(self, key: str) -> bool:
         """删除一个 API key（环境变量的不可删除）。"""
         with self._lock:
-            rec = self._api_keys.get(key)
+            key_hash = self._hash_key(key)
+            rec = self._api_keys.get(key_hash)
             if rec is None:
                 return False
             if rec.is_env:
                 return False
-            del self._api_keys[key]
+            del self._api_keys[key_hash]
             return True
 
     def toggle_api_key(self, key: str, enabled: bool) -> bool:
         """启用/禁用一个 API key。"""
         with self._lock:
-            rec = self._api_keys.get(key)
+            key_hash = self._hash_key(key)
+            rec = self._api_keys.get(key_hash)
             if rec is None:
                 return False
             rec.enabled = enabled
@@ -530,7 +558,8 @@ class AdminStore:
     ) -> None:
         """记录某 API key 的一次请求使用量。"""
         with self._lock:
-            rec = self._api_keys.get(key)
+            key_hash = self._hash_key(key)
+            rec = self._api_keys.get(key_hash)
             if rec is None:
                 return
             rec.total_requests += 1
@@ -548,14 +577,9 @@ class AdminStore:
         with self._lock:
             result = []
             for rec in self._api_keys.values():
-                # 脱敏：只显示前 8 位和后 4 位
-                if len(rec.key) > 16:
-                    masked_key = rec.key[:8] + "..." + rec.key[-4:]
-                else:
-                    masked_key = rec.key[:4] + "..."
                 result.append({
-                    "key": masked_key,
-                    "full_key": rec.key if not rec.is_env else None,  # 完整 key 仅非环境变量返回
+                    "key": rec.key_preview,
+                    "full_key": None,  # P1-2: 不再返回完整 key（安全）
                     "name": rec.name,
                     "created_at": rec.created_at,
                     "is_env": rec.is_env,
@@ -568,14 +592,14 @@ class AdminStore:
                     "total_tokens": rec.total_tokens,
                     "last_used_ts": rec.last_used_ts,
                 })
-            # 按 total_requests 降序
             result.sort(key=lambda x: x["total_requests"], reverse=True)
             return result
 
     def get_api_key_for_auth(self, key: str) -> bool:
-        """检查 API key 是否有效（存在且启用）。"""
+        """检查 API key 是否有效（存在且启用）。P1-2: 使用哈希对比。"""
         with self._lock:
-            rec = self._api_keys.get(key)
+            key_hash = self._hash_key(key)
+            rec = self._api_keys.get(key_hash)
             if rec is None:
                 return False
             return rec.enabled

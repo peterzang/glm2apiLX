@@ -1950,8 +1950,8 @@ async function refreshApiKeys() {
                   <td class="text-muted" style="font-size:11px;">${k.last_used_ts ? fmtTimeShort(k.last_used_ts) : '-'}</td>
                   <td>
                     ${k.is_env ? '<span class="text-muted" style="font-size:11px;">不可删除</span>' : `
-                      <button class="btn btn-ghost btn-sm" data-apikey-toggle="${escapeHtml(k.full_key || k.key)}" data-enabled="${!k.enabled}">${k.enabled ? '禁用' : '启用'}</button>
-                      <button class="btn btn-danger btn-sm" data-apikey-delete="${escapeHtml(k.full_key || k.key)}">删除</button>
+                      <button class="btn btn-ghost btn-sm" data-apikey-toggle="${escapeHtml(k.key)}" data-enabled="${!k.enabled}">${k.enabled ? '禁用' : '启用'}</button>
+                      <button class="btn btn-danger btn-sm" data-apikey-delete="${escapeHtml(k.key)}">删除</button>
                     `}
                   </td>
                 </tr>
