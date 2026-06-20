@@ -385,6 +385,14 @@ function stopAutoRefresh() {
 
 async function refresh(force = false) {
   if (!getToken()) return;
+  // v32 修复：自动刷新破坏表单 bug
+  // 用户反馈：添加账号时填 token、创建 API key、端点测试选模式时，
+  // 5 秒自动刷新会把整个页面 innerHTML 替换掉，导致表单消失/输入丢失。
+  // 修复：自动刷新（非强制）时，如果检测到用户正在与表单交互，跳过本次刷新。
+  // 强制刷新（用户点"刷新"按钮）不受此限制。
+  if (!force && _isUserInteractingWithForm()) {
+    return;  // 跳过本次自动刷新，等下一个周期
+  }
   // 强制刷新时重置 dashboard 哈希，绕过增量更新跳过逻辑
   if (force) _lastDashboardHash = '';
   try {
@@ -404,6 +412,48 @@ async function refresh(force = false) {
       console.error('refresh failed', err);
     }
   }
+}
+
+/**
+ * 检测用户是否正在与当前页面的表单交互。
+ *
+ * 检测条件（任一满足即返回 true，跳过自动刷新）：
+ * 1. 当前页面有 input/textarea/select 获得焦点（正在输入）
+ * 2. 当前页面有可见的表单/对话框打开（如添加账号表单、创建 API key 对话框）
+ * 3. 当前页面有打开的 <details> 元素（探针高级选项等）
+ *
+ * 这样用户在填表单时不会被 5 秒自动刷新打断。
+ * Dashboard 页面没有表单，不受影响，仍会正常实时刷新。
+ */
+function _isUserInteractingWithForm() {
+  const activeEl = document.activeElement;
+  if (!activeEl) return false;
+  const tag = activeEl.tagName.toLowerCase();
+  // 条件 1：input/textarea/select 获得焦点
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+    return true;
+  }
+  // 条件 2：contenteditable 元素获得焦点
+  if (activeEl.isContentEditable) {
+    return true;
+  }
+  // 条件 3：检测当前 view 是否有打开的表单/对话框
+  // 添加账号表单：#account-add-form 且 display 不为 none
+  const addAccountForm = document.getElementById('account-add-form');
+  if (addAccountForm && addAccountForm.style.display !== 'none') {
+    return true;
+  }
+  // API key 创建表单：#apikey-create-form 且 display 不为 none
+  const apikeyForm = document.getElementById('apikey-create-form');
+  if (apikeyForm && apikeyForm.style.display !== 'none') {
+    return true;
+  }
+  // API key 创建对话框：检查是否有 .modal 或 .dialog 可见
+  const openModal = document.querySelector('.modal:not(.hidden), .dialog:not(.hidden)');
+  if (openModal) {
+    return true;
+  }
+  return false;
 }
 
 // =========================================================================
