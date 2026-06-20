@@ -1772,14 +1772,43 @@ function renderProbeResult(result, payload, elapsed) {
 // Logs view
 // =========================================================================
 
+// 当前选中的日志分类（默认 'all'）
+let _logsCurrentCategory = 'all';
+
+// 分类匹配规则：根据 protocol 字段判断日志属于哪个分类
+const LOGS_CATEGORY_MATCHERS = {
+  all:        () => true,  // 全部
+  api:        (l) => ['openai-chat','anthropic','openai-responses','openai-legacy','openai-images','openai-embeddings','openai-moderations'].includes(l.protocol),
+  chat:       (l) => l.protocol === 'openai-chat' || l.protocol === 'openai-legacy',
+  anthropic:  (l) => l.protocol === 'anthropic',
+  responses:  (l) => l.protocol === 'openai-responses',
+  images:     (l) => l.protocol === 'openai-images',
+  embeddings: (l) => l.protocol === 'openai-embeddings',
+  models:     (l) => l.protocol === 'meta',  // /v1/models
+  health:     (l) => l.protocol === 'health', // /health 探活
+  errors:     (l) => l.status >= 400,  // 仅错误
+};
+
 async function refreshLogs() {
-  const onlyErrors = document.getElementById('logs-only-errors').checked ? 1 : 0;
   const limit = document.getElementById('logs-limit').value;
-  const data = await api(`logs?limit=${limit}&errors=${onlyErrors}`);
-  const logs = data.logs || [];
+  // 拉取更多日志用于前端过滤（避免过滤后条数太少）
+  // errors 分类走后端 only_errors，其他分类前端过滤
+  const isErrorsCategory = _logsCurrentCategory === 'errors';
+  const fetchLimit = isErrorsCategory ? limit : Math.max(parseInt(limit), 500);
+  const data = await api(`logs?limit=${fetchLimit}&errors=${isErrorsCategory ? 1 : 0}`);
+  let logs = data.logs || [];
+  // 前端按分类过滤
+  const matcher = LOGS_CATEGORY_MATCHERS[_logsCurrentCategory] || LOGS_CATEGORY_MATCHERS.all;
+  logs = logs.filter(matcher);
+  // 截断到用户选择的条数
+  logs = logs.slice(0, parseInt(limit));
   const wrapper = document.getElementById('logs-table-wrapper');
+  const countInfo = document.getElementById('logs-count-info');
+  if (countInfo) {
+    countInfo.textContent = `共 ${logs.length} 条`;
+  }
   if (logs.length === 0) {
-    wrapper.innerHTML = `<div class="empty-state">暂无日志记录</div>`;
+    wrapper.innerHTML = `<div class="empty-state">该分类暂无日志记录</div>`;
     return;
   }
   const rows = logs.map(l => {
@@ -1791,7 +1820,7 @@ async function refreshLogs() {
         <td class="mono text-muted" style="font-size:11px;">${fmtTime(l.ts)}</td>
         <td class="mono">${escapeHtml(l.method)}</td>
         <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.path)}">${escapeHtml(l.path)}</td>
-        <td><span class="badge ${l.protocol.startsWith('anthropic') ? 'badge-purple' : l.protocol.includes('responses') ? 'badge-info' : 'badge-success'}">${escapeHtml(l.protocol)}</span></td>
+        <td><span class="badge ${l.protocol.startsWith('anthropic') ? 'badge-purple' : l.protocol.includes('responses') ? 'badge-info' : l.protocol === 'health' ? 'badge-muted' : l.protocol === 'meta' ? 'badge-warning' : 'badge-success'}">${escapeHtml(l.protocol)}</span></td>
         <td class="mono">${escapeHtml(l.model || '-')}</td>
         <td class="mono text-muted" style="font-size:11px;">${escapeHtml(l.api_key || '-')}</td>
         <td class="mono"><span class="${statusClass}">${l.status}</span></td>
@@ -2265,7 +2294,18 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('logout-btn').addEventListener('click', handleLogout);
   document.getElementById('auto-refresh').addEventListener('change', startAutoRefresh);
   document.getElementById('manual-refresh').addEventListener('click', () => refresh(true));
-  document.getElementById('logs-only-errors').addEventListener('change', refreshLogs);
+  // 日志分类导航栏：点击 tab 切换分类
+  document.querySelectorAll('#logs-category-tabs .category-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      // 移除所有 tab 的 active
+      document.querySelectorAll('#logs-category-tabs .category-tab').forEach(t => t.classList.remove('active'));
+      // 给当前点击的 tab 加 active
+      tab.classList.add('active');
+      // 更新当前分类并刷新
+      _logsCurrentCategory = tab.dataset.category;
+      refreshLogs();
+    });
+  });
   document.getElementById('logs-limit').addEventListener('change', refreshLogs);
 
   document.querySelectorAll('.nav-item').forEach(a => {

@@ -818,6 +818,45 @@ table.data-table {
   box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
 }
 
+/* ============== Category tabs (请求日志分类导航栏) ============== */
+.category-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+}
+.category-tab {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.category-tab:hover {
+  background: var(--bg-card);
+  color: var(--text);
+  border-color: var(--border-light);
+}
+.category-tab.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+}
+:root[data-theme="light"] .category-tab.active {
+  background: var(--primary);
+  color: #fff;
+}
+
 /* ============== Config viewer ============== */
 .config-list { display: grid; grid-template-columns: 1fr; gap: 0; }
 .config-row {

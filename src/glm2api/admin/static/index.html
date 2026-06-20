@@ -4,8 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>GLM2API 管理面板</title>
-<link rel="icon" href="/admin/static/favicon.svg?v=29" type="image/svg+xml" />
-<link rel="stylesheet" href="/admin/static/style.css?v=29" />
+<link rel="icon" href="/admin/static/favicon.svg?v=30" type="image/svg+xml" />
+<link rel="stylesheet" href="/admin/static/style.css?v=30" />
 </head>
 <body>
 
@@ -103,8 +103,20 @@
       <section id="view-probe" class="view"></section>
       <!-- Logs -->
       <section id="view-logs" class="view">
+        <!-- 分类导航栏：全部 / API / Models / 健康 / 其他 -->
+        <div class="category-tabs" id="logs-category-tabs">
+          <button class="category-tab active" data-category="all">全部</button>
+          <button class="category-tab" data-category="api">API 请求</button>
+          <button class="category-tab" data-category="chat">Chat 对话</button>
+          <button class="category-tab" data-category="anthropic">Anthropic</button>
+          <button class="category-tab" data-category="responses">Responses</button>
+          <button class="category-tab" data-category="images">Images</button>
+          <button class="category-tab" data-category="embeddings">Embeddings</button>
+          <button class="category-tab" data-category="models">Models 元信息</button>
+          <button class="category-tab" data-category="health">健康检查</button>
+          <button class="category-tab" data-category="errors">仅错误 (4xx/5xx)</button>
+        </div>
         <div class="filter-bar">
-          <label><input type="checkbox" id="logs-only-errors" /> 仅显示错误 (4xx/5xx)</label>
           <label>显示条数:
             <select id="logs-limit">
               <option value="50">50</option>
@@ -113,6 +125,7 @@
               <option value="500">500</option>
             </select>
           </label>
+          <span class="text-muted" id="logs-count-info" style="font-size:12px;"></span>
         </div>
         <div id="logs-table-wrapper"></div>
       </section>
@@ -132,6 +145,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/admin/static/app.js?v=29"></script>
+<script src="/admin/static/app.js?v=30"></script>
 </body>
 </html>
