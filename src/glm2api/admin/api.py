@@ -868,7 +868,13 @@ def _handle_apikey_toggle(handler, config: AppConfig, glm_client: GLMWebClient, 
 
 
 def _handle_accounts_add(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
-    """添加用户账号（非游客）。请求体: {"refresh_token": "xxx"}"""
+    """添加用户账号（非游客）。请求体: {"refresh_token": "xxx"}
+    
+    流程：
+    1. 必须先通过 GLM 上游验证（auth.add_user_account 内部调用 validate_refresh_token）
+    2. 验证失败 → 返回 400 + {"error": "token_invalid", "message": "<具体原因>"}
+    3. 验证成功 → 返回 200 + 新账号 index / 总账号数
+    """
     try:
         payload = _read_json_body(handler)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -876,20 +882,35 @@ def _handle_accounts_add(handler, config: AppConfig, glm_client: GLMWebClient, l
         return
     refresh_token = str(payload.get("refresh_token", "")).strip()
     if not refresh_token:
-        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_refresh_token"}, config)
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {
+            "error": "missing_refresh_token",
+            "message": "请输入 refresh_token",
+        }, config)
         return
     auth = glm_client.auth
     try:
         idx = auth.add_user_account(refresh_token)
-        logger.info("admin 添加用户账号 index=%s", idx)
+        logger.info("admin 添加用户账号成功 index=%s", idx)
         _send_json(handler, HTTPStatus.OK, {
             "ok": True,
             "index": idx,
             "total_accounts": auth.get_account_count(),
+            "message": "token 验证通过，账号已添加并持久化",
+        }, config)
+    except ValueError as exc:
+        # 验证失败：token 不可用 / 失效 / 网络错误
+        logger.warning("admin 添加用户账号验证失败 token_preview=%s... error=%s",
+                       refresh_token[:8], exc)
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {
+            "error": "token_invalid",
+            "message": str(exc),
         }, config)
     except Exception as exc:
         logger.error("admin 添加用户账号失败 error=%s", exc)
-        _send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}, config)
+        _send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {
+            "error": "internal_error",
+            "message": str(exc),
+        }, config)
 
 
 # Map of /admin/api/<name> -> handler function (POST or GET both accepted

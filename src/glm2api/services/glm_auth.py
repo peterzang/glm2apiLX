@@ -12,7 +12,7 @@ import urllib.request
 from dataclasses import dataclass
 from logging import Logger
 
-from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER
+from ..config import AppConfig, GUEST_REFRESH_TOKEN_MARKER, is_guest_token_value
 from ..logging_utils import debug_dump
 
 
@@ -173,19 +173,145 @@ class GLMAccessTokenManager:
     def get_account_count(self) -> int:
         return len(self._accounts)
 
+    def validate_refresh_token(self, refresh_token: str) -> AccessToken:
+        """验证 refresh_token 是否可用：实际调用 GLM 上游换取 access_token。
+        
+        流程：
+        1. 用临时 device_id + 提供的 refresh_token 调用 /refreshToken
+        2. 上游返回 access_token → 验证通过，返回 AccessToken（含 access_token + 可能刷新后的 refresh_token）
+        3. 上游返回错误（token 失效 / 过期 / 风控）→ 抛 ValueError 含明确错误信息
+        
+        不修改内部状态，不持锁，可安全在 admin 接口同步调用。
+        """
+        if not refresh_token or not refresh_token.strip():
+            raise ValueError("refresh_token 为空")
+        refresh_token = refresh_token.strip()
+        # 拒绝 guest marker / 占位符，避免误把游客模式标记当真实 token 加
+        if is_guest_token_value(refresh_token):
+            raise ValueError("refresh_token 无效（不能使用游客占位符）")
+        device_id = uuid.uuid4().hex
+        timestamp, nonce, sign = build_sign()
+        request_id = f"{device_id[:8]}-{int(time.time()*1000)}-1"
+        request = urllib.request.Request(
+            self.config.refresh_url,
+            data=b"{}",
+            method="POST",
+            headers={
+                **self.get_browser_headers(),
+                "Authorization": f"Bearer {refresh_token}",
+                "X-Device-Id": device_id,
+                "X-Nonce": nonce,
+                "X-Request-Id": request_id,
+                "X-Sign": sign,
+                "X-Timestamp": timestamp,
+            },
+        )
+        debug_dump(self.logger, self.config.debug_dump_all, "GLM 验证 refresh_token 请求头", dict(request.header_items()))
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+                payload = self.read_json_response(response)
+        except urllib.error.HTTPError as exc:
+            # 4xx/5xx：尝试读 body 看具体错误码
+            body = ""
+            try:
+                raw = exc.read()
+                body = raw.decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            msg = f"GLM 上游返回 HTTP {exc.code}"
+            if body:
+                msg += f": {body}"
+            raise ValueError(msg) from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"网络错误：{exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ValueError(f"请求超时：{exc}") from exc
+
+        code = payload.get("code", payload.get("status"))
+        result = payload.get("result") or {}
+        access_token = result.get("access_token")
+        new_refresh_token = result.get("refresh_token", refresh_token)
+        # 上游返回错误码（token 失效/过期/风控等）
+        if code not in {0, None} or not access_token:
+            # 常见错误码翻译，让 admin 看到明确原因
+            err_msg = result.get("msg") or payload.get("msg") or str(payload)
+            raise ValueError(f"token 不可用（code={code}）：{err_msg}")
+        return AccessToken(
+            access_token=str(access_token),
+            refresh_token=str(new_refresh_token),
+            expires_at=time.time() + ACCESS_TOKEN_EXPIRES_SECONDS - random.randint(10, 30),
+        )
+
     def add_user_account(self, refresh_token: str) -> int:
-        """动态添加一个用户账号（非游客）。返回新账号的 index。"""
+        """添加用户账号（非游客）。
+        
+        流程：
+        1. 调用 validate_refresh_token 实际访问 GLM 上游验证 token 可用性
+        2. 验证失败 → 抛 ValueError（含具体原因），账号不会被添加
+        3. 验证成功 → append AccountState（已带 cached_token，首次请求 0 延迟）
+        4. 持久化 refresh_token 到 token 文件（重启后保留）
+        
+        返回新账号的 index。
+        """
+        # 先验证（HTTP 调用，不持锁）
+        access_token = self.validate_refresh_token(refresh_token)
+        refresh_token = access_token.refresh_token  # 用上游可能刷新后的新 token
         with self._lock:
             idx = len(self._accounts)
-            self._accounts.append(
-                AccountState(
-                    refresh_token=refresh_token,
-                    is_guest=False,
-                    device_id=_load_or_create_device_id(idx),
-                )
+            new_account = AccountState(
+                refresh_token=refresh_token,
+                is_guest=False,
+                device_id=_load_or_create_device_id(idx),
+                cached_token=access_token,  # 复用验证拿到的 token，首次请求 0 延迟
             )
-            self.logger.info("动态添加用户账号 index=%s, 总账号数=%s", idx, len(self._accounts))
-            return idx
+            self._accounts.append(new_account)
+            self.config.glm_refresh_tokens.append(refresh_token)
+            self.logger.info(
+                "动态添加用户账号 index=%s, 总账号数=%s, access_token 剩余=%.0fs",
+                idx, len(self._accounts), access_token.expires_at - time.time(),
+            )
+        # 锁外持久化（best-effort，失败不影响添加成功）
+        try:
+            self._persist_new_user_account(refresh_token)
+        except Exception as exc:
+            self.logger.warning("持久化新账号失败 index=%s error=%s", idx, exc)
+        return idx
+
+    def _persist_new_user_account(self, refresh_token: str) -> None:
+        """把新添加的用户账号 refresh_token 持久化到 token 文件（追加一行）。
+        
+        策略：
+        - 若 token 文件已存在 → 追加一行
+        - 若 .env 中 GLM_REFRESH_TOKEN 已存在但 token 文件不存在 → 
+          改为创建 token 文件包含原 .env token + 新 token（保证多账号正确加载）
+        - 都不存在 → 创建 token 文件只含新 token
+        """
+        with self._persist_lock:
+            token_file = self.config.token_file_path
+            if token_file.exists():
+                # 追加模式：直接 append 一行
+                with token_file.open("a", encoding="utf-8") as f:
+                    f.write(refresh_token + "\n")
+                return
+            # token 文件不存在：把 .env 中的 GLM_REFRESH_TOKEN（如果有）和新增的合并写入
+            existing_tokens: list[str] = []
+            env_path = self.config.env_file_path
+            if env_path.exists():
+                try:
+                    for line in env_path.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("GLM_REFRESH_TOKEN="):
+                            val = line[len("GLM_REFRESH_TOKEN="):].strip()
+                            if val and not is_guest_token_value(val):
+                                existing_tokens.append(val)
+                            break
+                except Exception:
+                    pass
+            existing_tokens.append(refresh_token)
+            try:
+                token_file.parent.mkdir(parents=True, exist_ok=True)
+                token_file.write_text("\n".join(existing_tokens) + "\n", encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(f"写入 token 文件失败: {token_file} error={exc}") from exc
 
     def get_all_accounts_info(self) -> list[dict]:
         """返回所有账号的信息（用于管理面板显示）。"""

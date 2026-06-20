@@ -45,7 +45,8 @@ async function api(name, opts = {}) {
   let data = null;
   try { data = await resp.json(); } catch (_) {}
   if (!resp.ok) {
-    const msg = (data && data.error) || `HTTP ${resp.status}`;
+    // 优先用后端返回的 message（更详细），其次用 error code，最后 fallback 到 HTTP status
+    const msg = (data && data.message) || (data && data.error) || `HTTP ${resp.status}`;
     throw new Error(msg);
   }
   // 成功 → 隐藏网络错误横幅
@@ -917,10 +918,12 @@ async function refreshAccounts() {
       <div class="kpi-card success">
         <div class="kpi-label">游客账号</div>
         <div class="kpi-value">${accs.filter(a => a.is_guest).length}</div>
+        <div class="kpi-sub">系统自动获取的临时账号</div>
       </div>
       <div class="kpi-card warning">
-        <div class="kpi-label">游客账号 (非游客)</div>
+        <div class="kpi-label">用户账号</div>
         <div class="kpi-value">${accs.filter(a => !a.is_guest).length}</div>
+        <div class="kpi-sub">已添加并验证通过的账号</div>
       </div>
     </div>
 
@@ -988,14 +991,27 @@ async function refreshAccounts() {
     addConfirm.addEventListener('click', async () => {
       const refreshToken = tokenInput.value.trim();
       if (!refreshToken) { showToast('请输入 refresh_token', 'error'); return; }
+      // 拒绝明显无效的输入：游客占位符 / 太短
+      if (refreshToken.length < 20) {
+        showToast('refresh_token 格式不正确（长度过短）', 'error');
+        return;
+      }
+      // 进入"验证中"状态：禁用按钮 + 改文案
+      const origText = addConfirm.textContent;
+      addConfirm.disabled = true;
+      addConfirm.textContent = '正在验证 token…';
       try {
         const result = await api('accounts/add', { method: 'POST', body: { refresh_token: refreshToken } });
-        showToast(`✅ 用户账号已添加 #${result.index}，总账号数 ${result.total_accounts}`, 'success');
+        showToast(`✅ ${result.message || 'token 验证通过'}（账号 #${result.index}，总账号数 ${result.total_accounts}）`, 'success');
         addForm.style.display = 'none';
         tokenInput.value = '';
         refreshAccounts();
       } catch (err) {
-        showToast('添加失败: ' + err.message, 'error');
+        // 后端返回 token_invalid / missing_refresh_token 等，message 字段含具体原因
+        showToast(`❌ 添加失败：${err.message}`, 'error');
+      } finally {
+        addConfirm.disabled = false;
+        addConfirm.textContent = origText;
       }
     });
   }
