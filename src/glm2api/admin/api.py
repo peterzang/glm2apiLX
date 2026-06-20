@@ -248,10 +248,19 @@ def _handle_login(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
     client_ip = _get_client_ip(handler)  # P2-6: 使用 X-Forwarded-For 获取真实 IP
     # P1-4: 防暴力破解检查
     if not _check_brute_force(client_ip):
-        _send_json(handler, HTTPStatus.TOO_MANY_REQUESTS, {
+        # v33 P2-2 修复：429 响应加 Retry-After header（标准做法，让客户端知道等多久）
+        # 同时返回剩余锁定秒数让客户端能精确等待
+        import time as _time
+        now = _time.time()
+        failures = _login_failures.get(client_ip, [])
+        oldest_failure = min(failures) if failures else now
+        retry_after = max(1, int(_LOGIN_LOCKOUT_SECONDS - (now - oldest_failure)))
+        _send_json_with_retry_after(handler, HTTPStatus.TOO_MANY_REQUESTS, {
             "error": "too_many_login_attempts",
-            "message": f"Too many failed login attempts. Please try again in {_LOGIN_LOCKOUT_SECONDS // 60} minutes.",
-        }, config)
+            "message": f"Too many failed login attempts. Please try again in {retry_after} seconds.",
+            "retry_after": retry_after,
+        }, config, retry_after)
+        logger.warning("admin login rate-limited ip=%s retry_after=%ss", client_ip, retry_after)
         return
     try:
         payload = _read_json_body(handler)
@@ -275,6 +284,21 @@ def _handle_login(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
     ttl = 8 * 3600
     token = get_store().create_session(ttl_seconds=ttl)
     _send_json(handler, HTTPStatus.OK, {"token": token, "expires_in": ttl}, config)
+
+
+def _send_json_with_retry_after(handler, status: HTTPStatus, payload: dict, config: AppConfig, retry_after: int) -> None:
+    """发送带 Retry-After header 的 JSON 响应（用于 429 限流场景）。"""
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    handler.send_header("Retry-After", str(retry_after))
+    handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.end_headers()
+    handler.wfile.write(body)
 
 
 def _handle_logout(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:

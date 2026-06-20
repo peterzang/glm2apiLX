@@ -101,6 +101,64 @@ def _extract_usage_from_sse_chunks(raw_chunks: list[bytes]) -> dict[str, int] | 
     return usage
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """剥离 GLM 输出习惯性包裹的 markdown 代码块（```json ... ``` / ``` ... ```）。
+
+    v33 P2-3 修复：当 response_format=json_object 时，即使 system instruction
+    明确告诉 GLM "Do not wrap the JSON in markdown code fences"，
+    GLM 仍会偶尔输出 ```json\\n{...}\\n``` 格式。客户端期望纯 JSON，
+    直接 json.loads 会失败。
+
+    本函数：
+    1. 去除开头的 ```json / ```jsonc / ``` 行
+    2. 去除结尾的 ``` 行
+    3. 保留中间的纯 JSON 内容
+    4. 如果不含 markdown fence，原样返回（无副作用）
+    """
+    if not text or "```" not in text:
+        return text
+    stripped = text.strip()
+    import re
+    # 完整匹配：开头 ```json/``` + 中间内容 + 结尾 ```
+    m = re.match(r'^\s*```(?:json|jsonc|JSON|JSONC)?\s*\n([\s\S]*?)\n\s*```\s*$', stripped)
+    if m:
+        return m.group(1).strip()
+    # 只有开头 ```json，没有结尾 ```（部分场景）
+    m = re.match(r'^\s*```(?:json|jsonc|JSON|JSONC)?\s*\n([\s\S]*)$', stripped)
+    if m:
+        content = m.group(1)
+        if content.rstrip().endswith('```'):
+            content = content.rstrip()[:-3].rstrip()
+        return content.strip()
+    return text
+
+
+def _apply_json_response_format_stripping(result: dict, payload: dict) -> dict:
+    """如果请求指定了 response_format=json_object/json_schema，
+    剥离响应内容里 GLM 习惯性包裹的 markdown 代码块。
+
+    非流式路径调用：直接修改 result dict 并返回。
+    """
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict):
+        return result
+    rf_type = str(response_format.get("type", "")).strip().lower()
+    if rf_type not in ("json_object", "json_schema"):
+        return result
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return result
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return result
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        stripped = _strip_markdown_fences(content)
+        if stripped != content:
+            message["content"] = stripped
+    return result
+
+
 class GLM2APIServer:
     def __init__(self, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
         self.config = config
@@ -134,6 +192,56 @@ class GLM2APIServer:
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self._send_common_headers()
                 self.end_headers()
+
+            def do_HEAD(self) -> None:
+                """处理 HEAD 请求（只返回 header 不返回 body）。
+
+                修复 v33 审计 P2-1：之前未实现 do_HEAD，curl -I / SDK 健康探测
+                会触发 501 Unsupported method ('HEAD')，破坏 keep-alive 连接复用。
+
+                支持的 HEAD 路径：
+                - /health → 200 OK（无 body）
+                - /v1/models → 200 OK（无 body，需要 API key 认证）
+                - /admin/* → 转发到 admin handler
+                - 其他 → 405 Method Not Allowed
+                """
+                self._admin_begin_request("HEAD")
+                try:
+                    if handle_admin_request(self, config, glm_client, logger):
+                        return
+                    path = self._path_without_query()
+                    if path == "/health":
+                        self.send_response(HTTPStatus.OK)
+                        self._send_common_headers()
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", "15")  # {"status":"ok"}
+                        self.end_headers()
+                        return
+                    if path == f"{config.api_prefix}/models":
+                        if not self._authorize():
+                            return
+                        self.send_response(HTTPStatus.OK)
+                        self._send_common_headers()
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    # 其他路径不支持 HEAD
+                    self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+                    self._send_common_headers()
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Allow", "GET, POST, OPTIONS")
+                    body = json.dumps({"error": {"message": "HEAD method not allowed for this path", "type": "invalid_request_error", "code": "method_not_allowed"}}, ensure_ascii=False).encode("utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 HEAD 响应写回前断开 path=%s", self.path)
+                except Exception as exc:
+                    logger.error("HEAD 请求处理失败 path=%s error=%s\n%s", self.path, exc, traceback.format_exc())
+                    try:
+                        self._safe_write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": str(exc), "type": "server_error"}})
+                    except Exception:
+                        pass
 
             def do_GET(self) -> None:
                 self._admin_begin_request("GET")
@@ -507,6 +615,8 @@ class GLM2APIServer:
 
                     logger.info("收到 chat 请求 model=%s", payload.get("model"))
                     result, conversation_id = glm_client.chat_completion(payload)
+                    # v33 P2-3 修复：response_format=json_object/json_schema 时剥离 markdown 代码块
+                    result = _apply_json_response_format_stripping(result, payload)
                     # 记录 token 使用量到 admin store（用于仪表盘 KPI）
                     self._record_token_usage(result)
                     # 动态模型发现：从上游响应提取真实模型名，加入动态注册表
@@ -930,18 +1040,53 @@ class GLM2APIServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                # v33 P2-3 修复：response_format=json_object/json_schema 时
+                # GLM 仍可能在流式响应里输出 ```json\n{...}\n``` 格式
+                # 策略：json 模式下缓冲所有 chunks，剥离 markdown 后作为单 chunk 发送
+                # （JSON 客户端必须等完整 JSON 才能 parse，缓冲不影响功能）
+                response_format = payload.get("response_format")
+                is_json_mode = (
+                    isinstance(response_format, dict)
+                    and str(response_format.get("type", "")).strip().lower() in ("json_object", "json_schema")
+                )
+
                 sent_done = False
                 # 收集所有 chunks 以便流结束后提取 usage（OpenAI 流式只在最后一个 chunk 含 usage）
                 collected_chunks: list[bytes] = []
+                # json 模式下额外收集所有 chunk dict，用于剥离 markdown 后重新发送
+                json_mode_buffer: list[dict] = []
                 try:
                     for chunk in stream_iter:
                         if chunk:
                             debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
-                            collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
-                            if b"data: [DONE]\n\n" in chunk:
-                                sent_done = True
+                            chunk_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                            collected_chunks.append(chunk_bytes)
+                            if is_json_mode:
+                                # 解析 chunk 提取 content delta 缓冲，不直接发给客户端
+                                try:
+                                    chunk_str = chunk_bytes.decode("utf-8", errors="replace")
+                                    for line in chunk_str.split("\n"):
+                                        line = line.strip()
+                                        if not line.startswith("data: "):
+                                            continue
+                                        data_str = line[6:].strip()
+                                        if data_str == "[DONE]" or not data_str:
+                                            continue
+                                        try:
+                                            chunk_dict = json.loads(data_str)
+                                            if isinstance(chunk_dict, dict):
+                                                json_mode_buffer.append(chunk_dict)
+                                        except json.JSONDecodeError:
+                                            pass
+                                    if b"data: [DONE]\n\n" in chunk_bytes:
+                                        sent_done = True
+                                except Exception:
+                                    pass
+                            else:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                                if b"data: [DONE]\n\n" in chunk_bytes:
+                                    sent_done = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")
@@ -952,13 +1097,81 @@ class GLM2APIServer:
                     logger.error("流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
                     self._write_sse_error(str(exc), exc.__class__.__name__)
                 finally:
-                    if not sent_done:
+                    if not sent_done and not is_json_mode:
                         try:
                             self.wfile.write(b"data: [DONE]\n\n")
                             self.wfile.flush()
                         except _CLIENT_DISCONNECTED:
                             pass
-                # 流结束后记录 token 用量（之前漏了，导致流式请求用量从不被统计）
+
+                # json 模式：从缓冲的 chunks 提取完整 content，剥离 markdown，重新发送
+                if is_json_mode and json_mode_buffer:
+                    try:
+                        full_content_parts: list[str] = []
+                        last_finish_reason: str | None = None
+                        last_usage: dict | None = None
+                        model_name = model
+                        created_ts = int(time.time())
+                        chunk_id = ""
+                        for chunk_dict in json_mode_buffer:
+                            chunk_id = chunk_dict.get("id", chunk_id) or chunk_id
+                            model_name = chunk_dict.get("model", model_name) or model_name
+                            created_ts = chunk_dict.get("created", created_ts) or created_ts
+                            choices = chunk_dict.get("choices") or []
+                            if choices and isinstance(choices[0], dict):
+                                delta = choices[0].get("delta") or {}
+                                content = delta.get("content")
+                                if isinstance(content, str) and content:
+                                    full_content_parts.append(content)
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    last_finish_reason = fr
+                            usage = chunk_dict.get("usage")
+                            if isinstance(usage, dict):
+                                last_usage = usage
+                        full_content = "".join(full_content_parts)
+                        stripped_content = _strip_markdown_fences(full_content)
+                        if stripped_content != full_content:
+                            logger.info("json 模式流式剥离 markdown 代码块 model=%s 原长度=%d 剥离后=%d",
+                                        model, len(full_content), len(stripped_content))
+                        # 发送单个完整 content chunk
+                        final_chunk = {
+                            "id": chunk_id or gen_chatcmpl_id(),
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model_name,
+                            "system_fingerprint": system_fingerprint(),
+                            "choices": [{"index": 0, "delta": {"content": stripped_content}, "finish_reason": None, "logprobs": None}],
+                        }
+                        self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
+                        # finish chunk
+                        finish_chunk = {
+                            "id": chunk_id or gen_chatcmpl_id(),
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model_name,
+                            "system_fingerprint": system_fingerprint(),
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish_reason or "stop", "logprobs": None}],
+                        }
+                        self.wfile.write(f"data: {json.dumps(finish_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
+                        # usage chunk（如果有）
+                        if last_usage:
+                            usage_chunk = {
+                                "id": chunk_id or gen_chatcmpl_id(),
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model_name,
+                                "system_fingerprint": system_fingerprint(),
+                                "choices": [],
+                                "usage": last_usage,
+                            }
+                            self.wfile.write(f"data: {json.dumps(usage_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except Exception as exc:
+                        logger.error("json 模式流式重新发送失败 model=%s error=%s", model, exc)
+
+                # 流结束后记录 token 用量
                 self._record_streaming_token_usage(collected_chunks)
                 logger.info("流式请求完成 model=%s", model)
 
