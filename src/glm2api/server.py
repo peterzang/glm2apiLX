@@ -60,6 +60,47 @@ _CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAborted
 RESPONSES_STREAM_HEARTBEAT_SECONDS = 2.0  # codex/clients expect data within ~4s; 2s keeps them alive
 
 
+def _extract_usage_from_sse_chunks(raw_chunks: list[bytes]) -> dict[str, int] | None:
+    """从 SSE chunks 中提取最后一个含 usage 字段的 chunk 的 usage。
+
+    OpenAI 流式响应在最后一个 chunk（带 finish_reason + usage）发送完整 token 统计。
+    本函数扫描所有 chunks，找到最后一个含 usage 的并返回。
+
+    Returns:
+        {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int} 或 None
+    """
+    usage: dict[str, int] | None = None
+    for raw in raw_chunks:
+        if not raw:
+            continue
+        try:
+            text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            continue
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if data_str == "[DONE]" or not data_str:
+                continue
+            try:
+                chunk_dict = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(chunk_dict, dict):
+                continue
+            u = chunk_dict.get("usage")
+            if isinstance(u, dict):
+                # 持续覆盖，保留最后一个含 usage 的 chunk
+                usage = {
+                    "prompt_tokens": int(u.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(u.get("completion_tokens", 0) or 0),
+                    "total_tokens": int(u.get("total_tokens", 0) or 0),
+                }
+    return usage
+
+
 class GLM2APIServer:
     def __init__(self, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
         self.config = config
@@ -641,6 +682,8 @@ class GLM2APIServer:
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                # 收集 OpenAI 原始 chunks 以便流结束后提取 usage（Anthropic 流式响应里没有 usage）
+                collected_chunks: list[bytes] = []
                 try:
                     for chunk in stream_iter:
                         if not chunk:
@@ -651,8 +694,11 @@ class GLM2APIServer:
                             self.wfile.flush()
                         events = accumulator.feed_chunk(chunk)
                         for event in events:
-                            self.wfile.write(event.encode("utf-8"))
+                            ev_bytes = event.encode("utf-8")
+                            self.wfile.write(ev_bytes)
                             self.wfile.flush()
+                        # 收集 chunk 用于后续 usage 提取
+                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
                     return
@@ -668,6 +714,8 @@ class GLM2APIServer:
                     except _CLIENT_DISCONNECTED:
                         pass
 
+                # 流结束后记录 token 用量
+                self._record_streaming_token_usage(collected_chunks)
                 logger.info("Anthropic 流式请求完成 model=%s", model)
 
             # ---- OpenAI Responses API ----
@@ -724,6 +772,8 @@ class GLM2APIServer:
 
                 threading.Thread(target=read_upstream, daemon=True).start()
 
+                # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
+                collected_chunks: list[bytes] = []
                 try:
                     while True:
                         try:
@@ -740,6 +790,8 @@ class GLM2APIServer:
                         chunk = queued
                         if not chunk:
                             continue
+                        # 收集原始 chunk 用于后续 usage 提取
+                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                         events = accumulator.feed_chunk(chunk)  # type: ignore[arg-type]
                         for event in events:
                             self.wfile.write(event.encode("utf-8"))
@@ -759,6 +811,8 @@ class GLM2APIServer:
                     except _CLIENT_DISCONNECTED:
                         pass
 
+                # 流结束后记录 token 用量
+                self._record_streaming_token_usage(collected_chunks)
                 logger.info("Responses 流式请求完成 model=%s", model)
 
             # ---- OpenAI Responses API v2 (新版，完整适配 2025 规范) ----
@@ -806,6 +860,8 @@ class GLM2APIServer:
 
                 threading.Thread(target=read_upstream, daemon=True).start()
 
+                # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
+                collected_chunks: list[bytes] = []
                 try:
                     while True:
                         try:
@@ -822,6 +878,8 @@ class GLM2APIServer:
                         chunk = queued
                         if not chunk:
                             continue
+                        # 收集原始 chunk 用于后续 usage 提取
+                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                         # chunk 是 OpenAI SSE 格式的 bytes，需要解析为 dict
                         try:
                             chunk_str = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
@@ -855,6 +913,8 @@ class GLM2APIServer:
                 except Exception as exc:
                     logger.error("Responses v2 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
 
+                # 流结束后记录 token 用量
+                self._record_streaming_token_usage(collected_chunks)
                 logger.info("Responses v2 流式请求完成 model=%s", model)
 
             # ---- Chat completions (original) ----
@@ -871,12 +931,15 @@ class GLM2APIServer:
                 self.end_headers()
 
                 sent_done = False
+                # 收集所有 chunks 以便流结束后提取 usage（OpenAI 流式只在最后一个 chunk 含 usage）
+                collected_chunks: list[bytes] = []
                 try:
                     for chunk in stream_iter:
                         if chunk:
                             debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                            collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                             if b"data: [DONE]\n\n" in chunk:
                                 sent_done = True
                 except UpstreamAPIError as exc:
@@ -895,6 +958,8 @@ class GLM2APIServer:
                             self.wfile.flush()
                         except _CLIENT_DISCONNECTED:
                             pass
+                # 流结束后记录 token 用量（之前漏了，导致流式请求用量从不被统计）
+                self._record_streaming_token_usage(collected_chunks)
                 logger.info("流式请求完成 model=%s", model)
 
             # ---- OpenAI-compat endpoint handlers ----
@@ -916,6 +981,33 @@ class GLM2APIServer:
                     store = _get_admin_store()
                     store.record_token_usage(pt, ct)
                     # per-key 用量统计
+                    api_key = getattr(self, "_admin_api_key", "")
+                    if api_key:
+                        store.record_api_key_usage(api_key, success=True, prompt_tokens=pt, completion_tokens=ct)
+                except Exception:
+                    pass  # 永不让 metrics 影响主请求
+
+            def _record_streaming_token_usage(self, raw_chunks: list[bytes]) -> None:
+                """从流式响应的原始 SSE chunks 中提取 usage 并记录。
+
+                流式响应里最后一个含 usage 字段的 chunk 包含完整 token 统计
+                （OpenAI stream_options.include_usage 行为，GLMEventAccumulator.finalize 输出）。
+
+                之前的 bug：4 个流式 handler 都没调用 _record_token_usage，
+                导致 stream=true 的请求（绝大多数 SDK 默认行为）token 用量从不被记录，
+                用户看到"API 调用多次但用量才几十"。
+                """
+                try:
+                    usage = _extract_usage_from_sse_chunks(raw_chunks)
+                    if usage is None:
+                        return
+                    pt = usage["prompt_tokens"]
+                    ct = usage["completion_tokens"]
+                    if pt <= 0 and ct <= 0:
+                        return
+                    from .admin.store import get_store as _get_admin_store
+                    store = _get_admin_store()
+                    store.record_token_usage(pt, ct)
                     api_key = getattr(self, "_admin_api_key", "")
                     if api_key:
                         store.record_api_key_usage(api_key, success=True, prompt_tokens=pt, completion_tokens=ct)
@@ -1178,10 +1270,13 @@ class GLM2APIServer:
                 self.end_headers()
 
                 sent_done = False
+                # 收集原始 chunks 以便流结束后提取 usage
+                collected_chunks: list[bytes] = []
                 try:
                     for chunk in glm_client.stream_chat_completion(chat_payload):
                         if not chunk:
                             continue
+                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                         text = chunk.decode("utf-8", errors="ignore")
                         # Each chunk is `data: {...}\n\n` with chat.completion.chunk shape
                         # Convert to text_completion chunk shape
@@ -1236,6 +1331,8 @@ class GLM2APIServer:
                             self.wfile.flush()
                         except _CLIENT_DISCONNECTED:
                             pass
+                # 流结束后记录 token 用量
+                self._record_streaming_token_usage(collected_chunks)
                 logger.info("legacy completion 流式请求完成 model=%s", model_id)
 
             # ---- Auth ----

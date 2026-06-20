@@ -365,10 +365,13 @@ function switchView(name) {
 // =========================================================================
 
 let refreshTimer = null;
-// 自动刷新间隔：1 天（86400000ms）
-// 原默认 5s 太频繁，对正常使用的 dashboard 来说没必要那么实时
-// 1 天一次保证长期打开页面时偶尔会刷新，需要看实时数据时点"刷新"按钮即可
-const AUTO_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// 自动刷新间隔：5 秒
+// 用户需求：仪表盘所有数据应该是实时的——停留页面就能看到数据更新，
+// 不需要切到其他标签页再切回来。
+// 5 秒足够实时（人眼能感知的"刷新"节奏），又不会过载服务器。
+// 注：之前误改成 1 天是错的，因为用户当时反馈的"Models 一直在涨"
+//   根因是 /health 探活被误归类，已在 v24 修复，与刷新间隔无关。
+const AUTO_REFRESH_INTERVAL_MS = 5000;
 function startAutoRefresh() {
   stopAutoRefresh();
   if (document.getElementById('auto-refresh').checked) {
