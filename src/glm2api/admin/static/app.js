@@ -492,7 +492,7 @@ async function refreshDashboard() {
         <div class="kpi-label">运行时长</div>
         <div class="kpi-value" data-metric="uptime" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
         <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">其他请求 ${otherTotal} · 历史累计 ${all.total}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">其他 ${otherTotal}（含健康检查 ${protoBreakdown.health || 0}）· 历史累计 ${all.total}</div>
       </div>
     </div>
   `;
@@ -774,8 +774,8 @@ function renderProtoBreakdownCard(protoBreakdown) {
       </div>
     `;
   }
-  const labels = { chat: 'Chat 对话', models: 'Models 元信息', images: 'Images 图像', embeddings: 'Embeddings', moderations: 'Moderations', other: '其他' };
-  const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#64748b'];
+  const labels = { chat: 'Chat 对话', models: 'Models 元信息', images: 'Images 图像', embeddings: 'Embeddings', moderations: 'Moderations', health: '健康检查', other: '其他' };
+  const colors = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ef4444', '#64748b'];
   const cx = 90, cy = 90, r = 70, innerR = 38;
   let cumAngle = -Math.PI / 2;
   const slices = entries.map(([k, v], i) => {
@@ -865,6 +865,7 @@ function renderTrafficSplitCard(protoBreakdown, totalReqs) {
         <div class="flex-between"><span class="text-muted">Models 元信息</span><strong>${pb.models || 0}</strong></div>
         <div class="flex-between"><span class="text-muted">Images 图像</span><strong>${pb.images || 0}</strong></div>
         <div class="flex-between"><span class="text-muted">Embeddings</span><strong>${pb.embeddings || 0}</strong></div>
+        <div class="flex-between"><span class="text-muted">健康检查</span><strong>${pb.health || 0}</strong></div>
         <div class="flex-between"><span class="text-muted">其他</span><strong>${pb.other || 0}</strong></div>
       </div>
     </div>

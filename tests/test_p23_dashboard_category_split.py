@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pytest
 
-from glm2api.admin.store import AdminStore, RequestRecord, classify_category
+from glm2api.admin.store import AdminStore, RequestRecord, classify_category, classify_protocol
 
 
 def _make_rec(
@@ -42,6 +42,19 @@ def _make_rec(
     )
 
 
+# === classify_protocol: /health 单独成类测试 ===
+
+def test_classify_protocol_health_separate():
+    """/health 单独归到 health 协议，不再混到 meta 类。
+
+    修复背景：Docker / Render / k8s 部署平台每 30s 探活 /health，
+    如果归到 meta（与 /v1/models 同类）会污染"Models 请求"计数，
+    用户看到 Models 一直涨其实只是健康检查。
+    """
+    assert classify_protocol("/health") == "health"
+    assert classify_protocol("/v1/models") == "meta"
+
+
 # === classify_category 测试 ===
 
 def test_classify_api_protocols():
@@ -53,14 +66,18 @@ def test_classify_api_protocols():
 
 
 def test_classify_meta_is_models():
-    """/v1/models + /health 的 meta 协议归到 models 类。"""
+    """/v1/models 的 meta 协议归到 models 类；/health 单独归到 health 类。"""
     assert classify_category("meta") == "models"
+    # /health 单独成类（部署平台探活），归到 other 而非 models
+    assert classify_category("health") == "other"
 
 
 def test_classify_other():
-    """未识别协议归到 other。"""
+    """未识别协议 + 健康检查都归到 other。"""
     assert classify_category("other") == "other"
     assert classify_category("unknown-protocol") == "other"
+    # health 协议（/health 探活）也归到 other，不再归 models
+    assert classify_category("health") == "other"
 
 
 # === record_request 三类计数器测试 ===
@@ -85,14 +102,20 @@ def test_record_api_request_increments_api_counter(store):
 
 
 def test_record_models_request_increments_models_counter(store):
-    """/v1/models 元信息请求只增加 models 类计数器。"""
+    """/v1/models 元信息请求只增加 models 类计数器；
+    /health 健康检查属于 other 类（不再污染 models 计数）。"""
     store.record_request(_make_rec(protocol="meta", path="/v1/models", status=200))
-    store.record_request(_make_rec(protocol="meta", path="/health", status=200))
+    store.record_request(_make_rec(protocol="health", path="/health", status=200))
     d = store.dashboard()
-    assert d["all_time"]["models_total"] == 2
-    assert d["all_time"]["models_success"] == 2
+    # /v1/models → models 类
+    assert d["all_time"]["models_total"] == 1
+    assert d["all_time"]["models_success"] == 1
+    # /health → other 类（不再污染 models）
+    assert d["all_time"]["other_total"] == 1
     assert d["all_time"]["api_total"] == 0
-    assert d["all_time"]["other_total"] == 0
+    # proto_breakdown 也分开
+    assert d["proto_breakdown"]["models"] == 1
+    assert d["proto_breakdown"]["health"] == 1
 
 
 def test_record_other_request_increments_other_counter(store):

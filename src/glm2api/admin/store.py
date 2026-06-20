@@ -368,15 +368,17 @@ class AdminStore:
             # 活跃账号数（success > 0 或 last_used_ts > 0）
             accounts_active = sum(1 for s in self._account_stats.values() if s.get("last_used_ts", 0) > 0)
             accounts_total = len(self._account_stats)
-            # 协议分类（chat / models / images / admin / meta / other）
-            # "meta" 协议包含 /v1/models / /v1/models/{id} / /health，
-            # 这里把 meta 全算到 models（健康检查占比小，可接受）
+            # 协议分类（chat / models / images / embeddings / moderations / health / other）
+            # 注意：models 只包含 /v1/models 真实元信息请求；
+            # /health 健康检查（Docker / Render / k8s 探活，每 30s 一次）单独计到 health 字段，
+            # 不再污染 models 计数（用户反馈"Models 一直在涨"就是这个原因）
             proto_breakdown = {
                 "chat": sum(c for p, c in protocols.items() if p in ("openai-chat", "anthropic", "openai-responses", "openai-legacy")),
                 "models": protocols.get("meta", 0),
                 "images": protocols.get("openai-images", 0),
                 "embeddings": protocols.get("openai-embeddings", 0),
                 "moderations": protocols.get("openai-moderations", 0),
+                "health": protocols.get("health", 0),
                 "other": protocols.get("other", 0),
             }
             return {
@@ -679,7 +681,11 @@ def classify_protocol(path: str, payload: Optional[dict] = None) -> str:
         return "openai-legacy"
     if "/images/" in path:
         return "openai-images"
-    if path == "/health" or path.endswith("/models"):
+    # /health 单独一类：部署平台（Docker / Render / k8s）每 30s 探活会调它，
+    # 如果归到 models 会污染"Models 请求"计数（用户看到 Models 一直在涨）
+    if path == "/health":
+        return "health"
+    if path.endswith("/models"):
         return "meta"
     return "other"
 
@@ -688,14 +694,15 @@ def classify_category(protocol: str) -> str:
     """把细分协议归到 3 大类，用于仪表盘 KPI 拆分显示。
 
     - "api":    业务请求（chat/completions/responses/anthropic/images/embeddings/moderations）
-    - "models": 元信息查询（/v1/models + /health）
-    - "other":  上述之外的杂项
+    - "models": 元信息查询（仅 /v1/models，不含 /health 健康检查）
+    - "other":  健康检查 / admin / 未识别等杂项
     """
     if protocol in ("openai-chat", "anthropic", "openai-responses", "openai-legacy",
                     "openai-images", "openai-embeddings", "openai-moderations"):
         return "api"
     if protocol == "meta":
         return "models"
+    # health / other / 任何未识别 → other
     return "other"
 
 
