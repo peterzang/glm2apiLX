@@ -1776,12 +1776,10 @@ function renderProbeResult(result, payload, elapsed) {
 let _logsCurrentCategory = 'all';
 
 // 分类匹配规则：根据 protocol 字段判断日志属于哪个分类
+// v31 精简：删掉 Chat/Anthropic/Responses 三个 tab（API 请求 tab 已显示协议列）
 const LOGS_CATEGORY_MATCHERS = {
   all:        () => true,  // 全部
   api:        (l) => ['openai-chat','anthropic','openai-responses','openai-legacy','openai-images','openai-embeddings','openai-moderations'].includes(l.protocol),
-  chat:       (l) => l.protocol === 'openai-chat' || l.protocol === 'openai-legacy',
-  anthropic:  (l) => l.protocol === 'anthropic',
-  responses:  (l) => l.protocol === 'openai-responses',
   images:     (l) => l.protocol === 'openai-images',
   embeddings: (l) => l.protocol === 'openai-embeddings',
   models:     (l) => l.protocol === 'meta',  // /v1/models
@@ -1815,14 +1813,22 @@ async function refreshLogs() {
     const statusClass = l.status >= 500 ? 'text-error'
                       : l.status >= 400 ? 'text-warning'
                       : 'text-success';
+    const protoBadge = l.protocol.startsWith('anthropic') ? 'badge-purple'
+                     : l.protocol.includes('responses') ? 'badge-info'
+                     : l.protocol === 'health' ? 'badge-muted'
+                     : l.protocol === 'meta' ? 'badge-warning'
+                     : l.protocol.includes('images') ? 'badge-info'
+                     : 'badge-success';
+    // v31 增强：显示客户端 IP（从哪里请求的）+ 更详细的信息
     return `
       <tr>
-        <td class="mono text-muted" style="font-size:11px;">${fmtTime(l.ts)}</td>
+        <td class="mono text-muted" style="font-size:11px;white-space:nowrap;">${fmtTime(l.ts)}</td>
+        <td><span class="badge ${protoBadge}">${escapeHtml(l.protocol)}</span></td>
         <td class="mono">${escapeHtml(l.method)}</td>
-        <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.path)}">${escapeHtml(l.path)}</td>
-        <td><span class="badge ${l.protocol.startsWith('anthropic') ? 'badge-purple' : l.protocol.includes('responses') ? 'badge-info' : l.protocol === 'health' ? 'badge-muted' : l.protocol === 'meta' ? 'badge-warning' : 'badge-success'}">${escapeHtml(l.protocol)}</span></td>
+        <td class="mono" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(l.path)}">${escapeHtml(l.path)}</td>
         <td class="mono">${escapeHtml(l.model || '-')}</td>
-        <td class="mono text-muted" style="font-size:11px;">${escapeHtml(l.api_key || '-')}</td>
+        <td class="mono text-muted" style="font-size:11px;" title="${escapeHtml(l.api_key || '')}">${escapeHtml(l.api_key || '-')}</td>
+        <td class="mono text-muted" style="font-size:11px;" title="客户端 IP">${escapeHtml(l.client_ip || '-')}</td>
         <td class="mono"><span class="${statusClass}">${l.status}</span></td>
         <td class="mono">${l.duration_ms}ms</td>
         <td class="mono text-muted">${l.stream ? 'stream' : 'sync'}</td>
@@ -1837,8 +1843,8 @@ async function refreshLogs() {
       <table class="data-table">
         <thead>
           <tr>
-            <th>时间</th><th>方法</th><th>路径</th><th>协议</th><th>模型</th><th>API Key</th>
-            <th>状态</th><th>延迟</th><th>模式</th><th>账号</th><th>错误</th><th>请求ID</th>
+            <th>时间</th><th>协议</th><th>方法</th><th>路径</th><th>模型</th><th>API Key</th>
+            <th>客户端 IP</th><th>状态</th><th>延迟</th><th>模式</th><th>账号</th><th>错误</th><th>请求ID</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
