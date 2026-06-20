@@ -615,16 +615,8 @@ body {
 .kpi-card.warning .kpi-value { color: var(--warning); }
 .kpi-card.info .kpi-value    { color: var(--info); }
 
-/* 数据变化时的脉冲发光动画 */
-.metric-value.updated,
-.kpi-value.updated {
-  animation: pulse-glow 0.7s ease-out;
-}
-@keyframes pulse-glow {
-  0%   { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.5); color: var(--primary-glow); }
-  50%  { box-shadow: 0 0 20px 4px rgba(99, 102, 241, 0.2); color: var(--primary-glow); }
-  100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); color: var(--text); }
-}
+/* 数据变化时不再有任何动画效果（用户反馈：不要"方框亮一下"）
+   原 pulse-glow 动画已移除，KPI 数值变化时静默更新数字即可。 */
 
 /* ============== Panels ============== */
 .panel {

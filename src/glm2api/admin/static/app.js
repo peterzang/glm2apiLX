@@ -557,14 +557,9 @@ async function refreshDashboard() {
 
   document.getElementById('view-dashboard').innerHTML = kpiRow1 + kpiRow2 + mainArea + bottomCards;
 
-  // === 数据变化时触发脉冲发光动画 ===
-  // 非首次渲染 + 数据真的变了 → 给所有 KPI 数值加 updated class
-  if (!isFirstRender && dataChanged) {
-    document.querySelectorAll('#view-dashboard .kpi-value[data-metric]').forEach(el => {
-      el.classList.add('updated');
-      setTimeout(() => el.classList.remove('updated'), 700);
-    });
-  }
+  // 用户反馈：数据刷新时不要出现"方框亮一下"的脉冲动画，
+  // 数字直接更新即可，不要任何视觉特效。
+  // （原 pulse-glow 动画已移除，KPI 数值变化时静默更新）
 }
 
 // === 复读率监控卡片（v3 审核报告建议）===
