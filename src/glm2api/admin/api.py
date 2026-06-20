@@ -145,9 +145,12 @@ def _send_json(handler, status: HTTPStatus, payload: Dict[str, Any], config: App
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-    handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    # v35 修复：admin 端点 CORS 仅当配置了具体来源时才发送（不用 *，避免暴露特征）
+    # admin 端点需要 CORS 是因为浏览器跨域访问管理面板
+    if config.cors_allow_origin and config.cors_allow_origin != "*":
+        handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -180,7 +183,9 @@ def _send_static(handler, file_path: Path, config: AppConfig) -> None:
     # 文件未变 → 304（无 body，超快）；文件变了 → 200 全量
     # 这样部署新版本后用户立刻拿到新代码，无需等 max-age 过期
     handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+    # v35 修复：admin 静态资源 CORS 仅当配置了具体来源时才发送（不用 *）
+    if config.cors_allow_origin and config.cors_allow_origin != "*":
+        handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -294,9 +299,11 @@ def _send_json_with_retry_after(handler, status: HTTPStatus, payload: dict, conf
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
     handler.send_header("Retry-After", str(retry_after))
-    handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    # v35 修复：admin 端点 CORS 仅当配置了具体来源时才发送（不用 *）
+    if config.cors_allow_origin and config.cors_allow_origin != "*":
+        handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.end_headers()
     handler.wfile.write(body)
 

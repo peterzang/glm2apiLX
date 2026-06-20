@@ -1612,14 +1612,24 @@ class GLM2APIServer:
                 # 3. 添加 X-Request-ID（官方 OpenAI 每个响应都有，用于请求追踪）
                 #    格式：req_<32 hex>，与官方一致
                 self.send_header("X-Request-ID", f"req_{uuid.uuid4().hex[:24]}")
-                # CORS（仅当配置了具体来源时才发送，* 时也发送但审计建议生产环境用具体来源）
-                if config.cors_allow_origin:
-                    self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
-                    self.send_header(
-                        "Access-Control-Allow-Headers",
-                        "Authorization, Content-Type, x-api-key, anthropic-version",
-                    )
-                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                # 4. 添加 CF-Ray（官方 OpenAI 通过 cloudflare 返回此 header，模拟真实 CDN）
+                self.send_header("CF-Ray", f"{uuid.uuid4().hex[:16]}-LAX")
+                # v35 修复：API 端点（/v1/*）完全不发 CORS header（与官方 OpenAI 一致）
+                # 官方 OpenAI API 不返回 Access-Control-Allow-Origin，只返回 Access-Control-Expose-Headers
+                # 只有 admin 端点（/admin/*）才需要 CORS（浏览器跨域访问管理面板）
+                path = self._path_without_query() if hasattr(self, '_path_without_query') else ""
+                if path.startswith("/admin"):
+                    # Admin 端点：仅当配置了具体来源时才发送 CORS（不用 *，避免暴露特征）
+                    if config.cors_allow_origin and config.cors_allow_origin != "*":
+                        self.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
+                        self.send_header(
+                            "Access-Control-Allow-Headers",
+                            "Authorization, Content-Type, x-api-key, anthropic-version",
+                        )
+                        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                else:
+                    # API 端点：模拟官方 cloudflare 的 Access-Control-Expose-Headers
+                    self.send_header("Access-Control-Expose-Headers", "CF-Ray")
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:
