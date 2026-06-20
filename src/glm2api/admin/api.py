@@ -867,6 +867,31 @@ def _handle_apikey_toggle(handler, config: AppConfig, glm_client: GLMWebClient, 
     }, config)
 
 
+def _handle_accounts_add(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    """添加用户账号（非游客）。请求体: {"refresh_token": "xxx"}"""
+    try:
+        payload = _read_json_body(handler)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"}, config)
+        return
+    refresh_token = str(payload.get("refresh_token", "")).strip()
+    if not refresh_token:
+        _send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_refresh_token"}, config)
+        return
+    auth = glm_client.auth
+    try:
+        idx = auth.add_user_account(refresh_token)
+        logger.info("admin 添加用户账号 index=%s", idx)
+        _send_json(handler, HTTPStatus.OK, {
+            "ok": True,
+            "index": idx,
+            "total_accounts": auth.get_account_count(),
+        }, config)
+    except Exception as exc:
+        logger.error("admin 添加用户账号失败 error=%s", exc)
+        _send_json(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}, config)
+
+
 # Map of /admin/api/<name> -> handler function (POST or GET both accepted
 # where appropriate; each handler is method-agnostic)
 _API_ROUTES = {
@@ -887,6 +912,8 @@ _API_ROUTES = {
     "apikeys/create": ("POST", _handle_apikey_create),
     "apikeys/delete": ("POST", _handle_apikey_delete),
     "apikeys/toggle": ("POST", _handle_apikey_toggle),
+    # 账号管理
+    "accounts/add": ("POST", _handle_accounts_add),
 }
 
 

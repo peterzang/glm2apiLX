@@ -1481,6 +1481,21 @@ class GLMEventAccumulator:
             raise RuntimeError("descriptive_text_without_tool_call")
 
         final_content = clean_content.strip()
+
+        # P2-7: json_object / json_schema 模式下剥离 markdown 代码块
+        # GLM 倾向用 ```json ... ``` 包裹 JSON 输出，导致客户端 json.loads() 失败
+        if self.tools_schema is None or not all_tool_calls:
+            # 检测是否是 JSON 模式（通过 prompt_messages 中的 system 指令判断）
+            is_json_mode = False
+            if self.prompt_messages:
+                for msg in self.prompt_messages:
+                    if isinstance(msg, dict) and msg.get("role") == "system":
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and ("output JSON" in content or "json_schema" in content.lower()):
+                            is_json_mode = True
+                            break
+            if is_json_mode and final_content:
+                final_content = _strip_markdown_code_block(final_content)
         # P9 修复：非流式路径也检查 max_tokens
         finish_reason = "tool_calls" if all_tool_calls else "stop"
 
@@ -1723,3 +1738,32 @@ class GLMEventAccumulator:
         }
         payload.update(patch)
         return "data: " + safe_json_dumps(payload) + "\n\n"
+
+
+def _strip_markdown_code_block(text: str) -> str:
+    """P2-7: 剥离 markdown 代码块标记，返回纯内容。
+
+    处理以下格式：
+    ```json\n{"key": "value"}\n```  →  {"key": "value"}
+    ```\n{"key": "value"}\n```      →  {"key": "value"}
+    ```python\nprint("hi")\n```     →  print("hi")
+    """
+    if not text:
+        return text
+    text = text.strip()
+    # 检测是否以 ``` 开头
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if len(lines) >= 2:
+            # 去掉第一行（```json 或 ```）
+            # 去掉最后一行（```）
+            # 但最后一行可能不是 ```，所以只去掉首行 + 尾部 ```
+            first_line = lines[0].strip()
+            # 首行是 ``` 或 ```json 等
+            if first_line.startswith("```"):
+                lines = lines[1:]
+            # 去掉尾部的 ```
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+    return text

@@ -173,6 +173,36 @@ class GLMAccessTokenManager:
     def get_account_count(self) -> int:
         return len(self._accounts)
 
+    def add_user_account(self, refresh_token: str) -> int:
+        """动态添加一个用户账号（非游客）。返回新账号的 index。"""
+        with self._lock:
+            idx = len(self._accounts)
+            self._accounts.append(
+                AccountState(
+                    refresh_token=refresh_token,
+                    is_guest=False,
+                    device_id=_load_or_create_device_id(idx),
+                )
+            )
+            self.logger.info("动态添加用户账号 index=%s, 总账号数=%s", idx, len(self._accounts))
+            return idx
+
+    def get_all_accounts_info(self) -> list[dict]:
+        """返回所有账号的信息（用于管理面板显示）。"""
+        with self._lock:
+            result = []
+            for idx, acc in enumerate(self._accounts):
+                result.append({
+                    "index": idx,
+                    "is_guest": acc.is_guest,
+                    "has_refresh_token": bool(acc.refresh_token),
+                    "refresh_token_preview": (acc.refresh_token[:8] + "...") if acc.refresh_token and not acc.is_guest else "",
+                    "device_id_short": acc.device_id[:8] if acc.device_id else "",
+                    "request_id_counter": acc.request_id_counter,
+                    "device_request_count": acc.device_request_count,
+                })
+            return result
+
     def get_current_account_index(self) -> int:
         with self._lock:
             return self._current_index

@@ -927,9 +927,16 @@ async function refreshAccounts() {
     <div class="panel">
       <div class="panel-header">
         <div class="panel-title">账号详情</div>
-        <div class="panel-meta">点击"轮换"按钮可手动重置 device_id</div>
+        <div class="panel-meta">
+          <button id="account-add-btn" class="btn btn-primary btn-sm">+ 添加用户账号</button>
+        </div>
       </div>
       <div class="panel-body">
+        <div id="account-add-form" style="display:none;margin-bottom:16px;gap:10px;align-items:center;" class="flex">
+          <input type="text" id="account-refresh-token" placeholder="输入 GLM refresh_token（从 chatglm.cn 获取）" class="probe-input" style="width:400px;" />
+          <button id="account-add-confirm" class="btn btn-primary btn-sm">确认添加</button>
+          <button id="account-add-cancel" class="btn btn-ghost btn-sm">取消</button>
+        </div>
         <div class="table-wrapper">
           <table class="data-table">
             <thead>
@@ -958,6 +965,40 @@ async function refreshAccounts() {
   document.querySelectorAll('[data-rotate-idx]').forEach(btn => {
     btn.addEventListener('click', () => handleRotate(parseInt(btn.dataset.rotateIdx, 10)));
   });
+
+  // Bind add account button
+  const addBtn = document.getElementById('account-add-btn');
+  const addForm = document.getElementById('account-add-form');
+  const addConfirm = document.getElementById('account-add-confirm');
+  const addCancel = document.getElementById('account-add-cancel');
+  const tokenInput = document.getElementById('account-refresh-token');
+  if (addBtn) {
+    addBtn.addEventListener('click', () => {
+      addForm.style.display = 'flex';
+      tokenInput.focus();
+    });
+  }
+  if (addCancel) {
+    addCancel.addEventListener('click', () => {
+      addForm.style.display = 'none';
+      tokenInput.value = '';
+    });
+  }
+  if (addConfirm) {
+    addConfirm.addEventListener('click', async () => {
+      const refreshToken = tokenInput.value.trim();
+      if (!refreshToken) { showToast('请输入 refresh_token', 'error'); return; }
+      try {
+        const result = await api('accounts/add', { method: 'POST', body: { refresh_token: refreshToken } });
+        showToast(`✅ 用户账号已添加 #${result.index}，总账号数 ${result.total_accounts}`, 'success');
+        addForm.style.display = 'none';
+        tokenInput.value = '';
+        refreshAccounts();
+      } catch (err) {
+        showToast('添加失败: ' + err.message, 'error');
+      }
+    });
+  }
 }
 
 function renderAccountRow(a) {
