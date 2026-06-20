@@ -196,8 +196,11 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
-def openai_to_anthropic_response(result: dict[str, object], model: str) -> dict[str, object]:
-    """Convert an OpenAI chat/completions response to Anthropic Messages format."""
+def openai_to_anthropic_response(result: dict[str, object], model: str, stop_sequences: list[str] | None = None) -> dict[str, object]:
+    """Convert an OpenAI chat/completions response to Anthropic Messages format.
+
+    P1-1 修复：支持 stop_sequences 截断。
+    """
     content: list[dict[str, object]] = []
     stop_reason = "end_turn"
 
@@ -218,7 +221,16 @@ def openai_to_anthropic_response(result: dict[str, object], model: str) -> dict[
                 # text content
                 text = message.get("content")
                 if text:
-                    content.append({"type": "text", "text": str(text)})
+                    text = str(text)
+                    # P1-1: stop_sequences 截断
+                    if stop_sequences:
+                        for stop_seq in stop_sequences:
+                            if stop_seq and isinstance(stop_seq, str) and stop_seq in text:
+                                idx = text.index(stop_seq)
+                                text = text[:idx]
+                                stop_reason = "stop_sequence"
+                                break
+                    content.append({"type": "text", "text": text})
 
                 # tool_calls
                 tool_calls = message.get("tool_calls")
@@ -242,6 +254,9 @@ def openai_to_anthropic_response(result: dict[str, object], model: str) -> dict[
             finish_reason = choice.get("finish_reason")
             if finish_reason == "length":
                 stop_reason = "max_tokens"
+            # P1-1: 如果 OpenAI finish_reason="stop" 且提供了 stop_sequences，设为 stop_sequence
+            elif finish_reason == "stop" and stop_sequences:
+                stop_reason = "stop_sequence"
 
     if not content:
         content.append({"type": "text", "text": ""})

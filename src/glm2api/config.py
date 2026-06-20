@@ -298,7 +298,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         exposed_models=exposed_models,  # type: ignore
         model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
-        cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "*").strip() or "*",
+        cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "").strip(),
     )
 
     if not (1 <= config.port <= 65535):

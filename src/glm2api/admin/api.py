@@ -119,8 +119,8 @@ def _resolve_admin_password(config: AppConfig, logger: Logger) -> str:
         pass
     if config.server_api_keys:
         return config.server_api_keys[0]
-    logger.warning("ADMIN_PASSWORD 未设置且 SERVER_API_KEYS 为空，管理面板默认密码为 'admin'，请尽快修改")
-    return "admin"
+    logger.warning("ADMIN_PASSWORD 未设置且 SERVER_API_KEYS 为空，管理面板拒绝登录。请设置 ADMIN_PASSWORD 环境变量。")
+    return ""  # P2-4: 不再使用默认密码 admin，返回空字符串拒绝所有登录
 
 
 def _authorize_admin(handler, config: AppConfig, logger: Logger) -> bool:
@@ -184,7 +184,40 @@ def _read_json_body(handler) -> Dict[str, Any]:
 # Endpoint implementations
 # ---------------------------------------------------------------------------
 
+# P1-4: 防暴力破解 — IP 级别登录失败计数
+_login_failures: dict[str, list[float]] = {}  # ip -> [timestamps]
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_LOCKOUT_SECONDS = 900  # 15 分钟
+
+
+def _check_brute_force(ip: str) -> bool:
+    """检查 IP 是否被锁定。返回 True 表示允许登录。"""
+    import time as _time
+    now = _time.time()
+    failures = _login_failures.get(ip, [])
+    # 清理过期的失败记录
+    failures = [ts for ts in failures if now - ts < _LOGIN_LOCKOUT_SECONDS]
+    _login_failures[ip] = failures
+    return len(failures) < _LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(ip: str) -> None:
+    """记录一次登录失败。"""
+    import time as _time
+    if ip not in _login_failures:
+        _login_failures[ip] = []
+    _login_failures[ip].append(_time.time())
+
+
 def _handle_login(handler, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
+    client_ip = handler.client_address[0] if handler.client_address else "unknown"
+    # P1-4: 防暴力破解检查
+    if not _check_brute_force(client_ip):
+        _send_json(handler, HTTPStatus.TOO_MANY_REQUESTS, {
+            "error": "too_many_login_attempts",
+            "message": f"Too many failed login attempts. Please try again in {_LOGIN_LOCKOUT_SECONDS // 60} minutes.",
+        }, config)
+        return
     try:
         payload = _read_json_body(handler)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -195,8 +228,15 @@ def _handle_login(handler, config: AppConfig, glm_client: GLMWebClient, logger: 
     # Constant-time compare to reduce timing leak
     import hmac
     if not password or not hmac.compare_digest(password.encode("utf-8"), expected.encode("utf-8")):
-        _send_json(handler, HTTPStatus.UNAUTHORIZED, {"error": "invalid_password"}, config)
+        _record_login_failure(client_ip)
+        remaining = _LOGIN_MAX_FAILURES - len(_login_failures.get(client_ip, []))
+        _send_json(handler, HTTPStatus.UNAUTHORIZED, {
+            "error": "invalid_password",
+            "remaining_attempts": max(0, remaining),
+        }, config)
         return
+    # 登录成功，清除失败记录
+    _login_failures.pop(client_ip, None)
     ttl = 8 * 3600
     token = get_store().create_session(ttl_seconds=ttl)
     _send_json(handler, HTTPStatus.OK, {"token": token, "expires_in": ttl}, config)

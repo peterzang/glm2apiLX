@@ -620,7 +620,11 @@ class GLM2APIServer:
                     return
 
                 result, _ = glm_client.chat_completion(openai_payload)
-                response = openai_to_anthropic_response(result, model)
+                # P1-1: 传递 stop_sequences 给 Anthropic 响应转换
+                stop_seqs = payload.get("stop_sequences")
+                if isinstance(stop_seqs, str):
+                    stop_seqs = [stop_seqs]
+                response = openai_to_anthropic_response(result, model, stop_sequences=stop_seqs if isinstance(stop_seqs, list) else None)
                 self._record_token_usage(result)
                 self._discover_dynamic_model(result)
                 self._write_json(HTTPStatus.OK, response)
