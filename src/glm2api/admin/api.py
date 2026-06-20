@@ -160,11 +160,26 @@ def _send_static(handler, file_path: Path, config: AppConfig) -> None:
         return
     suffix = file_path.suffix.lower()
     content_type = _MIME_TYPES.get(suffix, "application/octet-stream")
+    # ETag：基于文件大小 + mtime，文件改动后 ETag 必变
+    stat = file_path.stat()
+    etag = f'"{stat.st_size}-{int(stat.st_mtime)}"'
+    # 客户端发 If-None-Match → 命中则返回 304 不传 body
+    if_none_match = handler.headers.get("If-None-Match", "")
+    if if_none_match and etag in if_none_match:
+        handler.send_response(HTTPStatus.NOT_MODIFIED)
+        handler.send_header("ETag", etag)
+        # no-cache: 每次都来问一次 ETag，命中才用本地缓存
+        handler.send_header("Cache-Control", "no-cache")
+        handler.end_headers()
+        return
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(body)))
-    # Cache static assets for 1h (login page itself is small, no harm)
-    handler.send_header("Cache-Control", "public, max-age=3600")
+    handler.send_header("ETag", etag)
+    # no-cache: 浏览器会缓存，但每次使用前必须向服务器校验 ETag
+    # 文件未变 → 304（无 body，超快）；文件变了 → 200 全量
+    # 这样部署新版本后用户立刻拿到新代码，无需等 max-age 过期
+    handler.send_header("Cache-Control", "no-cache")
     handler.send_header("Access-Control-Allow-Origin", config.cors_allow_origin)
     handler.end_headers()
     handler.wfile.write(body)
