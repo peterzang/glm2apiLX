@@ -378,7 +378,22 @@ def _parse_xml_block(
     try:
         root = ET.fromstring(_normalize_dsml_to_xml(block))
     except ET.ParseError:
-        return [], None
+        # P1 修复：DSML 解析失败时尝试更多修复策略
+        # 策略 1: 移除 CDATA 内容中的非法 XML 字符
+        try:
+            cleaned = block
+            # 移除 XML 非法字符 (除了 \t \n \r)
+            cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', cleaned)
+            root = ET.fromstring(_normalize_dsml_to_xml(cleaned))
+        except ET.ParseError:
+            # 策略 2: 提取所有 CDATA 内容，尝试正则解析工具调用
+            try:
+                fallback_calls = _regex_fallback_parse_tool_calls(block, allowed_tool_names)
+                if fallback_calls:
+                    return fallback_calls, (start_index, start_index + len(block))
+            except Exception:
+                pass
+            return [], None
 
     root_name = _local_name(root.tag)
     if root_name in {"tool_calls", "ml_tool_calls"}:
@@ -620,3 +635,57 @@ class StreamingToolParser:
         self.tool_calls.extend(parsed_calls)
         tail = "" if _looks_like_tool_markup_fragment(remainder) else remainder
         return (visible + tail).strip(), self.tool_calls
+
+
+def _regex_fallback_parse_tool_calls(
+    block: str,
+    allowed_tool_names: set[str] | None,
+) -> list[dict[str, object]]:
+    """P1 修复：DSML XML 解析失败时的正则兜底解析。
+
+    当 XML 解析器无法解析 DSML 块时，用正则表达式提取工具调用信息。
+    提取模式：
+    - invoke name="xxx" → 工具名
+    - parameter name="yyy" → 参数名
+    - CDATA[...] → 参数值
+    """
+    import json as _json
+    tool_calls: list[dict[str, object]] = []
+
+    # 提取所有 invoke name="xxx" 块
+    invoke_pattern = re.compile(
+        r'invoke\s+name="([^"]+)"(.*?)(?=invoke\s+name=|</.*?tool_calls|$)',
+        re.DOTALL,
+    )
+    for invoke_match in invoke_pattern.finditer(block):
+        tool_name = invoke_match.group(1).strip()
+        if allowed_tool_names and tool_name not in allowed_tool_names:
+            continue
+
+        invoke_body = invoke_match.group(2)
+
+        # 提取所有 parameter name="xxx" 的 CDATA 值
+        params: dict[str, object] = {}
+        param_pattern = re.compile(
+            r'parameter\s+name="([^"]+)"\s*>\s*<!\[CDATA\[(.*?)\]\]>',
+            re.DOTALL,
+        )
+        for param_match in param_pattern.finditer(invoke_body):
+            param_name = param_match.group(1).strip()
+            param_value = param_match.group(2).strip()
+            # 尝试解析为 JSON
+            try:
+                params[param_name] = _json.loads(param_value)
+            except (json.JSONDecodeError, ValueError):
+                params[param_name] = param_value
+
+        tool_calls.append({
+            "type": "function",
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "function": {
+                "name": tool_name,
+                "arguments": _json.dumps(params, ensure_ascii=False),
+            },
+        })
+
+    return tool_calls

@@ -1468,6 +1468,19 @@ class GLMEventAccumulator:
         final_content = clean_content.strip()
         # P9 修复：非流式路径也检查 max_tokens
         finish_reason = "tool_calls" if all_tool_calls else "stop"
+
+        # P1 修复：stop 序列支持（官方 API stop 参数）
+        # 当模型输出包含 stop 序列时，在 stop 序列处截断并设置 finish_reason="stop"
+        stop_sequences = getattr(self, "_stop_sequences", None)
+        if stop_sequences and final_content and not all_tool_calls:
+            for stop_seq in stop_sequences:
+                if stop_seq and isinstance(stop_seq, str) and stop_seq in final_content:
+                    idx = final_content.index(stop_seq)
+                    final_content = final_content[:idx]
+                    finish_reason = "stop"
+                    if self.logger:
+                        self.logger.info("stop 序列触发 stop=%r 截断到 %d 字符", stop_seq, idx)
+                    break
         if (
             not all_tool_calls
             and self.max_tokens_limit > 0

@@ -431,6 +431,13 @@ class GLMWebClient:
             tools_schema=list(payload.get("tools", [])) if isinstance(payload.get("tools"), list) else None,
             max_tokens_limit=int(payload.get("max_tokens", 0) or 0),
         )
+        # P1 修复：传递 stop 序列给 accumulator
+        stop_val = payload.get("stop")
+        if stop_val:
+            if isinstance(stop_val, str):
+                accumulator._stop_sequences = [stop_val]
+            elif isinstance(stop_val, list):
+                accumulator._stop_sequences = [str(s) for s in stop_val if s]
         try:
             for event in self._iter_sse_events(response):
                 if not event:
