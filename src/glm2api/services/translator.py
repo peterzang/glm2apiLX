@@ -1075,8 +1075,12 @@ class GLMEventAccumulator:
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
 
-    def _estimate_usage(self, completion_text: str = "") -> dict[str, int]:
-        """Compute realistic prompt_tokens / completion_tokens / total_tokens."""
+    def _estimate_usage(self, completion_text: str = "") -> dict[str, object]:
+        """Compute realistic prompt_tokens / completion_tokens / total_tokens.
+
+        v31 修复：添加 prompt_tokens_details 和 completion_tokens_details 子字段，
+        与官方 OpenAI API 格式完全一致。
+        """
         prompt_tokens = 0
         if self.prompt_messages is not None:
             try:
@@ -1094,10 +1098,21 @@ class GLMEventAccumulator:
         # Min 1 completion token if there's any output at all (matches OpenAI behavior)
         if completion_tokens == 0 and (self._cached_full_text or self._completion_text_buffer or self._server_side_tool_calls):
             completion_tokens = 1
+        # v31: 计算推理 token（reasoning_content 的估算）
+        reasoning_tokens = 0
+        if self._cached_full_reasoning:
+            reasoning_tokens = max(1, len(self._cached_full_reasoning) // 4)
         return {
             "prompt_tokens": max(prompt_tokens, 1),
             "completion_tokens": max(completion_tokens, 1),
             "total_tokens": max(prompt_tokens + completion_tokens, 2),
+            # v31: 官方 API 兼容子字段
+            "prompt_tokens_details": {
+                "cached_tokens": 0,  # GLM 不支持 prompt cache
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
         }
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[str], str | None]:

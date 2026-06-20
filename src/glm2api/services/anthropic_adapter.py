@@ -276,6 +276,9 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            # v31: 官方 Anthropic API 兼容字段
+            "cache_creation_input_tokens": 0,  # GLM 不支持 prompt cache
+            "cache_read_input_tokens": 0,     # GLM 不支持 prompt cache
         },
     }
 
@@ -313,7 +316,7 @@ class AnthropicStreamAccumulator:
             "model": self.model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": self.input_tokens, "output_tokens": 0},
+            "usage": {"input_tokens": self.input_tokens, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
         }
         return self._sse("message_start", {"type": "message_start", "message": msg})
 
@@ -445,7 +448,7 @@ class AnthropicStreamAccumulator:
         events.append(self._sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": self.output_tokens},
+            "usage": {"output_tokens": self.output_tokens},  # message_delta only has output_tokens per spec
         }))
         events.append(self._sse("message_stop", {"type": "message_stop"}))
         return events
