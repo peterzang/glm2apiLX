@@ -820,6 +820,20 @@ class GLM2APIServer:
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
+                """v34 修复：Anthropic 流式响应完整重写，解决长任务断开问题。
+
+                之前的问题（v36-v40 审计未发现的根因）：
+                1. message_start 延迟发送 — 等 GLM 第一个 chunk 才发，GLM 思考 30s 时
+                   Claude Code 30s 收不到任何事件 → 认为连接断开 → 长任务断开
+                2. 无 ping 心跳 — 官方 Anthropic API 周期性发 event: ping，
+                   我们没有 → 长时间无数据时 Claude Code 超时断开
+                3. 同步阻塞读 — 主线程直接读 stream_iter，GLM 慢时无法发心跳
+
+                修复：
+                1. message_start 立即发送（不等第一个 chunk）
+                2. 后台线程读上游 chunks（不阻塞主线程）
+                3. 主线程周期性发 ping 心跳（2s 间隔，与 Responses v2 一致）
+                """
                 openai_payload["stream"] = True
                 stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = AnthropicStreamAccumulator(model=model)
@@ -829,25 +843,72 @@ class GLM2APIServer:
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
                 self.end_headers()
 
-                # 收集 OpenAI 原始 chunks 以便流结束后提取 usage（Anthropic 流式响应里没有 usage）
-                collected_chunks: list[bytes] = []
+                # v34 P0-1: 立即发送 message_start（不等第一个 chunk）
+                # 这是长任务不断开的关键 — Claude Code 收到 message_start 就知道连接建立了
                 try:
-                    for chunk in stream_iter:
+                    start_event = accumulator.start_message()
+                    self.wfile.write(start_event.encode("utf-8"))
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 Anthropic 流式启动阶段断开 model=%s", model)
+                    return
+
+                # v34 P0-2: 后台线程读上游 chunks（不阻塞主线程，主线程可以发心跳）
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
+                # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
+                collected_chunks: list[bytes] = []
+                ANTHROPIC_PING_INTERVAL = 2.0  # 2 秒发一次 ping（与 Responses v2 一致）
+
+                try:
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=ANTHROPIC_PING_INTERVAL)
+                        except queue.Empty:
+                            # v34 P0-2: 超时未收到 chunk → 发 ping 心跳保活
+                            # 官方 Anthropic API 周期性发 event: ping
+                            # 这防止 Claude Code 在 GLM 思考时超时断开
+                            try:
+                                self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                                self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在 ping 心跳阶段断开 model=%s", model)
+                                return
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
                         if not chunk:
                             continue
-                        if not accumulator.started:
-                            start_event = accumulator.start_message()
-                            self.wfile.write(start_event.encode("utf-8"))
-                            self.wfile.flush()
+                        # 收集原始 chunk 用于后续 usage 提取
+                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+                        # 转换 OpenAI chunk → Anthropic SSE events
                         events = accumulator.feed_chunk(chunk)
                         for event in events:
-                            ev_bytes = event.encode("utf-8")
-                            self.wfile.write(ev_bytes)
-                            self.wfile.flush()
-                        # 收集 chunk 用于后续 usage 提取
-                        collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
+                            try:
+                                self.wfile.write(event.encode("utf-8"))
+                                self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s", model)
+                                return
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
                     return
