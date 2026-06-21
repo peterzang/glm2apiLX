@@ -20,6 +20,34 @@ def _safe_json(obj: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _strip_attribution_block(system_text: str) -> str:
+    """剥掉 Claude Code 在 system prompt 前加的 attribution block。
+
+    v39 审计发现：Claude Code >= 2.1.36 会把 attribution 信息作为 text block
+    注入到 system prompt 最前面（不是 HTTP header），格式：
+        x-anthropic-billing-header: cc_version=2.1.185; cc_entrypoint=cli; cch=xxxxx;
+
+    这个 block 的 cch= 段每次请求都变化，导致：
+    1. 上游 GLM 把这个识别成异常请求直接 403（长任务断开的根因）
+    2. prompt-cache prefix 每次都 break → 每轮都 full reprocess → 越来越慢
+
+    本函数在网关层主动剥掉这个 attribution block，让用户开箱即用，
+    无需手动设 CLAUDE_CODE_ATTRIBUTION_HEADER=0 环境变量。
+    """
+    if not system_text or not isinstance(system_text, str):
+        return system_text
+    import re
+    # 1. 剥掉 x-anthropic-billing-header 行
+    cleaned = re.sub(r'x-anthropic-billing-header:\s*[^\n]*', '', system_text, flags=re.IGNORECASE)
+    # 2. 剥掉 <system-reminder>...</system-reminder> 块
+    cleaned = re.sub(r'<system-reminder>[\s\S]*?</system-reminder>', '', cleaned)
+    # 3. 剥掉独立的 cc_version/cc_entrypoint/cch 片段
+    cleaned = re.sub(r'cc_version=[^\s;]*[;\s]*cc_entrypoint=[^\s;]*[;\s]*cch=[^\s;]*[;]?', '', cleaned, flags=re.IGNORECASE)
+    # 清理多余空行
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned
+
+
 def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
     """Convert an Anthropic Messages request body to OpenAI chat/completions."""
     messages: list[dict[str, object]] = []
@@ -28,12 +56,20 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
     system = payload.get("system")
     if system:
         if isinstance(system, str):
-            messages.append({"role": "system", "content": system})
+            # v39 P0-1: 剥掉 Claude Code attribution block
+            stripped = _strip_attribution_block(system)
+            if stripped:
+                messages.append({"role": "system", "content": stripped})
         elif isinstance(system, list):
             text_parts = []
-            for block in system:
+            for idx, block in enumerate(system):
                 if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(str(block.get("text", "")))
+                    text = str(block.get("text", ""))
+                    # v39 P0-1: 第一个 block 通常是 attribution，剥掉它
+                    if idx == 0:
+                        text = _strip_attribution_block(text)
+                    if text:
+                        text_parts.append(text)
             if text_parts:
                 messages.append({"role": "system", "content": "\n".join(text_parts)})
 

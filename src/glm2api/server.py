@@ -346,6 +346,7 @@ class GLM2APIServer:
                         f"{config.api_prefix}/images/edits",
                         f"{config.api_prefix}/images/variations",
                         f"{config.api_prefix}/messages",
+                        f"{config.api_prefix}/messages/count_tokens",
                         f"{config.api_prefix}/responses",
                         f"{config.api_prefix}/responses_v2",
                         "/v2/responses",
@@ -446,6 +447,12 @@ class GLM2APIServer:
                     if path == f"{config.api_prefix}/messages":
                         logger.info("收到 Anthropic 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
                         self._handle_anthropic_messages(payload)
+                        return
+
+                    # --- Anthropic count_tokens API (v39 P0-2) ---
+                    # Claude Code 用它做 context window 估算，减少不必要的截断
+                    if path == f"{config.api_prefix}/messages/count_tokens":
+                        self._handle_anthropic_count_tokens(payload)
                         return
 
                     # --- OpenAI Responses API v1 (legacy) ---
@@ -748,6 +755,34 @@ class GLM2APIServer:
                     pass  # never let metrics break the request
 
             # ---- Anthropic Messages API ----
+
+            def _handle_anthropic_count_tokens(self, payload: dict[str, object]) -> None:
+                """处理 POST /v1/messages/count_tokens 请求。
+
+                v39 P0-2: Claude Code 用这个端点做 context window 估算，
+                减少不必要的截断。如果不实现，Claude Code 会用默认估算，
+                可能导致长任务被提前截断（用户反馈的"长任务断开"问题之一）。
+
+                请求格式与 /v1/messages 相同（model + messages + system），
+                响应格式：{"input_tokens": <int>}
+                """
+                try:
+                    openai_payload = anthropic_to_openai(payload)
+                    messages = openai_payload.get("messages", [])
+                    tools = openai_payload.get("tools")
+                    total_tokens = 0
+                    if isinstance(messages, list):
+                        total_tokens = estimate_message_tokens(messages)
+                    if tools and isinstance(tools, list):
+                        from .core.tokenizer import estimate_tools_tokens
+                        total_tokens += estimate_tools_tokens(tools)
+                    total_tokens = max(1, total_tokens)
+                    self._write_json(HTTPStatus.OK, {"input_tokens": total_tokens})
+                except Exception as exc:
+                    logger.error("count_tokens 请求处理失败 error=%s", exc)
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                        make_error(f"count_tokens failed: {exc}", error_type="server_error",
+                                   code="count_tokens_error", request_id=gen_request_id()))
 
             def _handle_anthropic_messages(self, payload: dict[str, object]) -> None:
                 model = str(payload.get("model", "glm-4"))
