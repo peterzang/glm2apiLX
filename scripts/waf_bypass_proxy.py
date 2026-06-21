@@ -9,6 +9,10 @@
 MODIFIER LETTER GRAVE ACCENT)，视觉几乎一样但 WAF 不拦截。
 glm2api 收到后在应用层把 ˋ 还原成 `，GLM 收到正确的原始 prompt。
 
+v36 修复：流式 SSE 转发
+v42 审计发现 v35 proxy 用 urllib.read() buffered 读取导致 SSE hang。
+v36 改用 http.client + 逐块转发，正确处理流式响应。
+
 用法：
   1. 在本地运行此脚本：
      python scripts/waf_bypass_proxy.py --target https://glm2api.onrender.com --port 8001
@@ -22,16 +26,26 @@ glm2api 收到后在应用层把 ˋ 还原成 `，GLM 收到正确的原始 prom
 from __future__ import annotations
 
 import argparse
+import http.client
 import http.server
 import json
 import ssl
 import sys
-import urllib.request
-import urllib.error
+import threading
+from urllib.parse import urlparse
 
 # 反引号替换：U+0060 → U+02CB
 _BACKTICK = '\x60'        # ` GRAVE ACCENT（WAF 拦截目标）
 _BACKTICK_SAFE = '\u02cb' # ˋ MODIFIER LETTER GRAVE ACCENT（WAF 不拦截）
+
+# SSE 流式响应的 Content-Type
+_SSE_CONTENT_TYPE = 'text/event-stream'
+
+# 不转发的 hop-by-hop headers
+_HOP_BY_HOP = frozenset({
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade',
+})
 
 
 def _bypass_backticks_in_body(body: bytes) -> bytes:
@@ -46,7 +60,10 @@ def _bypass_backticks_in_body(body: bytes) -> bytes:
 
 
 class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
-    """转发所有请求到目标 URL，同时把请求体中的反引号替换为安全字符。"""
+    """转发所有请求到目标 URL，同时把请求体中的反引号替换为安全字符。
+
+    v36: 支持流式 SSE 转发（chunked transfer encoding）。
+    """
 
     # 不打印默认的请求日志（减少噪音）
     def log_message(self, format, *args):
@@ -60,33 +77,36 @@ class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
         # v35: 替换反引号为安全字符
         if body and _BACKTICK.encode('utf-8') in body:
             body = _bypass_backticks_in_body(body)
-            print(f'  [bypass] {method} {self.path} — replaced backticks ({content_length} bytes)', file=sys.stderr)
+            print(f'  [bypass] {method} {self.path} — replaced backticks ({len(body)} bytes)', file=sys.stderr)
 
-        # 构建目标 URL
-        target_url = f'{self.server.target_url}{self.path}'
+        # 解析目标 URL
+        parsed = urlparse(self.server.target_url)
+        target_host = parsed.hostname
+        target_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        use_https = parsed.scheme == 'https'
 
-        # 转发请求
-        req = urllib.request.Request(target_url, data=body if body else None, method=method)
-
-        # 转发所有 headers（除了 Host，由 urllib 自动设置）
+        # 构建转发 headers
+        forward_headers = {}
         for key, val in self.headers.items():
-            if key.lower() in ('host', 'content-length', 'transfer-encoding'):
+            if key.lower() in _HOP_BY_HOP or key.lower() == 'host':
                 continue
-            req.add_header(key, val)
-
-        # 设置正确的 Content-Length
+            forward_headers[key] = val
+        # 设置正确的 Content-Length（body 已被替换，长度可能变化）
         if body:
-            req.add_header('Content-Length', str(len(body)))
+            forward_headers['Content-Length'] = str(len(body))
+        # 设置 Host header
+        forward_headers['Host'] = target_host
 
+        # v36: 用 http.client 发送请求（支持流式读取）
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                status = resp.status
-                resp_headers = resp.headers
-                resp_body = resp.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            resp_headers = exc.headers
-            resp_body = exc.read()
+            if use_https:
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(target_host, target_port, context=ctx, timeout=300)
+            else:
+                conn = http.client.HTTPConnection(target_host, target_port, timeout=300)
+
+            conn.request(method, self.path, body=body if body else None, headers=forward_headers)
+            resp = conn.getresponse()
         except Exception as exc:
             self.send_response(502)
             self.send_header('Content-Type', 'application/json')
@@ -96,18 +116,57 @@ class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(error_body)
             return
 
-        # 发送响应
-        self.send_response(status)
-        for key, val in resp_headers.items():
-            if key.lower() in ('transfer-encoding', 'content-encoding', 'connection'):
-                continue
-            self.send_header(key, val)
-        self.send_header('Content-Length', str(len(resp_body)))
-        self.end_headers()
+        # v36: 判断是否为 SSE 流式响应
+        resp_content_type = resp.getheader('Content-Type', '')
+        is_sse = _SSE_CONTENT_TYPE in resp_content_type
 
-        # 流式响应需要逐块写入
-        self.wfile.write(resp_body)
-        self.wfile.flush()
+        if is_sse:
+            # v36: 流式转发 — 逐块读取上游 SSE，逐块转发给客户端
+            self.send_response(resp.status)
+
+            # 转发响应 headers（跳过 hop-by-hop + Content-Length）
+            for key, val in resp.getheaders():
+                if key.lower() in _HOP_BY_HOP or key.lower() == 'content-length':
+                    continue
+                self.send_header(key, val)
+
+            # 用 chunked transfer encoding（流式不设 Content-Length）
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+
+            # 逐块读取 + 转发
+            try:
+                while True:
+                    chunk = resp.read(4096)  # 4KB 块
+                    if not chunk:
+                        break
+                    # chunked encoding: <hex length>\r\n<data>\r\n
+                    self.wfile.write(f'{len(chunk):x}\r\n'.encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b'\r\n')
+                    self.wfile.flush()
+                # 发送终止 chunk
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                # 客户端断开，静默处理
+                pass
+            finally:
+                conn.close()
+        else:
+            # 非流式响应 — buffered 读取（与 v35 行为一致）
+            resp_body = resp.read()
+
+            self.send_response(resp.status)
+            for key, val in resp.getheaders():
+                if key.lower() in _HOP_BY_HOP or key.lower() == 'content-length':
+                    continue
+                self.send_header(key, val)
+            self.send_header('Content-Length', str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+            self.wfile.flush()
+            conn.close()
 
     def do_GET(self):
         self._proxy('GET')
@@ -133,6 +192,7 @@ class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
 
 class BypassProxyServer(http.server.ThreadingHTTPServer):
     target_url: str = ''
+    daemon_threads = True
 
 
 def main():
@@ -153,7 +213,8 @@ def main():
 
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║           WAF Bypass Proxy for glm2api               ║
+║           WAF Bypass Proxy for glm2api v36           ║
+║              (流式 SSE 转发已修复)                    ║
 ╠══════════════════════════════════════════════════════╣
 ║                                                      ║
 ║  监听: http://{args.host}:{args.port}                     ║
@@ -161,6 +222,7 @@ def main():
 ║                                                      ║
 ║  功能: 把请求体中的反引号 ` 替换为 ˋ                  ║
 ║        绕过 Cloudflare WAF 的 Command Injection 规则    ║
+║        支持 SSE 流式转发（chunked transfer）            ║
 ║                                                      ║
 ║  Claude Code 配置:                                    ║
 ║    export ANTHROPIC_BASE_URL=http://{args.host}:{args.port}     ║
