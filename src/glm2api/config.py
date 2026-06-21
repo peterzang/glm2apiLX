@@ -287,7 +287,7 @@ def load_config(env_file: str = ".env") -> AppConfig:
         ).strip(),
         glm_delete_conversation=parse_bool(values.get("GLM_DELETE_CONVERSATION"), True),
         glm_max_concurrency=glm_max_concurrency,
-        glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 600),
+        glm_queue_wait_timeout=parse_int(values.get("GLM_QUEUE_WAIT_TIMEOUT_SECONDS"), 60),  # v47: 600→60s，避免 10 分钟挂起
         glm_busy_max_retries=parse_int(values.get("GLM_BUSY_MAX_RETRIES"), 30),
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),

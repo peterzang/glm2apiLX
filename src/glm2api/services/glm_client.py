@@ -1395,6 +1395,34 @@ class GLMWebClient:
         account_count = self.auth.get_account_count()
         if account_count <= 0:
             raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
+
+        # v47 P0: 快速失败检测 — 如果所有账号的 token 都已失效且无法刷新，
+        # 不要遍历所有账号 × 重试次数（可能导致 10-30 分钟挂起），而是快速失败
+        # 检查是否有任何账号有可用的 cached_token 或能刷新
+        any_account_usable = False
+        for idx in range(account_count):
+            acc = self.auth._accounts[idx]
+            # 有 cached_token 且未过期 → 可用
+            if acc.cached_token and acc.cached_token.expires_at > time.time() + 5:
+                any_account_usable = True
+                break
+            # 游客账号 → 可用（可以 fetch 新 token）
+            if acc.is_guest:
+                any_account_usable = True
+                break
+            # 非游客有 refresh_token → 可用（可以刷新）
+            if acc.refresh_token:
+                any_account_usable = True
+                break
+
+        if not any_account_usable:
+            # v47 P0: 所有账号都不可用 → 立即抛异常，不要等 timeout
+            self.logger.error("所有账号均不可用，快速失败 request=%s accounts=%s", request_name, account_count)
+            raise RuntimeError(
+                "所有 GLM 账号均不可用（token 失效且无法刷新）。"
+                "请检查账号配置或稍后重试。"
+            )
+
         start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_current_account_index()
         last_exc: Exception | None = None
 

@@ -671,7 +671,8 @@ class GLM2APIServer:
                     self._write_json(HTTPStatus.OK, result)
                 except QueueTimeoutError as exc:
                     logger.warning("GLM 队列等待超时 error=%s", exc)
-                    self._write_json(
+                    # v47: 加 Retry-After header，让客户端知道等多久
+                    self._write_json_with_retry(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         make_error(
                             f"Service temporarily unavailable: {exc}",
@@ -679,6 +680,7 @@ class GLM2APIServer:
                             code="queue_timeout",
                             request_id=gen_request_id(),
                         ),
+                        retry_after=30,
                     )
                 except UpstreamAPIError as exc:
                     logger.warning("上游 GLM 返回错误 status=%s error=%s", exc.status_code, exc)
@@ -692,6 +694,24 @@ class GLM2APIServer:
                             request_id=gen_request_id(),
                         ),
                     )
+                except RuntimeError as exc:
+                    # v47 P0: 所有账号不可用时立即返回 503 + Retry-After
+                    # 之前等 10-30 分钟 timeout 才返回，现在立即返回
+                    exc_str = str(exc)
+                    if "不可用" in exc_str or "账号" in exc_str:
+                        logger.error("账号池不可用，快速返回 503 error=%s", exc)
+                        self._write_json_with_retry(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            make_error(
+                                f"All accounts unavailable: {exc}",
+                                error_type=ERROR_SERVER,
+                                code="no_available_account",
+                                request_id=gen_request_id(),
+                            ),
+                            retry_after=60,
+                        )
+                    else:
+                        raise  # 其他 RuntimeError 继续抛出
                 except ValueError as exc:
                     logger.warning("请求参数错误 path=%s error=%s", self.path, exc)
                     self._write_json(
@@ -707,17 +727,35 @@ class GLM2APIServer:
                     logger.warning("客户端连接提前断开 path=%s error=%s", self.path, exc)
                     self._admin_error = f"client_disconnected: {exc}"
                 except Exception as exc:
-                    logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
-                    self._admin_error = str(exc)
-                    self._safe_write_json(
-                        HTTPStatus.BAD_GATEWAY,
-                        make_error(
-                            f"Upstream error: {exc}",
-                            error_type=ERROR_UPSTREAM,
-                            code=exc.__class__.__name__.lower(),
-                            request_id=gen_request_id(),
-                        ),
-                    )
+                    exc_str = str(exc)
+                    self._admin_error = exc_str
+                    # v47 P0: 账号不可用时返回 503 + Retry-After（不是 502）
+                    if "不可用" in exc_str or "账号" in exc_str or "no_available" in exc_str:
+                        logger.error("账号池不可用，快速返回 503 error=%s", exc)
+                        try:
+                            self._write_json_with_retry(
+                                HTTPStatus.SERVICE_UNAVAILABLE,
+                                make_error(
+                                    f"All accounts unavailable: {exc}",
+                                    error_type=ERROR_SERVER,
+                                    code="no_available_account",
+                                    request_id=gen_request_id(),
+                                ),
+                                retry_after=60,
+                            )
+                        except _CLIENT_DISCONNECTED:
+                            pass
+                    else:
+                        logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
+                        self._safe_write_json(
+                            HTTPStatus.BAD_GATEWAY,
+                            make_error(
+                                f"Upstream error: {exc}",
+                                error_type=ERROR_UPSTREAM,
+                                code=exc.__class__.__name__.lower(),
+                                request_id=gen_request_id(),
+                            ),
+                        )
                 finally:
                     self._admin_finalize_request()
 
@@ -1728,6 +1766,17 @@ class GLM2APIServer:
                 self._send_common_headers()
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _write_json_with_retry(self, status: HTTPStatus, payload: dict[str, object], retry_after: int = 30) -> None:
+                """v47: 发送带 Retry-After header 的 JSON 响应（用于 503 限流场景）。"""
+                body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self._send_common_headers()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Retry-After", str(retry_after))
                 self.end_headers()
                 self.wfile.write(body)
 
