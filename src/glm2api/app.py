@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import errno
+import os
 import signal
+import threading
 import traceback
 
 from .config import AppConfig, ConfigError, load_config
@@ -37,7 +39,47 @@ class Application:
         except Exception as exc:
             raise StartupError(f"初始化 HTTP 服务失败: {exc}") from exc
         self._stopping = False
+        self._bypass_proxy_thread: threading.Thread | None = None
+        self._bypass_proxy_server = None
         self._install_signal_handlers()
+
+    def _maybe_start_bypass_proxy(self) -> None:
+        """v37: 内嵌 WAF bypass proxy（用户不需要手动启动外部 proxy）。
+
+        环境变量 WAF_BYPASS_PORT 设置后，glm2api 主进程额外监听一个端口，
+        该端口接收的请求会先替换反引号（绕过 WAF），然后内部转发到主端口。
+
+        用法：
+          export WAF_BYPASS_PORT=8001
+          # glm2api 启动后，Claude Code 连到 bypass 端口：
+          export ANTHROPIC_BASE_URL=http://127.0.0.1:8001
+        """
+        bypass_port_str = os.environ.get("WAF_BYPASS_PORT", "").strip()
+        if not bypass_port_str:
+            return
+        try:
+            bypass_port = int(bypass_port_str)
+        except ValueError:
+            self.logger.warning("WAF_BYPASS_PORT 无效: %s", bypass_port_str)
+            return
+        from .waf_bypass import EmbeddedBypassProxy
+        try:
+            self._bypass_proxy_server = EmbeddedBypassProxy(
+                listen_host=self.config.host,
+                listen_port=bypass_port,
+                target_host="127.0.0.1",
+                target_port=self.config.port,
+                logger=get_logger("glm2api.waf_bypass"),
+            )
+            self._bypass_proxy_thread = threading.Thread(
+                target=self._bypass_proxy_server.serve_forever,
+                daemon=True, name="waf-bypass-proxy")
+            self._bypass_proxy_thread.start()
+            self.logger.info(
+                "WAF bypass proxy 已启动: http://%s:%s → http://127.0.0.1:%s",
+                self.config.host, bypass_port, self.config.port)
+        except Exception as exc:
+            self.logger.warning("WAF bypass proxy 启动失败 port=%s error=%s", bypass_port, exc)
 
     def run(self) -> None:
         if self.config.env_file_created:
@@ -51,6 +93,8 @@ class Application:
             self.config.debug_dump_all,
             ",".join(self.config.exposed_models),
         )
+        # v37: 启动内嵌 WAF bypass proxy（如果配置了 WAF_BYPASS_PORT）
+        self._maybe_start_bypass_proxy()
         try:
             self.server.serve_forever()
         except KeyboardInterrupt:
@@ -69,6 +113,12 @@ class Application:
             return
         self._stopping = True
         self.logger.info("停止 HTTP 服务并释放监听端口...")
+        # 停止 bypass proxy
+        if self._bypass_proxy_server:
+            try:
+                self._bypass_proxy_server.shutdown()
+            except Exception as exc:
+                self.logger.warning("关闭 bypass proxy 时出现异常 error=%s", exc)
         try:
             self.server.shutdown()
         except Exception as exc:

@@ -179,6 +179,12 @@ class _MockSSEServer:
             conn.sendall(end_chunk)
             self.chunks_sent.append(end_chunk)
 
+            # 等待客户端读取完再关闭
+            time.sleep(1.0)
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
             conn.close()
         except Exception:
             pass
