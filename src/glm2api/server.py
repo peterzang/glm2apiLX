@@ -159,6 +159,37 @@ def _apply_json_response_format_stripping(result: dict, payload: dict) -> dict:
     return result
 
 
+# v35: WAF bypass — 递归还原请求体中的 ˋ (U+02CB) → ` (U+0060)
+_BACKTICK_SAFE_CHAR = '\u02cb'  # ˋ MODIFIER LETTER GRAVE ACCENT
+_BACKTICK_REAL_CHAR = '\x60'    # ` GRAVE ACCENT
+
+
+def _restore_backticks_in_payload(obj: object) -> None:
+    """递归遍历请求体 dict/list/str，把 ˋ (U+02CB) 还原成 ` (U+0060)。
+
+    配合 scripts/waf_bypass_proxy.py 使用：
+    - 代理脚本把 ` 替换成 ˋ 绕过 Cloudflare WAF
+    - 本函数在请求到达业务逻辑之前还原
+
+    对没用 bypass 代理的请求无副作用（正常 prompt 不含 ˋ 字符）。
+    """
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            val = obj[key]
+            if isinstance(val, str):
+                if _BACKTICK_SAFE_CHAR in val:
+                    obj[key] = val.replace(_BACKTICK_SAFE_CHAR, _BACKTICK_REAL_CHAR)
+            elif isinstance(val, (dict, list)):
+                _restore_backticks_in_payload(val)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, str):
+                if _BACKTICK_SAFE_CHAR in item:
+                    obj[i] = item.replace(_BACKTICK_SAFE_CHAR, _BACKTICK_REAL_CHAR)
+            elif isinstance(item, (dict, list)):
+                _restore_backticks_in_payload(item)
+
+
 class GLM2APIServer:
     def __init__(self, config: AppConfig, glm_client: GLMWebClient, logger: Logger) -> None:
         self.config = config
@@ -437,6 +468,10 @@ class GLM2APIServer:
                         )
                         return
                     debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
+                    # v35: WAF bypass — 还原 bypass 代理替换的反引号
+                    # 在所有协议处理之前，统一还原请求体中的 ˋ (U+02CB) → ` (U+0060)
+                    # 这样 Anthropic/OpenAI Chat/Responses 三种协议都能正确还原
+                    _restore_backticks_in_payload(payload)
                     # Record model + stream for admin metrics (best-effort)
                     if isinstance(payload.get("model"), str):
                         self._admin_model = str(payload["model"])

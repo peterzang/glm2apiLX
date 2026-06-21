@@ -48,6 +48,33 @@ def _strip_attribution_block(system_text: str) -> str:
     return cleaned
 
 
+# v35: WAF bypass 字符还原
+# Cloudflare WAF 的 Command Injection 规则会拦截含反引号 ` (U+0060) 的 prompt，
+# 特别是 `python -m`、`perl -e` 等模式。Claude Code 的 prompt 大量使用反引号
+# 包裹命令（markdown code span 风格），导致请求被 WAF 拦截返回 403。
+#
+# 解决方案：本地 bypass 代理脚本把 ` (U+0060) 替换成 ˋ (U+02CB，
+# MODIFIER LETTER GRAVE ACCENT)，视觉几乎一样但 WAF 不拦截。
+# glm2api 收到请求后在应用层把 ˋ 还原成 `，GLM 收到正确的原始 prompt。
+_BACKTICK = '\x60'        # U+0060 GRAVE ACCENT（WAF 拦截目标）
+_BACKTICK_SAFE = '\u02cb' # U+02CB MODIFIER LETTER GRAVE ACCENT（WAF 不拦截）
+
+
+def _restore_backticks(text: str) -> str:
+    """把 WAF bypass 代理替换的安全字符 ˋ (U+02CB) 还原成反引号 ` (U+0060)。
+
+    配合 scripts/waf_bypass_proxy.py 使用：
+    - 代理脚本：` → ˋ（绕过 WAF）
+    - 本函数：ˋ → `（还原给 GLM）
+
+    如果用户没用 bypass 代理（直接连 glm2api），此函数无副作用
+    （正常 prompt 不含 ˋ 字符）。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    return text.replace(_BACKTICK_SAFE, _BACKTICK)
+
+
 def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
     """Convert an Anthropic Messages request body to OpenAI chat/completions."""
     messages: list[dict[str, object]] = []
@@ -57,7 +84,9 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
     if system:
         if isinstance(system, str):
             # v39 P0-1: 剥掉 Claude Code attribution block
+            # v35: 还原 WAF bypass 替换的反引号
             stripped = _strip_attribution_block(system)
+            stripped = _restore_backticks(stripped)
             if stripped:
                 messages.append({"role": "system", "content": stripped})
         elif isinstance(system, list):
@@ -68,6 +97,8 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
                     # v39 P0-1: 第一个 block 通常是 attribution，剥掉它
                     if idx == 0:
                         text = _strip_attribution_block(text)
+                    # v35: 还原 WAF bypass 替换的反引号
+                    text = _restore_backticks(text)
                     if text:
                         text_parts.append(text)
             if text_parts:
@@ -81,7 +112,8 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
         content = msg.get("content")
 
         if isinstance(content, str):
-            messages.append({"role": role, "content": content})
+            # v35: 还原 WAF bypass 替换的反引号
+            messages.append({"role": role, "content": _restore_backticks(content)})
             continue
 
         if not isinstance(content, list):
@@ -99,12 +131,13 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
             block_type = block.get("type")
 
             if block_type == "text":
-                openai_content_parts.append({"type": "text", "text": block.get("text", "")})
+                # v35: 还原 WAF bypass 替换的反引号
+                openai_content_parts.append({"type": "text", "text": _restore_backticks(str(block.get("text", "")))})
 
             elif block_type == "thinking":
                 thinking_text = block.get("thinking", "")
                 if thinking_text:
-                    openai_content_parts.append({"type": "text", "text": str(thinking_text)})
+                    openai_content_parts.append({"type": "text", "text": _restore_backticks(str(thinking_text))})
 
             elif block_type == "image":
                 source = block.get("source", {})
