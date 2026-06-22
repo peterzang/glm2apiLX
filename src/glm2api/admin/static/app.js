@@ -617,6 +617,19 @@ async function refreshDashboard() {
   // 2) 如果数据没变，跳过重渲染（避免闪烁 + 减少 CPU 占用）
   if (!isFirstRender && !dataChanged) return;
 
+  // === 变量定义（v44 修复：Bento Grid 改造时遗漏的变量定义）===
+  const apiTotal = all.api_total ?? 0;
+  const apiSuccess = all.api_success ?? 0;
+  const apiClientErr = all.api_client_errors ?? 0;
+  const apiServerErr = all.api_server_errors ?? 0;
+  const modelsTotal = all.models_total ?? 0;
+  const modelsSuccess = all.models_success ?? 0;
+  const otherTotal = all.other_total ?? 0;
+  const r5Api = r5.api_total ?? 0;
+  const r5Models = r5.models_total ?? 0;
+  const r5Other = r5.other_total ?? 0;
+  const r5Health = r5.health_total ?? 0;
+
   // === v43: Bento Grid 布局（核心 2x2 + 次要 1x1 + 趋势 2x1）===
   const apiSuccessRate = r5.api_success_rate ?? 0;
   const apiSRColor = apiSuccessRate >= 95 ? 'var(--success)' : apiSuccessRate >= 80 ? 'var(--warning)' : 'var(--error)';
