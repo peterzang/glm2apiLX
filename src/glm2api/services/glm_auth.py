@@ -119,6 +119,32 @@ class GLMAccessTokenManager:
             any(a.is_guest for a in self._accounts),
         )
 
+    def prefetch_initial_tokens(self, count: int = 3) -> None:
+        """v47: 启动时预取前 N 个账号的 token，避免首个请求卡在 token 刷新。
+
+        之前：服务启动后第一个请求需要同步获取游客 token（可能 10s+），
+        如果多个请求同时到达，都会排队等 token 刷新。
+
+        现在：启动时后台预取前 3 个账号的 token，首个请求直接命中缓存。
+        预取失败不阻塞启动（failover 逻辑会在请求时重试）。
+        """
+        import threading
+        count = min(count, len(self._accounts))
+
+        def _prefetch_worker(idx: int) -> None:
+            try:
+                token = self._get_access_token_for_index(idx)
+                self.logger.info("启动预取 token 成功 account=%s", idx)
+            except Exception as exc:
+                self.logger.warning("启动预取 token 失败 account=%s error=%s", idx, exc)
+
+        threads = []
+        for idx in range(count):
+            t = threading.Thread(target=_prefetch_worker, args=(idx,), daemon=True)
+            t.start()
+            threads.append(t)
+        self.logger.info("启动预取 token count=%s/%s", count, len(self._accounts))
+
     def get_browser_headers(self, app_fr: str = "browser_extension") -> dict[str, str]:
         return {
             "Accept": "application/json, text/plain, */*" if app_fr == "default" else "text/event-stream",
@@ -622,6 +648,13 @@ class GLMAccessTokenManager:
         )
 
     def _fetch_guest_access_token(self, account_index: int) -> AccessToken:
+        """获取游客 access_token。
+
+        v47 修复：使用独立的短超时（10秒）而非 request_timeout（120秒）。
+        之前所有 100 个账号都需要刷新时，串行 × 120s = 3.3 小时。
+        现在 100 × 10s = 1000s（16 分钟），加上 v39 的快速失败检测，
+        大部分情况下账号池能在几秒内恢复。
+        """
         account = self._accounts[account_index]
         timestamp, nonce, sign = build_sign()
         request_id = self.next_request_id_for_account(account_index)
@@ -643,13 +676,21 @@ class GLMAccessTokenManager:
         )
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求头 account={account_index}", dict(request.header_items()))
         debug_dump(self.logger, self.config.debug_dump_all, f"GLM 游客 token 请求体 account={account_index}", b"")
-        with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
-            payload = self.read_json_response(response)
+        # v47: 游客 token 刷新用 10 秒超时（不是 120 秒）
+        # 如果智谱服务器响应慢，快速失败让 failover 逻辑切到下一个账号
+        guest_token_timeout = min(10, self.config.request_timeout)
+        try:
+            with urllib.request.urlopen(request, timeout=guest_token_timeout) as response:
+                payload = self.read_json_response(response)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"获取游客 token 网络超时 account={account_index} timeout={guest_token_timeout}s: {exc}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"获取游客 token 超时 account={account_index} timeout={guest_token_timeout}s: {exc}") from exc
         code = payload.get("code", payload.get("status"))
         result = payload.get("result") or {}
         access_token = result.get("access_token")
         refresh_token = result.get("refresh_token")
-        if response.status != 200 or code not in {0, None} or not access_token or not refresh_token:
+        if code not in {0, None} or not access_token or not refresh_token:
             raise RuntimeError(f"获取 GLM 游客 token 失败: {payload}")
         account.refresh_token = str(refresh_token)
         self.logger.info("已获取新的 GLM 游客 refresh_token index=%s", account_index)

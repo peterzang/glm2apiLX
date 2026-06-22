@@ -28,6 +28,11 @@ class Application:
             len(config.exposed_models),
         )
         self.client = GLMWebClient(config=config, logger=get_logger("glm2api.glm"))
+        # v47: 启动时预取前 3 个账号的 token，避免首个请求卡在 token 刷新
+        try:
+            self.client.auth.prefetch_initial_tokens(count=3)
+        except Exception as exc:
+            self.logger.warning("启动预取 token 异常（不影响启动）: %s", exc)
         try:
             self.server = GLM2APIServer(
                 config=config,
