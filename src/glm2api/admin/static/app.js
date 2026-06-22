@@ -630,55 +630,92 @@ async function refreshDashboard() {
   const r5Other = r5.other_total ?? 0;
   const r5Health = r5.health_total ?? 0;
 
-  // === v43: Bento Grid 布局（核心 2x2 + 次要 1x1 + 趋势 2x1）===
+  // === v47: 全新仪表盘 — 圆形核心仪表 + 流体数据栏 ===
   const apiSuccessRate = r5.api_success_rate ?? 0;
+  const sr = r5.success_rate || 0;
+  const srColor = sr >= 95 ? 'var(--success)' : sr >= 80 ? 'var(--warning)' : 'var(--error)';
   const apiSRColor = apiSuccessRate >= 95 ? 'var(--success)' : apiSuccessRate >= 80 ? 'var(--warning)' : 'var(--error)';
-  const bentoKpi = `
-    <div class="bento-grid">
-      <!-- 核心 2x2: 成功率 + NeuralPulse 120px 视觉焦点 -->
-      <div class="bento-hero kpi-card ${successRateColor}">
-        <div style="display:grid;grid-template-columns:1fr 140px;gap:24px;align-items:center;height:100%;">
-          <div>
-            <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;margin-bottom:8px;">5 分钟成功率</div>
-            <div class="kpi-value" data-metric="success-rate" style="font-size:48px;font-weight:700;line-height:1.0;">${(r5.success_rate || 0).toFixed(1)}%</div>
-            <div class="kpi-sub" style="margin-top:8px;font-size:11px;opacity:0.5;">${r5.success}/${r5.total} 请求</div>
-            <div class="kpi-sub" style="margin-top:4px;font-size:11px;opacity:0.5;">API 成功率 <strong style="color:${apiSRColor};opacity:1;">${apiSuccessRate.toFixed(1)}%</strong></div>
-          </div>
-          <canvas class="neural-pulse-canvas" id="bento-neural-pulse" width="120" height="120"></canvas>
+  // 圆环 SVG 参数
+  const gaugeR = 72, gaugeC = 2 * Math.PI * gaugeR;
+  const gaugeOffset = gaugeC * (1 - sr / 100);
+
+  const dashHero = `
+    <div class="dash-hero">
+      <!-- 左侧统计 -->
+      <div class="dash-hero-left">
+        <div class="dash-stat">
+          <div class="dash-stat-label">API 请求</div>
+          <div class="dash-stat-value" style="color:var(--primary-glow);">${apiTotal.toLocaleString()}</div>
+          <div class="dash-stat-sub">成功 ${apiSuccess} · 4xx ${apiClientErr} · 5xx ${apiServerErr}</div>
+        </div>
+        <div class="dash-stat">
+          <div class="dash-stat-label">当前 RPM</div>
+          <div class="dash-stat-value">${rpm}</div>
+          <div class="dash-stat-sub">30m 均值 ${avgRpm} · 峰值 ${peakRpm}</div>
         </div>
       </div>
-      <!-- 次要 1x1 -->
-      <div class="bento-small kpi-card info">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">API 请求</div>
-        <div class="kpi-value" data-metric="api-requests" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${(apiTotal).toLocaleString()}</div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">成功 ${apiSuccess} · 4xx ${apiClientErr} · 5xx ${apiServerErr}</div>
+      <!-- 中心圆环仪表 + NeuralPulse -->
+      <div class="dash-gauge">
+        <svg viewBox="0 0 180 180">
+          <circle cx="90" cy="90" r="${gaugeR}" fill="none" stroke="var(--glass-border)" stroke-width="6"/>
+          <circle cx="90" cy="90" r="${gaugeR}" fill="none" stroke="${srColor}" stroke-width="6"
+            stroke-dasharray="${gaugeC}" stroke-dashoffset="${gaugeOffset}" stroke-linecap="round"
+            style="transition:stroke-dashoffset 0.8s ease;"/>
+        </svg>
+        <div class="dash-gauge-center">
+          <div class="dash-gauge-value" data-metric="success-rate" style="color:${srColor};">${sr.toFixed(1)}%</div>
+          <div class="dash-gauge-label">5 分钟成功率</div>
+        </div>
+        <div class="dash-gauge-pulse">
+          <canvas class="neural-pulse-canvas" id="bento-neural-pulse" width="120" height="120" style="width:48px;height:48px;"></canvas>
+        </div>
       </div>
-      <div class="bento-small kpi-card info">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">当前 RPM</div>
-        <div class="kpi-value" data-metric="rpm" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${rpm}</div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">30m 平均 ${avgRpm} · 峰值 ${peakRpm}</div>
+      <!-- 右侧统计 -->
+      <div class="dash-hero-right">
+        <div class="dash-stat">
+          <div class="dash-stat-label">Models 请求</div>
+          <div class="dash-stat-value" style="color:var(--purple);">${modelsTotal.toLocaleString()}</div>
+          <div class="dash-stat-sub">成功 ${modelsSuccess} · 近 5 分钟 ${r5Models}</div>
+        </div>
+        <div class="dash-stat">
+          <div class="dash-stat-label">P95 延迟</div>
+          <div class="dash-stat-value" style="color:${r5.p95_ms > 5000 ? 'var(--error)' : r5.p95_ms > 2000 ? 'var(--warning)' : 'var(--success)'};">${r5.p95_ms}ms</div>
+          <div class="dash-stat-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
+        </div>
       </div>
-      <!-- 次要 1x1 -->
-      <div class="bento-small kpi-card" style="border-left:3px solid var(--purple);">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">Models 请求</div>
-        <div class="kpi-value" data-metric="models-requests" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${(modelsTotal).toLocaleString()}</div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">成功 ${modelsSuccess} · 近 5 分钟 ${r5Models}</div>
+    </div>
+  `;
+
+  // 流体数据栏（无方框，用分隔线）
+  const maxRpm = Math.max(peakRpm, 1);
+  const maxTokens = Math.max(tokenTotals.total, 1);
+  const maxAccounts = Math.max(accountsTotal, 1);
+  const maxUptime = Math.max(d.uptime_seconds, 1);
+  const dashFlow = `
+    <div class="dash-flow">
+      <div class="dash-flow-item">
+        <div class="dash-flow-label">API 成功率</div>
+        <div class="dash-flow-value" style="color:${apiSRColor};">${apiSuccessRate.toFixed(1)}%</div>
+        <div class="dash-flow-sub">近 5 分钟 ${r5Api} 次调用</div>
+        <div class="dash-flow-bar"><div class="dash-flow-bar-fill" style="width:${apiSuccessRate}%;background:${apiSRColor};"></div></div>
       </div>
-      <div class="bento-small kpi-card">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">P95 延迟</div>
-        <div class="kpi-value" data-metric="p95" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${r5.p95_ms}ms</div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
+      <div class="dash-flow-item">
+        <div class="dash-flow-label">活跃账号</div>
+        <div class="dash-flow-value" style="color:var(--success);">${accountsActive}<span style="font-size:13px;opacity:0.5;"> / ${accountsTotal}</span></div>
+        <div class="dash-flow-sub">已使用的游客/用户账号</div>
+        <div class="dash-flow-bar"><div class="dash-flow-bar-fill" style="width:${(accountsActive/maxAccounts)*100}%;background:var(--success);"></div></div>
       </div>
-      <!-- 趋势 2x1 -->
-      <div class="bento-wide kpi-card success">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">活跃账号</div>
-        <div class="kpi-value" data-metric="active-accounts" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">已使用过的账号 · Token ${fmtCompactNum(tokenTotals.total)}（P ${fmtCompactNum(tokenTotals.prompt)} · C ${fmtCompactNum(tokenTotals.completion)}）</div>
+      <div class="dash-flow-item">
+        <div class="dash-flow-label">Token 累计</div>
+        <div class="dash-flow-value" style="color:var(--purple);">${fmtCompactNum(tokenTotals.total)}</div>
+        <div class="dash-flow-sub">P ${fmtCompactNum(tokenTotals.prompt)} · C ${fmtCompactNum(tokenTotals.completion)} · 30m ${fmtCompactNum(token30m.total)}</div>
+        <div class="dash-flow-bar"><div class="dash-flow-bar-fill" style="width:${Math.min(100,(token30m.total/maxTokens)*100)}%;background:var(--purple);"></div></div>
       </div>
-      <div class="bento-wide kpi-card warning">
-        <div class="kpi-label" style="font-size:13px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;opacity:0.7;">运行时长</div>
-        <div class="kpi-value" data-metric="uptime" style="font-size:28px;font-weight:700;line-height:1.1;margin-top:4px;">${fmtDuration(d.uptime_seconds)}</div>
-        <div class="kpi-sub" style="font-size:11px;opacity:0.5;">自 ${fmtTime(d.now - d.uptime_seconds)} · 其他 ${otherTotal}（含健康 ${protoBreakdown.health || 0}）· 累计 ${all.total}</div>
+      <div class="dash-flow-item">
+        <div class="dash-flow-label">运行时长</div>
+        <div class="dash-flow-value" style="color:var(--warning);">${fmtDuration(d.uptime_seconds)}</div>
+        <div class="dash-flow-sub">自 ${fmtTime(d.now - d.uptime_seconds)} · 累计 ${all.total} 请求</div>
+        <div class="dash-flow-bar"><div class="dash-flow-bar-fill" style="width:${Math.min(100,(d.uptime_seconds/86400)*100)}%;background:var(--warning);"></div></div>
       </div>
     </div>
   `;
@@ -711,15 +748,15 @@ async function refreshDashboard() {
     </div>
   `;
 
-  document.getElementById('view-dashboard').innerHTML = bentoKpi + mainArea + bottomCards;
+  document.getElementById('view-dashboard').innerHTML = dashHero + dashFlow + mainArea + bottomCards;
 
-  // v43: 初始化 Bento Hero NeuralPulse 组件
+  // v47: 初始化 NeuralPulse 组件（圆环底部，48px 精致版）
   const pulseCanvas = document.getElementById('bento-neural-pulse');
   if (pulseCanvas) {
     const np = new NeuralPulse(pulseCanvas, {
       active: rpm > 0 || r5Api > 0,
       color: getComputedStyle(document.documentElement).getPropertyValue('--page-accent-glow').trim() || '#818cf8',
-      size: 120,  /* v46: 48→120 视觉焦点 */
+      size: 120,  /* canvas 内部分辨率 120，CSS 缩放到 48px */
     });
     // 当有 API 请求时触发脉冲
     if (r5Api > 0) {

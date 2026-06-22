@@ -1503,3 +1503,223 @@ input[type="range"].probe-input::-webkit-slider-thumb {
 [data-page="config"]    { --page-accent: #3b82f6; --page-accent-glow: #60a5fa; }
 [data-page="apikeys"]   { --page-accent: #8b5cf6; --page-accent-glow: #a78bfa; }
 [data-page="system"]    { --page-accent: #f43f5e; --page-accent-glow: #fb7185; }
+
+/* ============================================================
+ * v47: 全新仪表盘 — 圆形核心仪表 + 流体数据栏
+ * 告别方框布局，用圆弧 + 流体 + NeuralPulse 焦点
+ * ============================================================ */
+
+/* === 仪表盘顶部：圆形成功率仪表 === */
+.dash-hero {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 32px;
+  align-items: center;
+  padding: 36px 32px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 28px;
+  margin-bottom: 28px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--glass-shadow);
+}
+/* 顶部高光 */
+.dash-hero::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 10%; right: 10%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+}
+/* 左侧统计 */
+.dash-hero-left {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  text-align: right;
+}
+.dash-hero-right {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.dash-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dash-stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  opacity: 0.5;
+}
+.dash-stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  line-height: 1.1;
+}
+.dash-stat-sub {
+  font-size: 10px;
+  opacity: 0.4;
+}
+
+/* 中心圆环仪表 */
+.dash-gauge {
+  position: relative;
+  width: 180px;
+  height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dash-gauge svg {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+.dash-gauge-center {
+  position: relative;
+  z-index: 1;
+  text-align: center;
+}
+.dash-gauge-value {
+  font-size: 36px;
+  font-weight: 800;
+  line-height: 1;
+  font-feature-settings: "tnum";
+}
+.dash-gauge-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  opacity: 0.5;
+  margin-top: 4px;
+}
+.dash-gauge-pulse {
+  position: absolute;
+  bottom: -20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+}
+
+/* === 流体数据栏 === */
+.dash-flow {
+  display: flex;
+  gap: 0;
+  margin-bottom: 28px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
+  overflow: hidden;
+}
+.dash-flow-item {
+  flex: 1;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  transition: background 0.2s ease;
+}
+.dash-flow-item:hover {
+  background: rgba(255,255,255,0.03);
+}
+.dash-flow-item:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  right: 0; top: 20%; bottom: 20%;
+  width: 1px;
+  background: var(--glass-border);
+}
+.dash-flow-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  opacity: 0.5;
+}
+.dash-flow-value {
+  font-size: 24px;
+  font-weight: 700;
+  font-feature-settings: "tnum";
+  line-height: 1.1;
+}
+.dash-flow-sub {
+  font-size: 10px;
+  opacity: 0.4;
+}
+.dash-flow-bar {
+  height: 3px;
+  border-radius: 2px;
+  margin-top: 6px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+.dash-flow-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+/* === 图表区域圆角容器 === */
+.dash-charts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-bottom: 28px;
+}
+.dash-chart-panel {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
+  padding: 24px;
+  box-shadow: var(--glass-shadow);
+}
+.dash-chart-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 900px) {
+  .dash-hero {
+    grid-template-columns: 1fr;
+    gap: 20px;
+    text-align: center;
+  }
+  .dash-hero-left, .dash-hero-right {
+    text-align: center;
+    flex-direction: row;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 20px;
+  }
+  .dash-flow {
+    flex-direction: column;
+  }
+  .dash-flow-item:not(:last-child)::after {
+    display: none;
+  }
+  .dash-flow-item:not(:last-child) {
+    border-bottom: 1px solid var(--glass-border);
+  }
+  .dash-charts {
+    grid-template-columns: 1fr;
+  }
+}
