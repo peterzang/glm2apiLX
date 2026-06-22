@@ -4,8 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>GLM2API 管理面板</title>
-<link rel="icon" href="/admin/static/favicon.svg?v=50" type="image/svg+xml" />
-<link rel="stylesheet" href="/admin/static/style.css?v=50" />
+<link rel="icon" href="/admin/static/favicon.svg?v=51" type="image/svg+xml" />
+<link rel="stylesheet" href="/admin/static/style.css?v=51" />
 </head>
 <body>
 
@@ -14,67 +14,6 @@
 
 <!-- v43: Aurora 极光背景（毛玻璃下层 3 色点 + 20s 缓慢位移）-->
 <div class="neural-aurora"></div>
-
-<!-- v49: 萌系电子宠物（根据仪表盘数据变化情绪）-->
-<div class="pet-container" id="pet-mascot" style="display:none;">
-  <div class="pet-bubble" id="pet-bubble">我在守护你的 API~</div>
-  <svg viewBox="0 0 80 100" xmlns="http://www.w3.org/2000/svg">
-    <g class="pet-body" id="pet-body-group">
-      <!-- 双马尾（左）-->
-      <path d="M18 20 Q10 28 12 42 Q14 48 18 44 Q16 34 22 26 Z" fill="#7c3aed" opacity="0.85"/>
-      <!-- 双马尾（右）-->
-      <path d="M62 20 Q70 28 68 42 Q66 48 62 44 Q64 34 58 26 Z" fill="#7c3aed" opacity="0.85"/>
-      <!-- 蝴蝶结（左）-->
-      <path d="M16 18 L12 14 L12 22 Z M16 18 L20 14 L20 22 Z" fill="#ec4899"/>
-      <circle cx="16" cy="18" r="2" fill="#f472b6"/>
-      <!-- 蝴蝶结（右）-->
-      <path d="M64 18 L60 14 L60 22 Z M64 18 L68 14 L68 22 Z" fill="#ec4899"/>
-      <circle cx="64" cy="18" r="2" fill="#f472b6"/>
-      <!-- 头部 -->
-      <circle cx="40" cy="26" r="16" fill="#fde68a"/>
-      <!-- 刘海 -->
-      <path d="M26 22 Q28 14 40 12 Q52 14 54 22 Q48 18 44 20 Q40 16 36 20 Q32 18 26 22 Z" fill="#7c3aed"/>
-      <!-- 脸颊腮红 -->
-      <ellipse cx="28" cy="30" rx="3" ry="2" fill="#fca5a5" opacity="0.6"/>
-      <ellipse cx="52" cy="30" rx="3" ry="2" fill="#fca5a5" opacity="0.6"/>
-      <!-- 左眼（大眼睛）-->
-      <ellipse class="pet-eye" cx="33" cy="26" rx="3" ry="4.5" fill="#1e1b4b"/>
-      <circle cx="34" cy="24.5" r="1.5" fill="#fff"/>
-      <circle cx="32" cy="28" r="0.6" fill="#fff" opacity="0.6"/>
-      <!-- 右眼 -->
-      <ellipse class="pet-eye" cx="47" cy="26" rx="3" ry="4.5" fill="#1e1b4b"/>
-      <circle cx="48" cy="24.5" r="1.5" fill="#fff"/>
-      <circle cx="46" cy="28" r="0.6" fill="#fff" opacity="0.6"/>
-      <!-- 嘴巴（动态变化）-->
-      <path id="pet-mouth" d="M36 33 Q40 37 44 33" fill="none" stroke="#1e1b4b" stroke-width="1.8" stroke-linecap="round"/>
-      <!-- 眼泪（难过时显示）-->
-      <ellipse class="pet-tear" cx="33" cy="33" rx="1.5" ry="3" fill="#60a5fa" opacity="0"/>
-      <ellipse class="pet-tear" cx="47" cy="33" rx="1.5" ry="3" fill="#60a5fa" opacity="0"/>
-      <!-- 怒气符号（生气时显示）-->
-      <text class="pet-angry" x="56" y="16" font-size="14" fill="#ef4444" opacity="0">💢</text>
-      <!-- 身体（小裙子）-->
-      <path d="M30 40 L50 40 L54 58 Q40 62 26 58 Z" fill="#8b5cf6"/>
-      <!-- 裙子花纹 -->
-      <path d="M30 48 L50 48" stroke="#a78bfa" stroke-width="1" stroke-dasharray="2 2"/>
-      <!-- 裙摆波浪 -->
-      <path d="M26 58 Q29 62 32 58 Q35 62 38 58 Q41 62 44 58 Q47 62 50 58 Q53 62 54 58" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
-      <!-- 小手（左）-->
-      <ellipse class="pet-hand-left" cx="24" cy="46" rx="3.5" ry="4" fill="#fde68a"/>
-      <!-- 小手（右）-->
-      <ellipse class="pet-hand-right" cx="56" cy="46" rx="3.5" ry="4" fill="#fde68a"/>
-      <!-- 腿（左）-->
-      <rect x="33" y="58" width="5" height="8" rx="2" fill="#fde68a"/>
-      <!-- 腿（右）-->
-      <rect x="42" y="58" width="5" height="8" rx="2" fill="#fde68a"/>
-      <!-- 鞋子（左）-->
-      <ellipse cx="35.5" cy="68" rx="4" ry="2.5" fill="#7c3aed"/>
-      <!-- 鞋子（右）-->
-      <ellipse cx="44.5" cy="68" rx="4" ry="2.5" fill="#7c3aed"/>
-      <!-- Z 字（睡觉时显示）-->
-      <text class="pet-zzz" x="58" y="14" font-size="10" fill="var(--text-muted)" font-weight="700" opacity="0">z</text>
-    </g>
-  </svg>
-</div>
 
 <!-- Theme Toggle Button -->
 <button id="theme-toggle" class="theme-toggle" title="切换主题" aria-label="切换亮色/暗色主题">
@@ -206,6 +145,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/admin/static/app.js?v=50"></script>
+<script src="/admin/static/app.js?v=51"></script>
 </body>
 </html>
