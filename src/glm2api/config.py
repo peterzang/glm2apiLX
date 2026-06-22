@@ -36,13 +36,16 @@ BUILTIN_EXPOSED_MODELS = (
     "glm-4-flash-250414",
     "glm-zero-preview",
     "glm-deep-research",
+    "glm-deep-reasoning",  # v52: 深度推理（上游助手 id=676411c38945bbc58a905d31）
     DEFAULT_IMAGE_MODEL_NAME,
 )
 MODEL_VARIANT_EXCLUDED_MODELS = {
     "cogView-4-250304",
     DEFAULT_IMAGE_MODEL_NAME,
 }
+# v52: 深度推理模型映射到上游 assistant_id
 BUILTIN_MODEL_ALIASES = {name: name for name in BUILTIN_EXPOSED_MODELS}
+BUILTIN_MODEL_ALIASES["glm-deep-reasoning"] = "676411c38945bbc58a905d31"
 
 
 class ConfigError(ValueError):
