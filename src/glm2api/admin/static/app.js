@@ -785,23 +785,30 @@ async function refreshDashboard() {
 }
 
 // =========================================================================
-// v49: 萌系电子宠物 — 根据仪表盘数据变化情绪
+// v49: 萌系电子宠物 — 萌系动漫小女孩 + AI 行为系统
+// 七情六欲 + 自由走动 + 爬方框 + 架梯子
 // =========================================================================
 
 let _petMood = 'idle';
+let _petBehaviorTimer = null;
+let _petCurrentTarget = null;
+let _petIsMoving = false;
+
 const _petMessages = {
-  happy:    ['API 全部成功！我好开心~', '一切正常运行中~', '成功率满分！耶~'],
-  sad:      ['呜...有请求失败了...', '5xx 错误让我难过...', '成功率下降了，我会盯着的...'],
-  surprised:['哇！流量突然好大！', 'RM 好高！忙不过来了！', '延迟突然变高了！'],
-  sleeping: ['没有请求，我先睡一会儿~', '安静的时候最适合打盹~', '等有人来调用我再醒~'],
-  thinking: ['让我想想这个请求...', '正在思考中...', '嗯...延迟有点高...'],
-  idle:     ['我在守护你的 API~', '你好呀~', '随时待命！'],
+  happy:    ['API 全部成功！我好开心~♪', '耶~一切正常！', '成功率满分！太棒了~'],
+  sad:      ['呜呜...有请求失败了...', '5xx 错误...好难过...', '不要失败嘛...呜...'],
+  angry:    ['哼！延迟太高了！', '气死了！又报错了！', '不跟你说了！生气！'],
+  surprised:['哇！流量好大！', '好忙好忙！', 'RM 好高啊！'],
+  sleeping: ['呼呼...好安静...', '没人调用我...先睡了~', 'zzZ...等请求来再叫我...'],
+  thinking: ['嗯...让我看看这个数据...', '延迟有点高啊...', '思考中...请稍等...'],
+  climbing: ['爬上去看看！', '我要到上面去看看！', '嘿咻嘿咻~爬上去！'],
+  walking:  ['溜达溜达~', '嗯？这是什么？', '到处看看~'],
+  idle:     ['我在守护你的 API~', '你好呀~♡', '随时待命！'],
 };
 
 function updatePetMood(data) {
   const pet = document.getElementById('pet-mascot');
   if (!pet) return;
-  // v49: 宠物只在仪表盘显示，其他页面隐藏
   if (currentView !== 'dashboard') {
     pet.style.display = 'none';
     return;
@@ -812,55 +819,181 @@ function updatePetMood(data) {
   let mood = 'idle';
   let msg = '';
 
-  if (data.successRate < 80 || data.apiSuccessRate < 80) {
+  if (data.successRate < 50 || data.apiSuccessRate < 50) {
+    mood = 'angry';
+    msg = pick(_petMessages.angry);
+  } else if (data.successRate < 80 || data.apiSuccessRate < 80) {
     mood = 'sad';
-    msg = _petMessages.sad[Math.floor(Math.random() * _petMessages.sad.length)];
+    msg = pick(_petMessages.sad);
   } else if (data.rpm > 20 || data.p95 > 5000) {
     mood = 'surprised';
-    msg = _petMessages.surprised[Math.floor(Math.random() * _petMessages.surprised.length)];
+    msg = pick(_petMessages.surprised);
   } else if (data.p95 > 2000) {
     mood = 'thinking';
-    msg = _petMessages.thinking[Math.floor(Math.random() * _petMessages.thinking.length)];
+    msg = pick(_petMessages.thinking);
   } else if (data.successRate >= 95 && data.hasApiTraffic) {
     mood = 'happy';
-    msg = _petMessages.happy[Math.floor(Math.random() * _petMessages.happy.length)];
+    msg = pick(_petMessages.happy);
   } else if (!data.hasApiTraffic && data.rpm === 0) {
     mood = 'sleeping';
-    msg = _petMessages.sleeping[Math.floor(Math.random() * _petMessages.sleeping.length)];
+    msg = pick(_petMessages.sleeping);
   } else {
     mood = 'idle';
-    msg = _petMessages.idle[Math.floor(Math.random() * _petMessages.idle.length)];
+    msg = pick(_petMessages.idle);
   }
 
-  // 如果情绪没变，不重复更新
-  if (mood === _petMood) return;
-  _petMood = mood;
-
-  // 移除所有情绪 class
-  pet.classList.remove('happy', 'sad', 'surprised', 'sleeping', 'thinking', 'idle');
-  pet.classList.add(mood);
-
-  // 更新嘴巴形状
-  const mouth = document.getElementById('pet-mouth');
-  if (mouth) {
-    if (mood === 'happy') {
-      mouth.setAttribute('d', 'M27 32 Q32 38 37 32');  // 大笑
-    } else if (mood === 'sad') {
-      mouth.setAttribute('d', 'M27 35 Q32 31 37 35');  // 倒过来的嘴
-    } else if (mood === 'surprised') {
-      mouth.setAttribute('d', 'M32 34 m-2 0 a2 2 0 1 0 4 0 a2 2 0 1 0 -4 0');  // O 型嘴
-    } else if (mood === 'sleeping') {
-      mouth.setAttribute('d', 'M29 34 L35 34');  // 一条线
-    } else {
-      mouth.setAttribute('d', 'M28 33 Q32 36 36 33');  // 默认微笑
-    }
+  // 更新情绪（不重复设置）
+  if (mood !== _petMood) {
+    _petMood = mood;
+    pet.classList.remove('happy', 'sad', 'angry', 'surprised', 'sleeping', 'thinking', 'idle', 'walking', 'climbing');
+    pet.classList.add(mood);
+    updatePetFace(mood);
   }
 
-  // 更新气泡文字
+  // 更新气泡
   const bubble = document.getElementById('pet-bubble');
-  if (bubble) {
-    bubble.textContent = msg;
+  if (bubble) bubble.textContent = msg;
+
+  // 启动 AI 行为系统（如果还没启动）
+  if (!_petBehaviorTimer) {
+    startPetBehavior();
   }
+}
+
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function updatePetFace(mood) {
+  const mouth = document.getElementById('pet-mouth');
+  if (!mouth) return;
+  const faces = {
+    happy:    'M35 32 Q40 38 45 32',      // 大笑
+    sad:      'M35 36 Q40 32 45 36',      // 倒嘴（难过）
+    angry:    'M35 35 L38 33 L41 35 L44 33 L45 35',  // 锯齿嘴（生气）
+    surprised:'M40 35 m-2.5 0 a2.5 2.5 0 1 0 5 0 a2.5 2.5 0 1 0 -5 0',  // O 型嘴
+    sleeping: 'M36 34 L44 34',             // 一条线（睡觉）
+    thinking: 'M37 34 Q40 36 43 34',       // 小嘟嘴（思考）
+    walking:  'M36 33 Q40 36 44 33',       // 微笑（走路）
+    climbing: 'M36 33 Q40 35 44 33',       // 小微笑（爬）
+    idle:     'M36 33 Q40 36 44 33',       // 微笑
+  };
+  mouth.setAttribute('d', faces[mood] || faces.idle);
+}
+
+// === AI 行为系统：自由走动 + 爬方框 ===
+
+function startPetBehavior() {
+  if (_petBehaviorTimer) clearInterval(_petBehaviorTimer);
+  _petBehaviorTimer = setInterval(petBehaviorTick, 4000 + Math.random() * 3000);
+  // 立即执行一次
+  setTimeout(petBehaviorTick, 1000);
+}
+
+function petBehaviorTick() {
+  const pet = document.getElementById('pet-mascot');
+  if (!pet || pet.style.display === 'none') return;
+  if (currentView !== 'dashboard') return;
+
+  // 不在睡觉/难过/生气时才走动
+  if (_petMood === 'sleeping' || _petMood === 'sad' || _petMood === 'angry') {
+    // 睡觉/难过/生气时不动，只在原地
+    return;
+  }
+
+  // 随机决定行为：走动(60%) / 爬方框(25%) / 发呆(15%)
+  const action = Math.random();
+  if (action < 0.6) {
+    petWalkToRandomSpot();
+  } else if (action < 0.85) {
+    petClimbToCard();
+  } else {
+    // 发呆，不加 walking class
+    pet.classList.remove('walking', 'climbing');
+    const bubble = document.getElementById('pet-bubble');
+    if (bubble) bubble.textContent = pick(_petMessages.idle);
+  }
+}
+
+function petWalkToRandomSpot() {
+  const pet = document.getElementById('pet-mascot');
+  if (!pet) return;
+  const view = document.getElementById('view-dashboard');
+  if (!view) return;
+
+  const rect = view.getBoundingClientRect();
+  // 在仪表盘区域内随机选一个位置
+  const margin = 20;
+  const x = rect.left + margin + Math.random() * (rect.width - 56 - margin * 2);
+  const y = rect.top + margin + Math.random() * (rect.height - 70 - margin * 2);
+
+  pet.classList.remove('climbing');
+  pet.classList.add('walking');
+
+  // 设置方向（翻转）
+  const currentLeft = parseFloat(pet.style.left) || rect.right - 70;
+  if (x < currentLeft) {
+    pet.style.transform = 'scaleX(-1)';
+  } else {
+    pet.style.transform = 'scaleX(1)';
+  }
+
+  pet.style.left = x + 'px';
+  pet.style.top = y + 'px';
+
+  const bubble = document.getElementById('pet-bubble');
+  if (bubble) bubble.textContent = pick(_petMessages.walking);
+
+  // 走完后回到当前情绪
+  setTimeout(() => {
+    pet.classList.remove('walking');
+    pet.classList.add(_petMood);
+  }, 1600);
+}
+
+function petClimbToCard() {
+  const pet = document.getElementById('pet-mascot');
+  if (!pet) return;
+
+  // 找仪表盘上的卡片元素
+  const cards = document.querySelectorAll('#view-dashboard .kpi-card, #view-dashboard .dash-flow-item, #view-dashboard .panel');
+  if (cards.length === 0) {
+    petWalkToRandomSpot();
+    return;
+  }
+
+  // 随机选一个卡片
+  const card = cards[Math.floor(Math.random() * cards.length)];
+  const rect = card.getBoundingClientRect();
+
+  // 放在卡片右上角
+  const x = rect.right - 60;
+  const y = rect.top - 30; // 站在卡片上面
+
+  pet.classList.remove('walking');
+  pet.classList.add('climbing');
+  pet.style.transform = 'scaleX(1)';
+
+  pet.style.left = x + 'px';
+  pet.style.top = y + 'px';
+
+  const bubble = document.getElementById('pet-bubble');
+  if (bubble) bubble.textContent = pick(_petMessages.climbing);
+
+  // 爬完后回到当前情绪
+  setTimeout(() => {
+    pet.classList.remove('climbing');
+    pet.classList.add(_petMood);
+  }, 2000);
+}
+
+// 初始化宠物位置
+function initPetPosition() {
+  const pet = document.getElementById('pet-mascot');
+  if (!pet) return;
+  const view = document.getElementById('view-dashboard');
+  if (!view) return;
+  const rect = view.getBoundingClientRect();
+  pet.style.left = (rect.right - 70) + 'px';
+  pet.style.top = (rect.bottom - 80) + 'px';
 }
 
 // === 复读率监控卡片（v3 审核报告建议）===
