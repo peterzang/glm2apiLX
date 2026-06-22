@@ -4,8 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>GLM2API 管理面板</title>
-<link rel="icon" href="/admin/static/favicon.svg?v=48" type="image/svg+xml" />
-<link rel="stylesheet" href="/admin/static/style.css?v=48" />
+<link rel="icon" href="/admin/static/favicon.svg?v=49" type="image/svg+xml" />
+<link rel="stylesheet" href="/admin/static/style.css?v=49" />
 </head>
 <body>
 
@@ -14,6 +14,43 @@
 
 <!-- v43: Aurora 极光背景（毛玻璃下层 3 色点 + 20s 缓慢位移）-->
 <div class="neural-aurora"></div>
+
+<!-- v49: 萌系电子宠物（根据仪表盘数据变化情绪）-->
+<div class="pet-container" id="pet-mascot" style="display:none;">
+  <div class="pet-bubble" id="pet-bubble">我在守护你的 API~</div>
+  <svg viewBox="0 0 64 80" xmlns="http://www.w3.org/2000/svg">
+    <!-- Z 字（睡觉时显示）-->
+    <text class="pet-zzz" x="44" y="18" font-size="10" fill="var(--text-muted)" font-weight="700">Z</text>
+    <g class="pet-body">
+      <!-- 头部光晕 -->
+      <ellipse cx="32" cy="28" rx="20" ry="18" fill="rgba(99,102,241,0.08)"/>
+      <!-- 身体（圆润水滴形）-->
+      <ellipse cx="32" cy="40" rx="18" ry="22" fill="#6366f1" opacity="0.9"/>
+      <!-- 头部 -->
+      <circle cx="32" cy="26" r="16" fill="#818cf8"/>
+      <!-- 头顶天线/呆毛 -->
+      <path d="M32 8 Q30 4 32 2 Q34 4 32 8" fill="none" stroke="#818cf8" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="32" cy="2" r="1.5" fill="#c4b5fd"/>
+      <!-- 脸颊腮红 -->
+      <circle cx="22" cy="30" r="3" fill="#f9a8d4" opacity="0.5"/>
+      <circle cx="42" cy="30" r="3" fill="#f9a8d4" opacity="0.5"/>
+      <!-- 左眼 -->
+      <ellipse class="pet-eye" cx="26" cy="25" rx="2.5" ry="3.5" fill="#1e1b4b"/>
+      <circle cx="27" cy="24" r="1" fill="#fff"/>
+      <!-- 右眼 -->
+      <ellipse class="pet-eye" cx="38" cy="25" rx="2.5" ry="3.5" fill="#1e1b4b"/>
+      <circle cx="39" cy="24" r="1" fill="#fff"/>
+      <!-- 嘴巴（开心微笑）-->
+      <path id="pet-mouth" d="M28 33 Q32 37 36 33" fill="none" stroke="#1e1b4b" stroke-width="1.5" stroke-linecap="round"/>
+      <!-- 小手 -->
+      <ellipse cx="16" cy="42" rx="4" ry="5" fill="#818cf8"/>
+      <ellipse cx="48" cy="42" rx="4" ry="5" fill="#818cf8"/>
+      <!-- 小脚 -->
+      <ellipse cx="26" cy="64" rx="5" ry="3" fill="#6366f1"/>
+      <ellipse cx="38" cy="64" rx="5" ry="3" fill="#6366f1"/>
+    </g>
+  </svg>
+</div>
 
 <!-- Theme Toggle Button -->
 <button id="theme-toggle" class="theme-toggle" title="切换主题" aria-label="切换亮色/暗色主题">
@@ -145,6 +182,6 @@
 
 <div id="toast" class="toast hidden"></div>
 
-<script src="/admin/static/app.js?v=48"></script>
+<script src="/admin/static/app.js?v=49"></script>
 </body>
 </html>

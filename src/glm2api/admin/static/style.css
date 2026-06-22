@@ -1723,3 +1723,142 @@ input[type="range"].probe-input::-webkit-slider-thumb {
     grid-template-columns: 1fr;
   }
 }
+
+/* ============================================================
+ * v49: 萌系电子宠物 — 纯 SVG + CSS 动画，零外部依赖
+ * 根据仪表盘数据变化情绪（开心/难过/惊讶/睡觉/思考）
+ * ============================================================ */
+.pet-container {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 9999;
+  width: 64px;
+  height: 80px;
+  cursor: pointer;
+  user-select: none;
+  filter: drop-shadow(0 4px 12px rgba(0,0,0,0.3));
+}
+.pet-container svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+/* === 宠物身体呼吸动画 === */
+.pet-body {
+  animation: pet-breathe 3s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+@keyframes pet-breathe {
+  0%, 100% { transform: scaleY(1) scaleX(1); }
+  50%      { transform: scaleY(0.97) scaleX(1.02); }
+}
+
+/* === 眨眼动画 === */
+.pet-eye {
+  animation: pet-blink 4s ease-in-out infinite;
+  transform-origin: center;
+}
+@keyframes pet-blink {
+  0%, 90%, 100% { transform: scaleY(1); }
+  93%, 95%      { transform: scaleY(0.1); }
+}
+
+/* === 开心模式：跳跳 === */
+.pet-container.happy .pet-body {
+  animation: pet-bounce 0.6s ease-in-out infinite;
+}
+@keyframes pet-bounce {
+  0%, 100% { transform: translateY(0) scaleY(1); }
+  50%      { transform: translateY(-8px) scaleY(1.05); }
+}
+
+/* === 难过模式：低头 === */
+.pet-container.sad .pet-body {
+  animation: pet-slump 4s ease-in-out infinite;
+}
+@keyframes pet-slump {
+  0%, 100% { transform: translateY(2px) rotate(0deg); }
+  50%      { transform: translateY(4px) rotate(-3deg); }
+}
+
+/* === 惊讶模式：抖动 === */
+.pet-container.surprised .pet-body {
+  animation: pet-shake 0.15s ease-in-out infinite;
+}
+@keyframes pet-shake {
+  0%, 100% { transform: translateX(0); }
+  50%      { transform: translateX(2px); }
+}
+
+/* === 睡觉模式：缓慢呼吸 + Z 字 === */
+.pet-container.sleeping .pet-body {
+  animation: pet-breathe 5s ease-in-out infinite;
+}
+.pet-zzz {
+  opacity: 0;
+}
+.pet-container.sleeping .pet-zzz {
+  opacity: 0.6;
+  animation: pet-zzz-float 2s ease-in-out infinite;
+}
+@keyframes pet-zzz-float {
+  0%   { transform: translate(0, 0) scale(0.8); opacity: 0; }
+  30%  { opacity: 0.6; }
+  100% { transform: translate(8px, -16px) scale(1); opacity: 0; }
+}
+
+/* === 思考模式：左右轻摇 === */
+.pet-container.thinking .pet-body {
+  animation: pet-think 3s ease-in-out infinite;
+}
+@keyframes pet-think {
+  0%, 100% { transform: rotate(0deg); }
+  25%      { transform: rotate(2deg); }
+  75%      { transform: rotate(-2deg); }
+}
+
+/* === 宠物气泡提示 === */
+.pet-bubble {
+  position: absolute;
+  bottom: 78px;
+  right: 0;
+  background: var(--glass-bg-strong);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  padding: 6px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--text);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  pointer-events: none;
+  box-shadow: var(--shadow-md);
+}
+.pet-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -6px;
+  right: 16px;
+  width: 0; height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 6px solid var(--glass-bg-strong);
+}
+.pet-container:hover .pet-bubble {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* === 响应式：小屏幕缩小 === */
+@media (max-width: 600px) {
+  .pet-container {
+    width: 48px;
+    height: 60px;
+    bottom: 8px;
+    right: 8px;
+  }
+}
