@@ -357,7 +357,116 @@ function switchView(name) {
     s.classList.toggle('active', s.id === `view-${name}`);
   });
   document.getElementById('topbar-title').textContent = VIEW_TITLES[name] || name;
+  // v43: 配色叙事 — 切换页面时设置 data-page 属性
+  document.body.setAttribute('data-page', name);
   refresh();
+}
+
+// =========================================================================
+// v43: NeuralPulse 签名组件 — glm2api 专属神经网络脉冲动画
+// =========================================================================
+
+class NeuralPulse {
+  /**
+   * glm2api 专属签名组件：3x3 节点网格 + 动态连线 + 脉冲传播。
+   * 活跃时节点呼吸 + 脉冲沿线传播；空闲时静态低亮度。
+   */
+  constructor(canvas, options = {}) {
+    this.canvas = typeof canvas === 'string' ? document.querySelector(canvas) : canvas;
+    if (!this.canvas || !this.canvas.getContext) return;
+    this.ctx = this.canvas.getContext('2d');
+    this.active = options.active ?? false;
+    this.color = options.color || '#6366f1';
+    this.size = options.size || 48;
+    this.canvas.width = this.size;
+    this.canvas.height = this.size;
+    this.nodes = [];
+    this.pulses = [];
+    this._initNodes();
+    this._animate = this._animate.bind(this);
+    this._animate();
+  }
+
+  _initNodes() {
+    const s = this.size;
+    const step = s / 4;
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        this.nodes.push({
+          x: step + j * step,
+          y: step + i * step,
+          glow: 0,
+          row: i,
+          col: j,
+        });
+      }
+    }
+  }
+
+  trigger() {
+    // 请求时调用：从节点 0 发脉冲到节点 4（中心）
+    if (this.pulses.length < 3) {
+      const from = Math.floor(Math.random() * 9);
+      const to = 4; // 中心节点
+      if (from !== to) {
+        this.pulses.push({ from, to, progress: 0, speed: 0.02 + Math.random() * 0.02 });
+      }
+    }
+  }
+
+  _animate() {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const s = this.size;
+    ctx.clearRect(0, 0, s, s);
+    const time = Date.now() / 1000;
+    // 连线
+    ctx.strokeStyle = this.color + '20';
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i < this.nodes.length; i++) {
+      for (let j = i + 1; j < this.nodes.length; j++) {
+        const a = this.nodes[i], b = this.nodes[j];
+        // 只连相邻节点
+        if (Math.abs(a.row - b.row) > 1 || Math.abs(a.col - b.col) > 1) continue;
+        if (Math.abs(a.row - b.row) + Math.abs(a.col - b.col) > 1) continue;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+    // 脉冲传播
+    this.pulses = this.pulses.filter(p => {
+      p.progress += p.speed;
+      if (p.progress >= 1) return false;
+      const from = this.nodes[p.from];
+      const to = this.nodes[p.to];
+      const px = from.x + (to.x - from.x) * p.progress;
+      const py = from.y + (to.y - from.y) * p.progress;
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+      return true;
+    });
+    // 节点
+    this.nodes.forEach((n, i) => {
+      const breathe = this.active ? (0.5 + 0.5 * Math.sin(time * 2 + i * 0.5)) : 0.2;
+      const r = 1.5 + breathe * 0.8;
+      const alpha = this.active ? (0.3 + breathe * 0.5) : 0.15;
+      ctx.fillStyle = this.color + Math.round(alpha * 255).toString(16).padStart(2, '0');
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      if (this.active && breathe > 0.7) {
+        ctx.fillStyle = this.color + '15';
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r * 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
+    requestAnimationFrame(this._animate);
+  }
 }
 
 // =========================================================================

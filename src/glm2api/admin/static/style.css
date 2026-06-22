@@ -1359,3 +1359,119 @@ input[type="range"].probe-input::-webkit-slider-thumb {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
+
+/* ============================================================
+ * v43: Neural Liquid 布局语言 — Aurora + Bento + NeuralPulse
+ * ============================================================ */
+
+/* === Aurora 极光背景（毛玻璃下层，3 色点 + 20s 缓慢位移）=== */
+.neural-aurora {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 600px 400px at 15% 25%, rgba(99, 102, 241, 0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 500px 500px at 85% 15%, rgba(139, 92, 246, 0.10) 0%, transparent 55%),
+    radial-gradient(ellipse 700px 350px at 50% 85%, rgba(6, 182, 212, 0.06) 0%, transparent 50%);
+  animation: aurora-shift 25s ease-in-out infinite;
+}
+:root[data-theme="light"] .neural-aurora {
+  background:
+    radial-gradient(ellipse 600px 400px at 15% 25%, rgba(99, 102, 241, 0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 500px 500px at 85% 15%, rgba(139, 92, 246, 0.06) 0%, transparent 55%),
+    radial-gradient(ellipse 700px 350px at 50% 85%, rgba(6, 182, 212, 0.04) 0%, transparent 50%);
+}
+@keyframes aurora-shift {
+  0%, 100% { transform: translate(0, 0) scale(1); opacity: 1; }
+  33%      { transform: translate(2%, -1.5%) scale(1.06); opacity: 0.9; }
+  66%      { transform: translate(-1.5%, 2%) scale(0.97); opacity: 0.95; }
+}
+
+/* === Bento Grid（仪表盘核心改造）=== */
+.bento-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: minmax(110px, auto);
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.bento-hero {
+  grid-column: span 2;
+  grid-row: span 2;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-xl);
+  padding: 24px;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: var(--glass-shadow);
+}
+/* Liquid Glass 顶部高光线 */
+.bento-hero::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+  pointer-events: none;
+}
+.bento-small {
+  grid-column: span 1;
+  grid-row: span 1;
+}
+.bento-wide {
+  grid-column: span 2;
+  grid-row: span 1;
+}
+@media (max-width: 768px) {
+  .bento-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .bento-hero {
+    grid-column: span 2;
+    grid-row: span 1;
+  }
+  .bento-wide {
+    grid-column: span 2;
+  }
+}
+
+/* === NeuralPulse 签名组件 === */
+.neural-pulse-canvas {
+  width: 48px;
+  height: 48px;
+  display: inline-block;
+  vertical-align: middle;
+}
+.neural-pulse-large {
+  width: 80px;
+  height: 80px;
+}
+.neural-pulse-inline {
+  width: 20px;
+  height: 20px;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+/* === 配色叙事 — 每页一个主色调 === */
+:root {
+  --page-accent: var(--primary);
+  --page-accent-glow: var(--primary-glow);
+}
+[data-page="dashboard"] { --page-accent: #6366f1; --page-accent-glow: #818cf8; }
+[data-page="accounts"]  { --page-accent: #10b981; --page-accent-glow: #34d399; }
+[data-page="models"]    { --page-accent: #f59e0b; --page-accent-glow: #fbbf24; }
+[data-page="probe"]     { --page-accent: #06b6d4; --page-accent-glow: #22d3ee; }
+[data-page="logs"]      { --page-accent: #64748b; --page-accent-glow: #94a3b8; }
+[data-page="rotates"]   { --page-accent: #ec4899; --page-accent-glow: #f472b6; }
+[data-page="config"]    { --page-accent: #3b82f6; --page-accent-glow: #60a5fa; }
+[data-page="apikeys"]   { --page-accent: #8b5cf6; --page-accent-glow: #a78bfa; }
+[data-page="system"]    { --page-accent: #f43f5e; --page-accent-glow: #fb7185; }
