@@ -1203,6 +1203,11 @@ class GLM2APIServer:
             # ---- Chat completions (original) ----
 
             def _stream_completion(self, payload: dict[str, object]) -> None:
+                """v47: OpenAI Chat 流式重写 — 加心跳保活，解决 Codex CLI 超时断开。
+
+                之前：for chunk in stream_iter 同步阻塞，GLM 慢时无数据 → Codex 超时
+                现在：后台线程读上游 + 主线程 2s 心跳（与 Anthropic 路径一致）
+                """
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
                 stream_iter = glm_client.stream_chat_completion(payload)
@@ -1211,55 +1216,87 @@ class GLM2APIServer:
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
                 # v33 P2-3 修复：response_format=json_object/json_schema 时
-                # GLM 仍可能在流式响应里输出 ```json\n{...}\n``` 格式
-                # 策略：json 模式下缓冲所有 chunks，剥离 markdown 后作为单 chunk 发送
-                # （JSON 客户端必须等完整 JSON 才能 parse，缓冲不影响功能）
                 response_format = payload.get("response_format")
                 is_json_mode = (
                     isinstance(response_format, dict)
                     and str(response_format.get("type", "")).strip().lower() in ("json_object", "json_schema")
                 )
 
+                # v47: 后台线程读上游 chunks（与 Anthropic/Responses 路径一致）
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+
+                def read_upstream() -> None:
+                    try:
+                        for upstream_chunk in stream_iter:
+                            chunk_queue.put(upstream_chunk)
+                    except BaseException as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
                 sent_done = False
-                # 收集所有 chunks 以便流结束后提取 usage（OpenAI 流式只在最后一个 chunk 含 usage）
                 collected_chunks: list[bytes] = []
-                # json 模式下额外收集所有 chunk dict，用于剥离 markdown 后重新发送
                 json_mode_buffer: list[dict] = []
+                CHAT_HEARTBEAT_INTERVAL = 2.0  # 2s 心跳（与 Anthropic 路径一致）
+
                 try:
-                    for chunk in stream_iter:
-                        if chunk:
-                            debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
-                            chunk_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-                            collected_chunks.append(chunk_bytes)
-                            if is_json_mode:
-                                # 解析 chunk 提取 content delta 缓冲，不直接发给客户端
-                                try:
-                                    chunk_str = chunk_bytes.decode("utf-8", errors="replace")
-                                    for line in chunk_str.split("\n"):
-                                        line = line.strip()
-                                        if not line.startswith("data: "):
-                                            continue
-                                        data_str = line[6:].strip()
-                                        if data_str == "[DONE]" or not data_str:
-                                            continue
-                                        try:
-                                            chunk_dict = json.loads(data_str)
-                                            if isinstance(chunk_dict, dict):
-                                                json_mode_buffer.append(chunk_dict)
-                                        except json.JSONDecodeError:
-                                            pass
-                                    if b"data: [DONE]\n\n" in chunk_bytes:
-                                        sent_done = True
-                                except Exception:
-                                    pass
-                            else:
-                                self.wfile.write(chunk)
+                    while True:
+                        try:
+                            queued = chunk_queue.get(timeout=CHAT_HEARTBEAT_INTERVAL)
+                        except queue.Empty:
+                            # v47: 超时未收到 chunk → 发 SSE 注释心跳保活
+                            # OpenAI SSE 规范允许 : 开头的注释行（客户端忽略）
+                            try:
+                                self.wfile.write(b": keep-alive\n\n")
                                 self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在心跳阶段断开 model=%s", model)
+                                return
+                            continue
+
+                        if queued is sentinel:
+                            break
+                        if isinstance(queued, BaseException):
+                            raise queued
+                        chunk = queued
+                        if not chunk:
+                            continue
+                        debug_dump(logger, config.debug_dump_all, f"HTTP 出站流式分片 model={model}", chunk)
+                        chunk_bytes = chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                        collected_chunks.append(chunk_bytes)
+                        if is_json_mode:
+                            # 解析 chunk 提取 content delta 缓冲，不直接发给客户端
+                            try:
+                                chunk_str = chunk_bytes.decode("utf-8", errors="replace")
+                                for line in chunk_str.split("\n"):
+                                    line = line.strip()
+                                    if not line.startswith("data: "):
+                                        continue
+                                    data_str = line[6:].strip()
+                                    if data_str == "[DONE]" or not data_str:
+                                        continue
+                                    try:
+                                        chunk_dict = json.loads(data_str)
+                                        if isinstance(chunk_dict, dict):
+                                            json_mode_buffer.append(chunk_dict)
+                                    except json.JSONDecodeError:
+                                        pass
                                 if b"data: [DONE]\n\n" in chunk_bytes:
                                     sent_done = True
+                            except Exception:
+                                pass
+                        else:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            if b"data: [DONE]\n\n" in chunk_bytes:
+                                sent_done = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")
