@@ -617,68 +617,66 @@ async function refreshDashboard() {
   // 2) 如果数据没变，跳过重渲染（避免闪烁 + 减少 CPU 占用）
   if (!isFirstRender && !dataChanged) return;
 
-  // === KPI Row 1 ===
-  // 把"总请求数"拆成 3 张卡：API 业务请求 / Models 元信息 / 其他
-  // 让用户能一眼分清 chat/completions 等业务请求 vs /v1/models 查询 vs 杂项
-  const apiTotal = all.api_total ?? 0;
-  const apiSuccess = all.api_success ?? 0;
-  const apiClientErr = all.api_client_errors ?? 0;
-  const apiServerErr = all.api_server_errors ?? 0;
-  const modelsTotal = all.models_total ?? 0;
-  const modelsSuccess = all.models_success ?? 0;
-  const otherTotal = all.other_total ?? 0;
-  // 5 分钟窗口同样拆分（sub 里展示最近活动）
-  const r5Api = r5.api_total ?? 0;
-  const r5Models = r5.models_total ?? 0;
-  const r5Other = r5.other_total ?? 0;
-  const r5Health = r5.health_total ?? 0;
-  const kpiRow1 = `
-    <div class="kpi-grid">
-      <div class="kpi-card info">
+  // === v43: Bento Grid 布局（核心 2x2 + 次要 1x1 + 趋势 2x1）===
+  const apiSuccessRate = r5.api_success_rate ?? 0;
+  const apiSRColor = apiSuccessRate >= 95 ? 'var(--success)' : apiSuccessRate >= 80 ? 'var(--warning)' : 'var(--error)';
+  const bentoKpi = `
+    <div class="bento-grid">
+      <!-- 核心 2x2: 成功率 + NeuralPulse -->
+      <div class="bento-hero kpi-card ${successRateColor}" style="padding:24px;">
+        <div>
+          <div class="kpi-label" style="font-size:14px;margin-bottom:8px;">5 分钟成功率</div>
+          <div class="kpi-value" data-metric="success-rate" style="font-size:42px;font-weight:700;line-height:1.1;">${(r5.success_rate || 0).toFixed(1)}%</div>
+          <div class="kpi-sub" style="margin-top:6px;">${r5.success}/${r5.total} 请求</div>
+        </div>
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px;">
+          <div style="flex:1;">
+            <div class="kpi-sub" style="font-size:12px;">API 成功率</div>
+            <div class="kpi-value" style="font-size:22px;color:${apiSRColor};">${apiSuccessRate.toFixed(1)}%</div>
+            <div class="kpi-sub" style="font-size:11px;margin-top:4px;">API ${r5Api} · 健康 ${r5Health || 0} · Models ${r5Models}</div>
+          </div>
+          <canvas class="neural-pulse-canvas" id="bento-neural-pulse" width="48" height="48"></canvas>
+        </div>
+      </div>
+      <!-- 次要 1x1 -->
+      <div class="bento-small kpi-card info">
         <div class="kpi-label">API 请求</div>
         <div class="kpi-value" data-metric="api-requests">${(apiTotal).toLocaleString()}</div>
         <div class="kpi-sub">成功 ${apiSuccess} · 4xx ${apiClientErr} · 5xx ${apiServerErr}</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Api} · chat/responses/anthropic 等</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Api}</div>
       </div>
-      <div class="kpi-card" style="border-left:3px solid var(--purple);">
-        <div class="kpi-label">Models 请求</div>
-        <div class="kpi-value" data-metric="models-requests">${(modelsTotal).toLocaleString()}</div>
-        <div class="kpi-sub">成功 ${modelsSuccess} · /v1/models 元信息查询</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Models} · SDK 启动会拉取</div>
-      </div>
-      <div class="kpi-card ${successRateColor}">
-        <div class="kpi-label">5分钟成功率</div>
-        <div class="kpi-value" data-metric="success-rate">${(r5.success_rate || 0).toFixed(1)}%</div>
-        <div class="kpi-sub">${r5.success}/${r5.total} 请求</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">API 成功率 <strong style="color:${(r5.api_success_rate ?? 100) >= 95 ? 'var(--success)' : (r5.api_success_rate ?? 100) >= 80 ? 'var(--warning)' : 'var(--error)'}">${(r5.api_success_rate ?? 0).toFixed(1)}%</strong> · API ${r5Api} · 健康 ${r5Health || 0}</div>
-      </div>
-      <div class="kpi-card warning">
-        <div class="kpi-label">运行时长</div>
-        <div class="kpi-value" data-metric="uptime" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
-        <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">其他 ${otherTotal}（含健康检查 ${protoBreakdown.health || 0}）· 历史累计 ${all.total}</div>
-      </div>
-    </div>
-  `;
-
-  // === KPI Row 2 ===
-  const kpiRow2 = `
-    <div class="kpi-grid">
-      <div class="kpi-card info">
+      <div class="bento-small kpi-card info">
         <div class="kpi-label">当前 RPM</div>
         <div class="kpi-value" data-metric="rpm">${rpm}</div>
-        <div class="kpi-sub">30m 平均 ${avgRpm} rpm · 峰值 ${peakRpm}</div>
+        <div class="kpi-sub">30m 平均 ${avgRpm} · 峰值 ${peakRpm}</div>
       </div>
-      <div class="kpi-card">
+      <!-- 次要 1x1 -->
+      <div class="bento-small kpi-card" style="border-left:3px solid var(--purple);">
+        <div class="kpi-label">Models 请求</div>
+        <div class="kpi-value" data-metric="models-requests">${(modelsTotal).toLocaleString()}</div>
+        <div class="kpi-sub">成功 ${modelsSuccess}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">近 5 分钟 ${r5Models}</div>
+      </div>
+      <div class="bento-small kpi-card">
         <div class="kpi-label">P95 延迟</div>
         <div class="kpi-value" data-metric="p95">${r5.p95_ms}ms</div>
         <div class="kpi-sub">P50 ${r5.p50_ms}ms · P99 ${r5.p99_ms}ms</div>
       </div>
-      <div class="kpi-card success">
+      <!-- 趋势 2x1 -->
+      <div class="bento-wide kpi-card success">
         <div class="kpi-label">活跃账号</div>
         <div class="kpi-value" data-metric="active-accounts">${accountsActive}<span style="font-size:14px;color:var(--text-muted);"> / ${accountsTotal}</span></div>
         <div class="kpi-sub">已使用过的账号</div>
       </div>
+      <div class="bento-wide kpi-card warning">
+        <div class="kpi-label">运行时长</div>
+        <div class="kpi-value" data-metric="uptime" style="font-size:18px;">${fmtDuration(d.uptime_seconds)}</div>
+        <div class="kpi-sub">自 ${fmtTime(d.now - d.uptime_seconds)}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">其他 ${otherTotal}（含健康 ${protoBreakdown.health || 0}）· 累计 ${all.total}</div>
+      </div>
+    </div>
+    <!-- Token 累计单独一行（保留原有 kpi-grid）-->
+    <div class="kpi-grid" style="margin-bottom:20px;">
       <div class="kpi-card" style="border-left:3px solid var(--purple);">
         <div class="kpi-label">Token 累计</div>
         <div class="kpi-value" data-metric="total-tokens" style="font-size:22px;">${fmtCompactNum(tokenTotals.total)}</div>
@@ -716,7 +714,22 @@ async function refreshDashboard() {
     </div>
   `;
 
-  document.getElementById('view-dashboard').innerHTML = kpiRow1 + kpiRow2 + mainArea + bottomCards;
+  document.getElementById('view-dashboard').innerHTML = bentoKpi + mainArea + bottomCards;
+
+  // v43: 初始化 Bento Hero NeuralPulse 组件
+  const pulseCanvas = document.getElementById('bento-neural-pulse');
+  if (pulseCanvas) {
+    const np = new NeuralPulse(pulseCanvas, {
+      active: rpm > 0 || r5Api > 0,
+      color: 'var(--page-accent-glow, #818cf8)',
+      size: 48,
+    });
+    // 当有 API 请求时触发脉冲
+    if (r5Api > 0) {
+      np.trigger();
+      setInterval(() => np.trigger(), 3000 + Math.random() * 2000);
+    }
+  }
 
   // 用户反馈：数据刷新时不要出现"方框亮一下"的脉冲动画，
   // 数字直接更新即可，不要任何视觉特效。
@@ -1981,8 +1994,12 @@ async function refreshLogs() {
                      : l.protocol.includes('images') ? 'badge-info'
                      : 'badge-success';
     // v31 增强：显示客户端 IP（从哪里请求的）+ 更详细的信息
+    // v43: 错误行整行高亮
+    const rowBg = l.status >= 500 ? 'background:rgba(239,68,68,0.06);'
+                : l.status >= 400 ? 'background:rgba(245,158,11,0.04);'
+                : '';
     return `
-      <tr>
+      <tr style="${rowBg}">
         <td class="mono text-muted" style="font-size:11px;white-space:nowrap;">${fmtTime(l.ts)}</td>
         <td><span class="badge ${protoBadge}">${escapeHtml(l.protocol)}</span></td>
         <td class="mono">${escapeHtml(l.method)}</td>
@@ -2034,11 +2051,18 @@ async function refreshRotates() {
   const events = data.events || [];
   const wrapper = document.getElementById('rotates-table-wrapper');
   if (events.length === 0) {
-    wrapper.innerHTML = renderEmptyState(
-      '暂无轮换事件',
-      '当前账号未发生 device_id 轮换。当账号请求次数达到阈值或手动触发轮换时，事件会出现在这里。',
-      '🔄'
-    );
+    wrapper.innerHTML = `
+      <div style="text-align:center;padding:60px 20px;">
+        <canvas class="neural-pulse-canvas neural-pulse-large" id="rotates-empty-pulse" width="80" height="80" style="margin:0 auto 20px;display:block;"></canvas>
+        <div style="font-size:18px;font-weight:600;margin-bottom:8px;">暂无轮换事件</div>
+        <div class="text-muted" style="font-size:13px;max-width:400px;margin:0 auto;">系统稳定运行中。当账号请求次数达到阈值或手动触发轮换时，事件会出现在这里。</div>
+      </div>
+    `;
+    // v43: 空状态 NeuralPulse 动画
+    const emptyPulse = document.getElementById('rotates-empty-pulse');
+    if (emptyPulse) {
+      new NeuralPulse(emptyPulse, { active: true, color: '#ec4899', size: 80 });
+    }
     return;
   }
   const rows = events.map(e => {
@@ -2201,9 +2225,7 @@ async function refreshApiKeys() {
                 <th>状态</th>
                 <th>请求数</th>
                 <th>成功 / 错误</th>
-                <th>Prompt Tokens</th>
-                <th>Completion Tokens</th>
-                <th>总 Tokens</th>
+                <th>Token 用量</th>
                 <th>最后使用</th>
                 <th>操作</th>
               </tr>
@@ -2222,9 +2244,14 @@ async function refreshApiKeys() {
                   <td>${k.enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-muted">禁用</span>'}</td>
                   <td class="mono">${k.total_requests || 0}</td>
                   <td class="mono"><span class="text-success">${k.total_success || 0}</span> / <span class="text-error">${k.total_errors || 0}</span></td>
-                  <td class="mono">${fmtCompactNum(k.prompt_tokens || 0)}</td>
-                  <td class="mono">${fmtCompactNum(k.completion_tokens || 0)}</td>
-                  <td class="mono"><strong>${fmtCompactNum(k.total_tokens || 0)}</strong></td>
+                  <td class="mono">
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <div style="flex:1;min-width:60px;height:4px;background:var(--bg-elevated);border-radius:2px;overflow:hidden;">
+                        <div style="height:100%;width:${Math.min(100, ((k.prompt_tokens || 0) / Math.max(1, k.total_tokens || 1)) * 100)}%;background:var(--primary);border-radius:2px;"></div>
+                      </div>
+                      <span style="font-size:11px;white-space:nowrap;">${fmtCompactNum(k.total_tokens || 0)}</span>
+                    </div>
+                  </td>
                   <td class="text-muted" style="font-size:11px;">${k.last_used_ts ? fmtTimeShort(k.last_used_ts) : '-'}</td>
                   <td>
                     ${k.is_env ? '<span class="text-muted" style="font-size:11px;">不可删除</span>' : `
