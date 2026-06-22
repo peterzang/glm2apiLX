@@ -334,9 +334,14 @@ class AdminStore:
             p99_idx = int(len(recent_latencies) * 0.99)
             p99 = recent_latencies[min(p99_idx, len(recent_latencies) - 1)] if recent_latencies else 0
             # 5 分钟窗口按类别拆分（让仪表盘能看到最近 5 分钟的 API/Models/Other 占比）
-            recent_by_category = {"api": 0, "models": 0, "other": 0}
+            recent_by_category = {"api": 0, "models": 0, "other": 0, "health": 0}
             for r in recent:
-                recent_by_category[classify_category(r.protocol)] += 1
+                cat = classify_category(r.protocol)
+                # v48: health 单独统计（不混入 other）
+                if r.protocol == "health":
+                    recent_by_category["health"] = recent_by_category.get("health", 0) + 1
+                else:
+                    recent_by_category[cat] += 1
             # All-time
             all_total = self._total_requests
             all_success_rate = (self._total_success / all_total * 100) if all_total else 0.0
@@ -395,9 +400,11 @@ class AdminStore:
                     "api_success": category_totals["api"]["success"],
                     "api_client_errors": category_totals["api"]["client_errors"],
                     "api_server_errors": category_totals["api"]["server_errors"],
+                    "api_success_rate": round((category_totals["api"]["success"] / category_totals["api"]["total"] * 100) if category_totals["api"]["total"] > 0 else 0.0, 2),
                     "models_total": category_totals["models"]["total"],
                     "models_success": category_totals["models"]["success"],
                     "other_total": category_totals["other"]["total"],
+                    "health_total": category_totals.get("health", {}).get("total", 0) + protocols.get("health", 0),
                 },
                 "recent_5m": {
                     "total": recent_total,
@@ -410,6 +417,9 @@ class AdminStore:
                     "api_total": recent_by_category["api"],
                     "models_total": recent_by_category["models"],
                     "other_total": recent_by_category["other"],
+                    # v48: 分开统计 API 成功率 vs health 成功率
+                    "api_success_rate": round((sum(1 for r in recent if r.status < 400 and classify_category(r.protocol) == "api") / recent_by_category["api"] * 100) if recent_by_category["api"] > 0 else 0.0, 2),
+                    "health_total": recent_by_category.get("health", 0),
                 },
                 "hourly": hourly,
                 "top_models": [{"model": m, "count": c} for m, c in top_models],

@@ -252,6 +252,37 @@ class GLM2APIServer:
                         self.send_header("Content-Length", "15")  # {"status":"ok"}
                         self.end_headers()
                         return
+                    # v48: 账号池健康检查端点
+                    if path == "/health/accounts":
+                        auth = glm_client.auth
+                        accounts_info = auth.get_all_accounts_info()
+                        total = len(accounts_info)
+                        # 有 cached_token 且未过期 = 可用
+                        usable = sum(1 for a in accounts_info if a.get("has_refresh_token") or a.get("is_guest"))
+                        # 有 cached_token = 已就绪
+                        ready = 0
+                        for idx in range(total):
+                            try:
+                                acc = auth._accounts[idx]
+                                if acc.cached_token and acc.cached_token.expires_at > __import__('time').time() + 5:
+                                    ready += 1
+                            except Exception:
+                                pass
+                        import json as _json
+                        health_body = _json.dumps({
+                            "status": "ok" if ready > 0 else "degraded",
+                            "total_accounts": total,
+                            "usable_accounts": usable,
+                            "ready_accounts": ready,
+                            "guest_mode": any(a.get("is_guest") for a in accounts_info),
+                        }).encode("utf-8")
+                        self.send_response(HTTPStatus.OK)
+                        self._send_common_headers()
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(health_body)))
+                        self.end_headers()
+                        self.wfile.write(health_body)
+                        return
                     if path == f"{config.api_prefix}/models":
                         if not self._authorize():
                             return

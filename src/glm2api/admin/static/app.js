@@ -487,7 +487,8 @@ async function refreshDashboard() {
     total: all.total, success: all.success, ce: all.client_errors, se: all.server_errors,
     apiTotal: all.api_total, modelsTotal: all.models_total, otherTotal: all.other_total,
     sr: r5.success_rate, sr_s: r5.success, sr_t: r5.total,
-    r5Api: r5.api_total, r5Models: r5.models_total, r5Other: r5.other_total,
+    r5Api: r5.api_total, r5Models: r5.models_total, r5Other: r5.other_total, r5Health: r5.health_total,
+    r5ApiSR: r5.api_success_rate,
     rpm, avgRpm, peakRpm, requests30m,
     tp: tokenTotals.prompt, tc: tokenTotals.completion, tt: tokenTotals.total,
     t30p: token30m.prompt, t30c: token30m.completion,
@@ -521,6 +522,7 @@ async function refreshDashboard() {
   const r5Api = r5.api_total ?? 0;
   const r5Models = r5.models_total ?? 0;
   const r5Other = r5.other_total ?? 0;
+  const r5Health = r5.health_total ?? 0;
   const kpiRow1 = `
     <div class="kpi-grid">
       <div class="kpi-card info">
@@ -539,7 +541,7 @@ async function refreshDashboard() {
         <div class="kpi-label">5分钟成功率</div>
         <div class="kpi-value" data-metric="success-rate">${(r5.success_rate || 0).toFixed(1)}%</div>
         <div class="kpi-sub">${r5.success}/${r5.total} 请求</div>
-        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">API ${r5Api} · Models ${r5Models} · 其他 ${r5Other}</div>
+        <div class="kpi-sub" style="margin-top:2px;color:var(--text-muted);">API 成功率 <strong style="color:${(r5.api_success_rate ?? 100) >= 95 ? 'var(--success)' : (r5.api_success_rate ?? 100) >= 80 ? 'var(--warning)' : 'var(--error)'}">${(r5.api_success_rate ?? 0).toFixed(1)}%</strong> · API ${r5Api} · 健康 ${r5Health || 0}</div>
       </div>
       <div class="kpi-card warning">
         <div class="kpi-label">运行时长</div>
