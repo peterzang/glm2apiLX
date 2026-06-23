@@ -354,3 +354,42 @@ def test_parse_extracts_param_name_only_payload_for_later_repair():
     assert clean == ""
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["arguments"] == '{"param_name":"url"}'
+
+
+def test_parse_handles_glom_concatenated_objects_as_array():
+    """v54: GLM 上游有时把多个 JSON 对象拼接但不加外层 []。
+
+    例如 AskUserQuestion 的 questions 参数：
+      <parameter name="questions"><![CDATA[{"question":"q1",...},{"question":"q2",...}]]></parameter>
+
+    之前 _coerce_leaf_value 解析失败后当作 string 返回，导致客户端收到
+    "questions": "..." (string) 而非 "questions": [...] (array)，
+    触发 InputValidationError: expected 'array' but provided as 'string'。
+
+    修复后应自动用 [...] 包裹再解析，返回 list。
+    """
+    from glm2api.protocol.tool_parser import _coerce_leaf_value
+
+    # 两对象拼接（缺 []）
+    text = '{"question":"q1","header":"h1"},{"question":"q2","header":"h2"}'
+    result = _coerce_leaf_value(text)
+    assert isinstance(result, list), f"应该是 list，实际是 {type(result).__name__}"
+    assert len(result) == 2
+    assert result[0]["question"] == "q1"
+    assert result[1]["question"] == "q2"
+
+    # 三对象拼接
+    text3 = '{"q":1},{"q":2},{"q":3}'
+    result3 = _coerce_leaf_value(text3)
+    assert isinstance(result3, list)
+    assert len(result3) == 3
+
+    # 单对象仍然返回 dict（不能误判为 list）
+    single = '{"question":"q1"}'
+    single_result = _coerce_leaf_value(single)
+    assert isinstance(single_result, dict)
+
+    # 正常 JSON 数组不变
+    arr = '[1,2,3]'
+    arr_result = _coerce_leaf_value(arr)
+    assert isinstance(arr_result, list) and arr_result == [1, 2, 3]

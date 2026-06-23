@@ -205,6 +205,15 @@ def _coerce_leaf_value(text: str) -> object:
         try:
             return json.loads(stripped)
         except json.JSONDecodeError:
+            # v54: GLM 上游有时把多个对象拼接但不加外层 []
+            # 例如 AskUserQuestion 的 questions 参数：
+            #   {"question":"q1",...},{"question":"q2",...}
+            # 这种情况 json.loads 失败，但用 [...] 包裹后可以解析
+            if stripped.startswith("{") and "},{" in stripped:
+                try:
+                    return json.loads("[" + stripped + "]")
+                except json.JSONDecodeError:
+                    pass
             if stripped.startswith("[") and not stripped.endswith("]"):
                 try:
                     return json.loads(stripped + "]")
@@ -677,6 +686,15 @@ def _regex_fallback_parse_tool_calls(
             try:
                 params[param_name] = _json.loads(param_value)
             except (json.JSONDecodeError, ValueError):
+                # v54: GLM 上游有时把多个对象拼接但不加外层 []
+                # 例如 AskUserQuestion 的 questions 参数：
+                #   {"question":"q1",...},{"question":"q2",...}
+                if param_value.startswith("{") and "},{" in param_value:
+                    try:
+                        params[param_name] = _json.loads("[" + param_value + "]")
+                        continue
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 params[param_name] = param_value
 
         tool_calls.append({
