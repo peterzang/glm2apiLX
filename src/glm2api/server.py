@@ -524,6 +524,47 @@ class GLM2APIServer:
                     if payload.get("stream"):
                         self._admin_stream = True
 
+                    # v51: STRICT_VALIDATION 开关（默认宽松，Claude Code 友好）
+                    # 启用后严格校验 Content-Type 和 anthropic-version
+                    strict_validation = os.environ.get("STRICT_VALIDATION", "").lower() in ("true", "1", "yes")
+
+                    # v51 WARN1: 严格模式下校验 Content-Type
+                    if strict_validation and path in {
+                        f"{config.api_prefix}/messages",
+                        f"{config.api_prefix}/chat/completions",
+                        f"{config.api_prefix}/responses",
+                        f"{config.api_prefix}/responses_v2",
+                        f"{config.api_prefix}/completions",
+                    }:
+                        ct = self.headers.get("Content-Type", "")
+                        if "application/json" not in ct.lower():
+                            self._write_json(
+                                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                                make_error(
+                                    "Content-Type must be application/json",
+                                    error_type=ERROR_INVALID_REQUEST,
+                                    param="Content-Type",
+                                    code="invalid_content_type",
+                                    request_id=gen_request_id(),
+                                ),
+                            )
+                            return
+                        # v51 WARN2: 严格模式下校验 anthropic-version（仅 /v1/messages）
+                        if path == f"{config.api_prefix}/messages":
+                            av = self.headers.get("anthropic-version", "")
+                            if not av:
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        "anthropic-version header is required",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param="anthropic-version",
+                                        code="missing_anthropic_version",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+
                     # v49/v50: 统一输入校验
                     # 适用于所有 chat-like 端点（messages/responses/responses_v2/chat/completions/completions）
                     chat_like_endpoints = {
