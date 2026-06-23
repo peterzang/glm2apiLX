@@ -524,7 +524,7 @@ class GLM2APIServer:
                     if payload.get("stream"):
                         self._admin_stream = True
 
-                    # v49 BUG2/3/4 + WARN: 统一输入校验
+                    # v49/v50: 统一输入校验
                     # 适用于所有 chat-like 端点（messages/responses/responses_v2/chat/completions/completions）
                     chat_like_endpoints = {
                         f"{config.api_prefix}/messages",
@@ -535,63 +535,149 @@ class GLM2APIServer:
                         f"{config.api_prefix}/completions",
                     }
                     if path in chat_like_endpoints:
-                        # BUG3: 空 messages 数组校验
-                        msgs = payload.get("messages")
-                        # Responses v2 用 input 而非 messages
+                        # v50 BUG1+BUG2: messages 完整类型校验（null/字符串/缺失/空数组）
+                        # Responses v2 用 input 而非 messages，但 input 可以是字符串（简化格式）或数组
                         if "input" in payload and "messages" not in payload:
                             msgs = payload.get("input")
-                        if isinstance(msgs, list) and len(msgs) == 0:
+                            msgs_key = "input"
+                            # input 可以是字符串（简化格式）或数组，字符串不校验数组规则
+                            input_is_string = isinstance(msgs, str)
+                        else:
+                            msgs = payload.get("messages")
+                            msgs_key = "messages"
+                            input_is_string = False
+
+                        if msgs is None:
+                            # messages=null 或字段缺失
                             self._write_json(
                                 HTTPStatus.BAD_REQUEST,
                                 make_error(
-                                    "messages array must not be empty",
+                                    f"{msgs_key} is required and must be an array",
                                     error_type=ERROR_INVALID_REQUEST,
-                                    param="messages",
+                                    param=msgs_key,
                                     code="invalid_request",
                                     request_id=gen_request_id(),
                                 ),
                             )
                             return
+                        if not input_is_string:
+                            # 非 Responses input 字符串场景：必须是数组
+                            if not isinstance(msgs, list):
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"{msgs_key} must be an array (got {type(msgs).__name__})",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param=msgs_key,
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+                            # v49 BUG3: 空数组
+                            if len(msgs) == 0:
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"{msgs_key} array must not be empty",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param=msgs_key,
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
 
-                        # BUG4: max_tokens 非法值校验（0/负数）
+                        # v49 BUG4 + v50 BUG3: max_tokens 校验（0/负数/超大值/非整数）
                         # Anthropic 用 max_tokens，OpenAI 用 max_tokens，Responses 用 max_output_tokens
                         mt_keys = ("max_tokens", "max_output_tokens")
+                        MAX_TOKENS_LIMIT = 32768  # GLM 上游通常支持到 32768
                         for mt_key in mt_keys:
+                            if mt_key not in payload:
+                                continue
                             mt_val = payload.get(mt_key)
-                            if mt_val is not None:
-                                try:
-                                    mt_int = int(mt_val)
-                                    if mt_int <= 0:
-                                        self._write_json(
-                                            HTTPStatus.BAD_REQUEST,
-                                            make_error(
-                                                f"{mt_key} must be a positive integer (got {mt_int})",
-                                                error_type=ERROR_INVALID_REQUEST,
-                                                param=mt_key,
-                                                code="invalid_request",
-                                                request_id=gen_request_id(),
-                                            ),
-                                        )
-                                        return
-                                except (ValueError, TypeError):
-                                    self._write_json(
-                                        HTTPStatus.BAD_REQUEST,
-                                        make_error(
-                                            f"{mt_key} must be an integer (got {mt_val!r})",
-                                            error_type=ERROR_INVALID_REQUEST,
-                                            param=mt_key,
-                                            code="invalid_request",
-                                            request_id=gen_request_id(),
-                                        ),
-                                    )
-                                    return
+                            if mt_val is None:
+                                continue
+                            try:
+                                mt_int = int(mt_val)
+                            except (ValueError, TypeError):
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"{mt_key} must be an integer (got {mt_val!r})",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param=mt_key,
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+                            if mt_int <= 0:
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"{mt_key} must be a positive integer (got {mt_int})",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param=mt_key,
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+                            # v50 BUG3: 超大值 clamp 到 MAX_TOKENS_LIMIT（而非报错，Claude Code 友好）
+                            if mt_int > MAX_TOKENS_LIMIT:
+                                logger.info("%s=%s 超过上限，clamp 到 %s", mt_key, mt_int, MAX_TOKENS_LIMIT)
+                                payload[mt_key] = MAX_TOKENS_LIMIT
 
-                        # WARN: 无 model 字段 fallback 改为 glm-5.2-flash（之前是 glm-4 旧模型）
-                        if not payload.get("model"):
+                        # v50 WARN3: temperature / top_p 范围校验（clamp 而非报错）
+                        temp_val = payload.get("temperature")
+                        if temp_val is not None:
+                            try:
+                                temp_float = float(temp_val)
+                                if temp_float < 0 or temp_float > 2:
+                                    clamped = max(0.0, min(2.0, temp_float))
+                                    logger.info("temperature=%s 超出 [0,2]，clamp 到 %s", temp_float, clamped)
+                                    payload["temperature"] = clamped
+                            except (ValueError, TypeError):
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"temperature must be a number (got {temp_val!r})",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param="temperature",
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+                        top_p_val = payload.get("top_p")
+                        if top_p_val is not None:
+                            try:
+                                top_p_float = float(top_p_val)
+                                if top_p_float < 0 or top_p_float > 1:
+                                    clamped = max(0.0, min(1.0, top_p_float))
+                                    logger.info("top_p=%s 超出 [0,1]，clamp 到 %s", top_p_float, clamped)
+                                    payload["top_p"] = clamped
+                            except (ValueError, TypeError):
+                                self._write_json(
+                                    HTTPStatus.BAD_REQUEST,
+                                    make_error(
+                                        f"top_p must be a number (got {top_p_val!r})",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param="top_p",
+                                        code="invalid_request",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+
+                        # v49 WARN: 无 model 字段 fallback 改为 glm-5.2-flash（之前是 glm-4 旧模型）
+                        model_val = payload.get("model")
+                        if not model_val or not isinstance(model_val, str) or not model_val.strip():
                             payload["model"] = "glm-5.2-flash"
                             logger.info("请求未指定 model，fallback 到 glm-5.2-flash")
 
-                        # BUG2: 不存在的模型校验
+                        # v49 BUG2: 不存在的模型校验
                         # 默认宽松模式：未知模型 fallback 到 glm-5.2-flash（Claude Code 友好）
                         # STRICT_MODEL_VALIDATION=true 时严格 404
                         model_id_check = str(payload.get("model", ""))
@@ -750,21 +836,7 @@ class GLM2APIServer:
                         return
 
                     # --- Chat completions ---
-                    # v49: 校验已在上面的 chat_like_endpoints 统一处理（messages/model/max_tokens）
-                    # 这里只做 chat completions 特有的 messages 必填校验（兼容老逻辑）
-                    messages = payload.get("messages")
-                    if not isinstance(messages, list):
-                        self._write_json(
-                            HTTPStatus.BAD_REQUEST,
-                            make_error(
-                                "you must provide a messages parameter as an array",
-                                error_type=ERROR_INVALID_REQUEST,
-                                param="messages",
-                                request_id=gen_request_id(),
-                            ),
-                        )
-                        return
-
+                    # v49/v50: 校验已在上面的 chat_like_endpoints 统一处理（messages/model/max_tokens/temperature/top_p）
                     if payload.get("stream"):
                         self._stream_completion(payload)
                         return
