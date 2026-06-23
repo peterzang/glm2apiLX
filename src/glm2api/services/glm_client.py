@@ -282,11 +282,11 @@ class GLMWebClient:
     def _is_repetition_loop(self, result: dict[str, object]) -> bool:
         """检测响应是否陷入复读模式（同一句话重复 N 次以上）。
 
-        判定规则：
-          - 提取 choices[0].message.content 文本
-          - 按句号/换行切分为句子
-          - 如果存在连续 5 句相同（或同一句重复超过 5 次），判定为复读
-          - 文本长度 < 100 字符不判定（避免误杀短回复）
+        v54 H4 修复：
+          - 全局重复阈值从 5 提到 8（减少 5-7 次合法重复误杀）
+          - 连续重复阈值保持 3（真正的复读往往连续）
+          - 代码块（``` 之间）内容豁免（shell 脚本/表格行不再误杀）
+          - buffer 阈值从 240 提到 800（减少短内容误触发）
         """
         try:
             choices = result.get("choices")
@@ -298,17 +298,19 @@ class GLMWebClient:
             content = msg.get("content")
             if not isinstance(content, str) or len(content) < 100:
                 return False
-            # 切句子：按。. ! ? \n 切
+            # v54: 豁免代码块内容 — 提取代码块外的文本单独检测
             import re
-            sentences = [s.strip() for s in re.split(r'[。.!！?？\n]+', content) if len(s.strip()) > 8]
+            # 去掉代码块（``` 之间）
+            text_outside_code = re.sub(r'```[\s\S]*?```', '', content)
+            # 切句子：按。. ! ? \n 切
+            sentences = [s.strip() for s in re.split(r'[。.!！?？\n]+', text_outside_code) if len(s.strip()) > 8]
             if len(sentences) < 6:
                 return False
-            # 检测连续重复
+            # v54: 全局重复阈值 8（之前 5）
             from collections import Counter
             counter = Counter(sentences)
             most_common_count = counter.most_common(1)[0][1] if counter else 0
-            # 同一句子重复 5 次以上判定为复读
-            if most_common_count >= 5:
+            if most_common_count >= 8:
                 return True
             # 检测连续 3 句相同
             consecutive = 1
@@ -403,8 +405,9 @@ class GLMWebClient:
                     return result, accumulator.conversation_id
         finally:
             response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            # v54 H1: lease 在 delete_conversation 之前 release，避免清理 HTTP 阻塞槽位
             lease.release()
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
         # 临时禁用描述性文本检测
         old_allowed = accumulator.allowed_tool_names
         accumulator.allowed_tool_names = None
@@ -449,8 +452,9 @@ class GLMWebClient:
                     return accumulator.build_response(), accumulator.conversation_id
         finally:
             response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            # v54 H1: lease 先释放，delete_conversation 不阻塞槽位
             lease.release()
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
         return accumulator.build_response(), accumulator.conversation_id
 
     def _chat_completion_n(self, payload: dict[str, object], n: int) -> tuple[dict[str, object], str | None]:
@@ -522,8 +526,9 @@ class GLMWebClient:
             return self._build_images_response(payload, {}, accumulator)
         finally:
             response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+            # v54 H1: lease 先释放
             lease.release()
+            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
 
     def stream_chat_completion(self, payload: dict[str, object]):
         _, allowed_tool_names = self._resolve_tools(payload)
@@ -556,7 +561,7 @@ class GLMWebClient:
             "buffered_text_len": 0,       # 已 buffer 的可见文本长度
             "rep_triggered": False,       # 是否已触发复读
         }
-        REP_BUFFER_THRESHOLD = 240  # buffer 240 字符后检测（覆盖大多数复读模式）
+        REP_BUFFER_THRESHOLD = 400  # v54 H4: 240→400，平衡误杀与检测灵敏度
 
         def _build_rep_error_chunk() -> bytes:
             """构造 OpenAI 兼容的 error chunk，让 codex 等客户端收到 error 后自动重试。
@@ -663,8 +668,9 @@ class GLMWebClient:
                         yield chunk.encode("utf-8")
             finally:
                 response.close() # type: ignore
-                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+                # v54 H1: lease 先释放，delete_conversation 异步清理不阻塞槽位
                 lease.release()
+                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
 
         return generate()
 
@@ -919,9 +925,15 @@ class GLMWebClient:
                         f"转发到 GLM 的 chat 请求头 account={account_index} attempt={attempt + 1}",
                         dict(request.header_items()),
                     )
-                    return self._prepare_chat_response(
-                        urllib.request.urlopen(request, timeout=self.config.request_timeout)
-                    )
+                    # v54 C4: 用 with 包装 urlopen，防止 _prepare_chat_response 抛异常时 fd 泄漏
+                    # 流式响应返回 BufferedReader wrapper，调用方在 finally 中 close
+                    # JSON 响应路径 _prepare_chat_response 可能 raise UpstreamAPIError
+                    raw_response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                    try:
+                        return self._prepare_chat_response(raw_response)
+                    except Exception:
+                        raw_response.close()
+                        raise
                 except urllib.error.HTTPError as exc:
                     error_payload = self._read_error_payload(exc)
                     if self._should_retry_busy_error(exc.code, error_payload) and attempt < self.config.glm_busy_max_retries:
@@ -1023,7 +1035,13 @@ class GLMWebClient:
                 dict(request.header_items()),
             )
             try:
-                return self._prepare_chat_response(urllib.request.urlopen(request, timeout=self.config.request_timeout))
+                # v54 C4: 同 chat 路径，防止 _prepare_chat_response 抛异常时 fd 泄漏
+                raw_response = urllib.request.urlopen(request, timeout=self.config.request_timeout)
+                try:
+                    return self._prepare_chat_response(raw_response)
+                except Exception:
+                    raw_response.close()
+                    raise
             except urllib.error.HTTPError as exc:
                 error_payload = self._read_error_payload(exc)
                 message = self._build_error_message(exc.code, error_payload)
@@ -1156,6 +1174,11 @@ class GLMWebClient:
     def _iter_sse_events(self, response):
         pending = ""
         decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+        # v54 H5: 无进展超时 — 上游每 59s 发一个字节时 socket.timeout 永不触发
+        # （socket.timeout 是单次 recv 超时，不是总超时）
+        # 记录上次收到非空 chunk 的时间，超过 120s 无进展则主动断开
+        last_progress_time = time.monotonic()
+        SSE_NO_PROGRESS_TIMEOUT = 120.0  # 120s 无进展则断开
 
         def emit_block(block: str):
             lines = [line for line in block.split("\n") if line.startswith("data:")]
@@ -1186,9 +1209,21 @@ class GLMWebClient:
                 raw_chunk = b""
                 stop_after_chunk = True
             except (socket.timeout, TimeoutError) as exc:
-                self.logger.warning("上游 SSE 读取超时(%s)，按已接收内容收尾", type(exc).__name__)
-                raw_chunk = b""
-                stop_after_chunk = True
+                # v54 H5: 检查无进展时间
+                # socket.timeout 是单次 recv 超时（60s），如果上游每 59s 发一个字节会永不触发
+                # 这里用"距上次收到非空 chunk 的时间"判断是否真正卡死
+                no_progress = time.monotonic() - last_progress_time
+                if no_progress >= SSE_NO_PROGRESS_TIMEOUT:
+                    self.logger.warning(
+                        "上游 SSE 无进展超时(%.0fs > %.0fs)，按已接收内容收尾",
+                        no_progress, SSE_NO_PROGRESS_TIMEOUT,
+                    )
+                    raw_chunk = b""
+                    stop_after_chunk = True
+                else:
+                    # 60s timeout 但未达无进展阈值（120s），继续等下一帧
+                    # 这种情况发生在上游正常但慢（如 GLM 思考阶段偶尔发心跳）
+                    continue
             except OSError as exc:
                 self.logger.warning("上游 SSE 网络 IO 异常(%s: %s)，按已接收内容收尾", type(exc).__name__, exc)
                 raw_chunk = b""
@@ -1199,7 +1234,10 @@ class GLMWebClient:
                     break
                 break
 
-            pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n")
+            # v54 H5: 收到非空 chunk，更新进展时间
+            last_progress_time = time.monotonic()
+
+            pending += decoder.decode(raw_chunk, False).replace("\r\n", "\n").replace("\r", "\n")
 
             while "\n\n" in pending:
                 block, pending = pending.split("\n\n", 1)
@@ -1396,31 +1434,35 @@ class GLMWebClient:
         if account_count <= 0:
             raise RuntimeError("没有可用的 GLM 账号或游客 token 配置")
 
-        # v47 P0: 快速失败检测 — 如果所有账号的 token 都已失效且无法刷新，
-        # 不要遍历所有账号 × 重试次数（可能导致 10-30 分钟挂起），而是快速失败
-        # 检查是否有任何账号有可用的 cached_token 或能刷新
+        # v54 C3: 快速失败检测 — 基于 per-account 熔断状态
+        # v47 的检测条件恒为 True（guest/refresh_token 存在就判可用），是死代码
+        # v54 改为：检查是否有账号未处于熔断期
+        # 熔断触发条件：连续 3 次请求/刷新失败 → 熔断 60 秒
+        now = time.time()
         any_account_usable = False
         for idx in range(account_count):
             acc = self.auth._accounts[idx]
-            # 有 cached_token 且未过期 → 可用
-            if acc.cached_token and acc.cached_token.expires_at > time.time() + 5:
-                any_account_usable = True
-                break
-            # 游客账号 → 可用（可以 fetch 新 token）
-            if acc.is_guest:
-                any_account_usable = True
-                break
-            # 非游客有 refresh_token → 可用（可以刷新）
-            if acc.refresh_token:
-                any_account_usable = True
-                break
+            # 熔断期内 → 跳过
+            if acc.circuit_break_until > now:
+                continue
+            # 未熔断 → 可用（即使 cached_token 过期，也可以尝试刷新）
+            any_account_usable = True
+            break
 
         if not any_account_usable:
-            # v47 P0: 所有账号都不可用 → 立即抛异常，不要等 timeout
-            self.logger.error("所有账号均不可用，快速失败 request=%s accounts=%s", request_name, account_count)
-            raise RuntimeError(
-                "所有 GLM 账号均不可用（token 失效且无法刷新）。"
-                "请检查账号配置或稍后重试。"
+            # 所有账号都在熔断期 → 快速失败
+            earliest_recovery = min(
+                (acc.circuit_break_until for acc in self.auth._accounts),
+                default=now,
+            )
+            wait_seconds = max(0, earliest_recovery - now)
+            self.logger.error(
+                "所有账号均在熔断期，快速失败 request=%s accounts=%s 最快恢复=%.1fs",
+                request_name, account_count, wait_seconds,
+            )
+            raise UpstreamAPIError(
+                status_code=503,
+                message=f"所有 GLM 账号均在冷却中（连续失败触发熔断），最快 {wait_seconds:.0f}s 后恢复。请稍后重试。",
             )
 
         start_index = preferred_account_index % account_count if preferred_account_index is not None else self.auth.get_current_account_index()
@@ -1434,9 +1476,22 @@ class GLMWebClient:
                     access_token = self.auth.get_access_token_for_account(account_index)
                     # Record which account served this request (for admin metrics)
                     self._set_last_account_index(account_index)
-                    return operation(account_index, access_token)
+                    result = operation(account_index, access_token)
+                    # v54 C3: 成功 → 重置熔断计数器
+                    self.auth._accounts[account_index].consecutive_failures = 0
+                    self.auth._accounts[account_index].circuit_break_until = 0.0
+                    return result
                 except Exception as exc:
                     last_exc = exc
+                    # v54 C3: 失败 → 递增熔断计数器，连续 3 次失败 → 熔断 60s
+                    acc_state = self.auth._accounts[account_index]
+                    acc_state.consecutive_failures += 1
+                    if acc_state.consecutive_failures >= 3:
+                        acc_state.circuit_break_until = time.time() + 60.0
+                        self.logger.warning(
+                            "账号连续失败 %s 次，熔断 60s account=%s request=%s",
+                            acc_state.consecutive_failures, account_index, request_name,
+                        )
                     should_switch = self.auth.should_switch_account(exc)
                     # 游客频控检测：命中即轮换 device_id（核心修复）
                     # 智谱游客 chat 接口按 device_id 计数，持久化 device_id 用几次

@@ -89,9 +89,29 @@ class _MockMainServer:
     def _serve(self):
         try:
             conn, _ = self.server.accept()
-            self.received_body = conn.recv(65536)
+            # v54: 循环 recv 直到读完 headers + body
+            # 之前只 recv 一次，TCP 分包时拿不到完整 body
+            buf = b''
+            conn.settimeout(2.0)
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                # 解析 Content-Length，判断是否读完整
+                if b'\r\n\r\n' in buf:
+                    header_part, body_part = buf.split(b'\r\n\r\n', 1)
+                    cl_match = [l for l in header_part.split(b'\r\n') if l.lower().startswith(b'content-length:')]
+                    if cl_match:
+                        cl = int(cl_match[0].split(b':', 1)[1].strip())
+                        if len(body_part) >= cl:
+                            break
+                    else:
+                        # 无 Content-Length，读到连接关闭即可（但这里 break 避免无限等）
+                        break
+            self.received_body = buf
             # 返回简单 JSON 响应
-            resp = b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{"status":"ok"}'
+            resp = b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{"status":"ok"}'
             conn.sendall(resp)
             time.sleep(0.2)
             conn.close()

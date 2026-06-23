@@ -299,15 +299,19 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
+    # v54 C1: 带 tools 时也流式下发 content（之前 defer 导致客户端看不到生成过程）
+    assert chunks != []
+    assert "我将创建文件" in chunks[0]  # 前言在 consume_event 的 chunks 里
+    # finalize 不再重发 _deferred_visible_text（已流式下发）
     assert "我将创建文件" not in "".join(final_chunks)
-    assert '"tool_calls"' in final_chunks[1]
+    # v54: final_chunks[0] 是 tool_calls chunk（role 已在 consume_event 发了）
+    assert '"tool_calls"' in final_chunks[0]
     # P16: Linux 环境下 powershell.exe 被替换为 sh -c
     import sys as _sys
     if _sys.platform != "win32":
-        assert '\\"command\\":[\\"sh\\",\\"-c\\",\\"pwd\\"]' in final_chunks[1]
+        assert '\\"command\\":[\\"sh\\",\\"-c\\",\\"pwd\\"]' in final_chunks[0]
     else:
-        assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+        assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[0]
 
 
 def test_accumulator_defers_visible_text_when_tools_available():
@@ -327,9 +331,12 @@ def test_accumulator_defers_visible_text_when_tools_available():
 
     final_chunks = accumulator.finalize(status)
 
-    assert chunks == []
-    assert '"content":"你好"' in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    # v54 C1: 带 tools 时流式下发 content（不再 defer 到 finalize）
+    assert chunks != []
+    assert '"content":"你好"' in chunks[0]
+    # finalize 不重发已流式下发的 content
+    assert '"content":"你好"' not in "".join(final_chunks)
+    assert '"finish_reason":"stop"' in final_chunks[0]
 
 
 def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():

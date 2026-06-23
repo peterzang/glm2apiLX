@@ -215,15 +215,10 @@ def anthropic_to_openai(payload: dict[str, object]) -> dict[str, object]:
         "stream": payload.get("stream", False),
     }
     if payload.get("max_tokens"):
-        # v53: 放大 max_tokens 上限，避免 Claude Desktop 写长代码时被截断
-        # Claude Desktop 默认发 max_tokens=4096，但写完整游戏/应用需要更多
-        # 官方 Anthropic API 不会在 max_tokens 时断流，而是自动续接
-        # 这里把 max_tokens 放大到至少 32768，让 GLM 有足够空间完成输出
-        original_max = int(payload["max_tokens"])
-        if original_max < 32768:
-            result["max_tokens"] = 32768
-        else:
-            result["max_tokens"] = payload["max_tokens"]
+        # v54: 回退 v53 的强制放大逻辑 — 保留客户端原始值
+        # Claude Desktop 收到 finish_reason="length" 会自动续接，
+        # 不需要 proxy 层覆盖 max_tokens（且避免对低上限模型传 32768 触发上游错误）
+        result["max_tokens"] = payload["max_tokens"]
     if payload.get("temperature") is not None:
         result["temperature"] = payload["temperature"]
     if payload.get("top_p") is not None:

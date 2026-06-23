@@ -92,6 +92,8 @@ def responses_v2_to_openai(payload: dict[str, object]) -> dict[str, object]:
     }
 
     # --- max_output_tokens -> max_tokens ---
+    # v54: 回退 v53 的强制放大逻辑 — 保留客户端原始值，让 GLM 上游决定截断
+    # （finish_reason="length" 会让客户端自动续接，不需要 proxy 层覆盖）
     if payload.get("max_output_tokens") is not None:
         result["max_tokens"] = payload["max_output_tokens"]
 

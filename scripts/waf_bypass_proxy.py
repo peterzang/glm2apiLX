@@ -63,7 +63,13 @@ class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
     """转发所有请求到目标 URL，同时把请求体中的反引号替换为安全字符。
 
     v36: 支持流式 SSE 转发（chunked transfer encoding）。
+    v54: 修正 protocol_version 为 HTTP/1.1（chunked 必须 HTTP/1.1）。
     """
+
+    # v54: chunked transfer encoding 是 HTTP/1.1 特性
+    protocol_version = 'HTTP/1.1'
+    server_version = 'cloudflare'
+    sys_version = ''
 
     # 不打印默认的请求日志（减少噪音）
     def log_message(self, format, *args):
@@ -96,6 +102,8 @@ class BypassProxyHandler(http.server.BaseHTTPRequestHandler):
             forward_headers['Content-Length'] = str(len(body))
         # 设置 Host header
         forward_headers['Host'] = target_host
+        # v54 H2: 标记请求经过 bypass proxy
+        forward_headers['X-WAF-Bypass'] = '1'
 
         # v36: 用 http.client 发送请求（支持流式读取）
         try:

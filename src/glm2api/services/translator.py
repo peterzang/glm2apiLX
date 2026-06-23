@@ -1210,7 +1210,27 @@ class GLMEventAccumulator:
                     self._finish_reason_sent = True  # P0: 标记已发送 finish_reason
                     return chunks, "finish"
             if self.allowed_tool_names is not None:
+                # v54 C1: 带 tools 时也流式下发 content（之前累积到 _deferred_visible_text
+                # 导致 Claude Code 带 tools 的请求在 GLM 整段生成期间看不到一个字）
+                # _deferred_visible_text 仍然累积，用于 finalize 的描述性文本检测
                 self._deferred_visible_text += visible_text_delta
+                delta_payload: dict[str, object] = {"content": visible_text_delta}
+                if not self.emitted_role:
+                    delta_payload = {"role": "assistant", "content": visible_text_delta}
+                    self.emitted_role = True
+                chunks.append(
+                    self._chunk_json(
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": delta_payload,
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+                    )
+                )
             else:
                 delta_payload: dict[str, object] = {"content": visible_text_delta}
                 if not self.emitted_role:
@@ -1260,7 +1280,9 @@ class GLMEventAccumulator:
         # P17 修复：多轮对话后期 GLM 可能生成正常的总结性文本（如 "All files created"），
         # 这不应该被误判为描述性文本。增加规则：如果文本包含 "created"/"done"/"completed"/
         # "successfully"/"file" 等完成类关键词，不触发检测。
-        DESCRIPTIVE_MIN_LEN = 30
+        # v54 H3: 阈值从 30 提到 200 — 30 字符太低，误杀 "I'll explain..." / "Sure, the answer is..."
+        # 等正常短回复。200 字符确保只对明显的"描述性废话"触发。
+        DESCRIPTIVE_MIN_LEN = 200
         if (
             not all_tool_calls
             and self.allowed_tool_names is not None
@@ -1300,7 +1322,9 @@ class GLMEventAccumulator:
             return [error_chunk, "data: [DONE]\n\n"]
 
         chunks: list[str] = []
-        final_text = self._deferred_visible_text + tail_text
+        # v54 C1/H1: _deferred_visible_text 已在 consume_event 中流式下发，
+        # finalize 只发 tail_text（tool_parser flush 的剩余文本）
+        final_text = tail_text
         self._deferred_visible_text = ""
         if final_text:
             self._completion_text_buffer += final_text
@@ -1325,7 +1349,8 @@ class GLMEventAccumulator:
                     + ", ".join(f"`{name}`" for name in unavailable_names)
                     + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
                 )
-        if final_text and not all_tool_calls:
+        if final_text:
+            # v54 H1: 工具调用存在时也发伴随文本（之前 `not all_tool_calls` 条件导致前言被丢弃）
             delta_payload: dict[str, object] = {"content": final_text}
             if not self.emitted_role:
                 delta_payload = {"role": "assistant", "content": final_text}

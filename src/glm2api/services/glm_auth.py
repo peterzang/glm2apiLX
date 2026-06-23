@@ -65,6 +65,10 @@ class AccountState:
     prefetched_token: AccessToken | None = None
     prefetched_device_id: str = ""
     prefetch_in_progress: bool = False
+    # v54 C3: 账号熔断状态 — 连续刷新失败 N 次后熔断 T 秒
+    # 避免所有 refresh_token 失效时遍历全部账号（100 分钟挂起）
+    consecutive_failures: int = 0
+    circuit_break_until: float = 0.0  # time.time() 之前的时间戳，过了则恢复
 
 
 def _load_or_create_device_id(account_index: int) -> str:
@@ -574,10 +578,22 @@ class GLMAccessTokenManager:
             self._accounts[account_index].cached_token = None
 
     def get_access_token_for_account(self, account_index: int) -> str:
-        with self._lock:
-            return self._get_access_token_for_index(account_index)
+        # v54 C1: 不再持外层锁 — _get_access_token_for_index 内部自己管理锁
+        # （double-checked locking + 锁外 HTTP，避免锁内做网络 I/O 串行化所有账号）
+        return self._get_access_token_for_index(account_index)
 
     def _get_access_token_for_index(self, account_index: int) -> str:
+        """v54 C1: double-checked locking + 锁外 HTTP。
+
+        之前整个方法体在 self._lock 内，而 _refresh_access_token 会做 HTTP（最长 60s），
+        导致所有账号的 token 获取被串行化（100 并发槽位实际只能服务 1 个请求）。
+
+        现在：
+        1. 第一次持锁：检查 cached_token / prefetched_token，命中则立即返回
+        2. 锁外：做 HTTP 刷新（可能多个线程同时刷新，结果一致，无害）
+        3. 第二次持锁：CAS 写入（如果其他线程已刷新，用其结果）
+        """
+        # 第一次检查（持锁）
         with self._lock:
             account = self._accounts[account_index]
             if account.cached_token and time.time() < account.cached_token.expires_at - 60:
@@ -598,9 +614,25 @@ class GLMAccessTokenManager:
                     account.cached_token.expires_at - time.time(),
                 )
                 return account.cached_token.access_token
-            # 兜底：同步 fetch（持有 RLock 可重入）
-            account.cached_token = self._refresh_access_token(account_index)
-            return account.cached_token.access_token
+            # 都失效，需要刷新 — 释放锁后做 HTTP
+            need_refresh = True
+
+        if need_refresh:
+            # 锁外做 HTTP（_refresh_access_token 内部调用 next_request_id_for_account /
+            # get_device_id_for_account，它们自己加锁，所以锁外调用安全）
+            new_token = self._refresh_access_token(account_index)
+            # 第二次检查（持锁）：CAS 写入
+            with self._lock:
+                account = self._accounts[account_index]
+                # 如果其他线程已经刷新了有效 token，用它的结果（避免覆盖更新的 token）
+                if account.cached_token and time.time() < account.cached_token.expires_at - 60:
+                    return account.cached_token.access_token
+                account.cached_token = new_token
+                return account.cached_token.access_token
+        # 理论上不会走到这里（need_refresh 要么 True 要么在第一次检查返回）
+        with self._lock:
+            account = self._accounts[account_index]
+            return account.cached_token.access_token if account.cached_token else ""
 
     def _refresh_access_token(self, account_index: int) -> AccessToken:
         account = self._accounts[account_index]
@@ -748,14 +780,34 @@ class GLMAccessTokenManager:
             raise RuntimeError(f"写入 .env 失败: {env_path} error={exc}") from exc
 
     def should_switch_account(self, exc: Exception) -> bool:
+        """v54 H3: 只在 token 失效或上游服务异常时切换账号。
+
+        之前所有 UpstreamAPIError / HTTPError / URLError / TimeoutError 都切换，
+        导致 400/422 用户错误（如 model=invalid）和网络抖动会清空所有账号的 cached_token，
+        叠加 token 刷新串行化导致雪崩。
+        """
+        # UpstreamAPIError — 按 status_code 区分
         if hasattr(exc, "status_code"):
-            return True
+            code = getattr(exc, "status_code", 0) or 0
+            # 401/403: token 失效 → 切换账号
+            # 429: busy → 切换账号（可能该账号被频控）
+            # 5xx: 上游服务异常 → 切换账号
+            # 400/422/413/404: 用户错误 → 不切换（切了也没用，新账号同样会拒绝）
+            if code in (401, 403, 429) or 500 <= code < 600:
+                return True
+            return False
+        # HTTPError — 同上按 code 区分
         if isinstance(exc, urllib.error.HTTPError):
-            return True
+            code = exc.code or 0
+            if code in (401, 403, 429) or 500 <= code < 600:
+                return True
+            return False
+        # URLError / TimeoutError: 网络问题 — 不切换（切到下一账号大概率同样失败，
+        # 反而清空 cached_token。调用方的 busy retry 会重试当前账号）
         if isinstance(exc, urllib.error.URLError):
-            return True
+            return False
         if isinstance(exc, TimeoutError):
-            return True
+            return False
         if isinstance(exc, RuntimeError):
             return "token" in str(exc).lower()
         return False

@@ -40,6 +40,13 @@ def _bypass_backticks(body: bytes) -> bytes:
 class _BypassHandler(http.server.BaseHTTPRequestHandler):
     """转发请求到目标端口，同时替换反引号。"""
 
+    # v54: 必须设 HTTP/1.1，否则 chunked transfer encoding 不合规，
+    # 且 keep-alive 失效导致 Claude Code 每个请求重建 TCP 连接。
+    protocol_version = 'HTTP/1.1'
+    # 与主服务对齐，伪装成 cloudflare 而非暴露 Python 版本
+    server_version = 'cloudflare'
+    sys_version = ''
+
     def log_message(self, format, *args):
         pass
 
@@ -62,6 +69,9 @@ class _BypassHandler(http.server.BaseHTTPRequestHandler):
         if body:
             forward_headers['Content-Length'] = str(len(body))
         forward_headers['Host'] = f'{target_host}:{target_port}'
+        # v54 H2: 标记请求经过 bypass proxy，server 只在有此标记时还原 ˋ → `
+        # 避免直连用户 prompt 中的合法 ˋ（越南语/拼音/IPA）被误转
+        forward_headers['X-WAF-Bypass'] = '1'
 
         try:
             conn = http.client.HTTPConnection(target_host, target_port, timeout=300)
@@ -87,6 +97,9 @@ class _BypassHandler(http.server.BaseHTTPRequestHandler):
                 if key.lower() in _HOP_BY_HOP or key.lower() == 'content-length':
                     continue
                 self.send_header(key, val)
+            # v54: 显式 Connection: close — HTTP/1.1 chunked 结束后关闭连接，
+            # 避免客户端误等（部分 SDK 对 chunked + keep-alive 处理不一致）
+            self.send_header('Connection', 'close')
             self.send_header('Transfer-Encoding', 'chunked')
             self.end_headers()
             try:
@@ -112,6 +125,8 @@ class _BypassHandler(http.server.BaseHTTPRequestHandler):
                 if key.lower() in _HOP_BY_HOP or key.lower() == 'content-length':
                     continue
                 self.send_header(key, val)
+            # v54: 显式 Connection: close，确保响应结束后连接关闭
+            self.send_header('Connection', 'close')
             self.send_header('Content-Length', str(len(resp_body)))
             self.end_headers()
             self.wfile.write(resp_body)

@@ -499,10 +499,11 @@ class GLM2APIServer:
                         )
                         return
                     debug_dump(logger, config.debug_dump_all, f"HTTP 入站解析后 JSON path={self.path}", payload)
-                    # v35: WAF bypass — 还原 bypass 代理替换的反引号
-                    # 在所有协议处理之前，统一还原请求体中的 ˋ (U+02CB) → ` (U+0060)
-                    # 这样 Anthropic/OpenAI Chat/Responses 三种协议都能正确还原
-                    _restore_backticks_in_payload(payload)
+                    # v35/v54 H2: WAF bypass — 只在请求经过 bypass proxy 时还原 ˋ → `
+                    # 之前无条件还原，导致直连用户 prompt 中的合法 ˋ（越南语/拼音/IPA）被误转
+                    # bypass proxy 会在请求头加 X-WAF-Bypass: 1，据此判断
+                    if self.headers.get("X-WAF-Bypass") == "1":
+                        _restore_backticks_in_payload(payload)
                     # Record model + stream for admin metrics (best-effort)
                     if isinstance(payload.get("model"), str):
                         self._admin_model = str(payload["model"])
@@ -939,7 +940,6 @@ class GLM2APIServer:
                 3. 主线程周期性发 ping 心跳（2s 间隔，与 Responses v2 一致）
                 """
                 openai_payload["stream"] = True
-                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = AnthropicStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
@@ -960,20 +960,8 @@ class GLM2APIServer:
                     logger.warning("客户端在 Anthropic 流式启动阶段断开 model=%s", model)
                     return
 
-                # v34 P0-2: 后台线程读上游 chunks（不阻塞主线程，主线程可以发心跳）
-                chunk_queue: queue.Queue[object] = queue.Queue()
-                sentinel = object()
-
-                def read_upstream() -> None:
-                    try:
-                        for upstream_chunk in stream_iter:
-                            chunk_queue.put(upstream_chunk)
-                    except BaseException as exc:
-                        chunk_queue.put(exc)
-                    finally:
-                        chunk_queue.put(sentinel)
-
-                threading.Thread(target=read_upstream, daemon=True).start()
+                # v54: 后台线程读上游（stream_chat_completion 也在后台调用，避免主线程阻塞）
+                chunk_queue, sentinel, close_upstream = self._start_stream_background(openai_payload)
 
                 # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
                 collected_chunks: list[bytes] = []
@@ -985,13 +973,9 @@ class GLM2APIServer:
                             queued = chunk_queue.get(timeout=ANTHROPIC_PING_INTERVAL)
                         except queue.Empty:
                             # v34 P0-2: 超时未收到 chunk → 发 ping 心跳保活
-                            # 官方 Anthropic API 周期性发 event: ping
-                            # 这防止 Claude Code 在 GLM 思考时超时断开
-                            try:
-                                self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
-                                self.wfile.flush()
-                            except _CLIENT_DISCONNECTED:
+                            if not self._write_heartbeat(b'event: ping\ndata: {"type": "ping"}\n\n'):
                                 logger.warning("客户端在 ping 心跳阶段断开 model=%s", model)
+                                close_upstream()
                                 return
                             continue
 
@@ -1012,9 +996,11 @@ class GLM2APIServer:
                                 self.wfile.flush()
                             except _CLIENT_DISCONNECTED:
                                 logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s", model)
+                                close_upstream()
                                 return
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
+                    close_upstream()
                     return
                 except Exception as exc:
                     logger.error("Anthropic 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
@@ -1050,7 +1036,6 @@ class GLM2APIServer:
 
             def _stream_responses(self, openai_payload: dict[str, object], model: str) -> None:
                 openai_payload["stream"] = True
-                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = ResponsesStreamAccumulator(model=model)
 
                 self.send_response(HTTPStatus.OK)
@@ -1072,19 +1057,8 @@ class GLM2APIServer:
                     logger.warning("客户端在 Responses 流式响应启动阶段断开 model=%s", model)
                     return
 
-                chunk_queue: queue.Queue[object] = queue.Queue()
-                sentinel = object()
-
-                def read_upstream() -> None:
-                    try:
-                        for upstream_chunk in stream_iter:
-                            chunk_queue.put(upstream_chunk)
-                    except BaseException as exc:
-                        chunk_queue.put(exc)
-                    finally:
-                        chunk_queue.put(sentinel)
-
-                threading.Thread(target=read_upstream, daemon=True).start()
+                # v54: 后台线程读上游（含 stream_chat_completion 调用）
+                chunk_queue, sentinel, close_upstream = self._start_stream_background(openai_payload)
 
                 # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
                 collected_chunks: list[bytes] = []
@@ -1093,8 +1067,10 @@ class GLM2APIServer:
                         try:
                             queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
                         except queue.Empty:
-                            self.wfile.write(b": keep-alive\n\n")
-                            self.wfile.flush()
+                            if not self._write_heartbeat(b": keep-alive\n\n"):
+                                logger.warning("客户端在 Responses 心跳阶段断开 model=%s", model)
+                                close_upstream()
+                                return
                             continue
 
                         if queued is sentinel:
@@ -1108,10 +1084,16 @@ class GLM2APIServer:
                         collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                         events = accumulator.feed_chunk(chunk)  # type: ignore[arg-type]
                         for event in events:
-                            self.wfile.write(event.encode("utf-8"))
-                            self.wfile.flush()
+                            try:
+                                self.wfile.write(event.encode("utf-8"))
+                                self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在 Responses 流式响应过程中断开 model=%s", model)
+                                close_upstream()
+                                return
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在 Responses 流式响应过程中断开 model=%s error=%s", model, exc)
+                    close_upstream()
                     return
                 except Exception as exc:
                     logger.error("Responses 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
@@ -1149,7 +1131,6 @@ class GLM2APIServer:
                 self, openai_payload: dict[str, object], model: str, request_payload: dict[str, object]
             ) -> None:
                 openai_payload["stream"] = True
-                stream_iter = glm_client.stream_chat_completion(openai_payload)
                 accumulator = ResponsesV2StreamAccumulator(model=model, request_payload=request_payload)
 
                 self.send_response(HTTPStatus.OK)
@@ -1160,29 +1141,32 @@ class GLM2APIServer:
                 self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
-                chunk_queue: queue.Queue[object] = queue.Queue()
-                sentinel = object()
+                # v54 P0: 立即发送 response.created + response.in_progress
+                # 之前 v2 路径不发，导致 codex 等 SDK 在 GLM 思考阶段超时
+                try:
+                    for event_type, event_data in accumulator.consume_chunk({}):
+                        sse_event = f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
+                        self.wfile.write(sse_event.encode("utf-8"))
+                    self.wfile.flush()
+                except _CLIENT_DISCONNECTED:
+                    logger.warning("客户端在 Responses v2 流式响应启动阶段断开 model=%s", model)
+                    return
 
-                def read_upstream() -> None:
-                    try:
-                        for upstream_chunk in stream_iter:
-                            chunk_queue.put(upstream_chunk)
-                    except BaseException as exc:
-                        chunk_queue.put(exc)
-                    finally:
-                        chunk_queue.put(sentinel)
-
-                threading.Thread(target=read_upstream, daemon=True).start()
+                # v54: 后台线程读上游（含 stream_chat_completion 调用）
+                chunk_queue, sentinel, close_upstream = self._start_stream_background(openai_payload)
 
                 # 收集 OpenAI 原始 chunks 以便流结束后提取 usage
                 collected_chunks: list[bytes] = []
+                client_disconnected = False
                 try:
                     while True:
                         try:
                             queued = chunk_queue.get(timeout=RESPONSES_STREAM_HEARTBEAT_SECONDS)
                         except queue.Empty:
-                            self.wfile.write(b": keep-alive\n\n")
-                            self.wfile.flush()
+                            if not self._write_heartbeat(b": keep-alive\n\n"):
+                                logger.warning("客户端在 Responses v2 心跳阶段断开 model=%s", model)
+                                client_disconnected = True
+                                break
                             continue
 
                         if queued is sentinel:
@@ -1212,20 +1196,35 @@ class GLM2APIServer:
                                             self.wfile.flush()
                                     except (json.JSONDecodeError, ValueError):
                                         pass
+                                    except _CLIENT_DISCONNECTED:
+                                        client_disconnected = True
+                                        break
+                            if client_disconnected:
+                                break
                         except _CLIENT_DISCONNECTED:
-                            return
+                            client_disconnected = True
+                            break
+                except _CLIENT_DISCONNECTED as exc:
+                    logger.warning("客户端在 Responses v2 流式响应过程中断开 model=%s error=%s", model, exc)
+                    close_upstream()
+                    return
+                except Exception as exc:
+                    logger.error("Responses v2 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
 
-                    # 流结束，发送 finalize 事件
+                if client_disconnected:
+                    close_upstream()
+                    return
+
+                # v54 P0 C3: finalize 移到 try/except 之外，确保异常路径也发 response.completed
+                try:
                     for event_type, event_data in accumulator.finalize():
                         sse_event = f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n"
                         self.wfile.write(sse_event.encode("utf-8"))
                         self.wfile.flush()
-
-                except _CLIENT_DISCONNECTED as exc:
-                    logger.warning("客户端在 Responses v2 流式响应过程中断开 model=%s error=%s", model, exc)
-                    return
+                except _CLIENT_DISCONNECTED:
+                    pass
                 except Exception as exc:
-                    logger.error("Responses v2 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+                    logger.error("Responses v2 finalize 失败 model=%s error=%s", model, exc)
 
                 # 流结束后记录 token 用量
                 self._record_streaming_token_usage(collected_chunks)
@@ -1238,10 +1237,10 @@ class GLM2APIServer:
 
                 之前：for chunk in stream_iter 同步阻塞，GLM 慢时无数据 → Codex 超时
                 现在：后台线程读上游 + 主线程 2s 心跳（与 Anthropic 路径一致）
+                v54: stream_chat_completion 移入后台线程，客户端断连关闭上游
                 """
                 model = str(payload.get("model", "unknown"))
                 logger.info("开始流式响应 model=%s", model)
-                stream_iter = glm_client.stream_chat_completion(payload)
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1257,20 +1256,8 @@ class GLM2APIServer:
                     and str(response_format.get("type", "")).strip().lower() in ("json_object", "json_schema")
                 )
 
-                # v47: 后台线程读上游 chunks（与 Anthropic/Responses 路径一致）
-                chunk_queue: queue.Queue[object] = queue.Queue()
-                sentinel = object()
-
-                def read_upstream() -> None:
-                    try:
-                        for upstream_chunk in stream_iter:
-                            chunk_queue.put(upstream_chunk)
-                    except BaseException as exc:
-                        chunk_queue.put(exc)
-                    finally:
-                        chunk_queue.put(sentinel)
-
-                threading.Thread(target=read_upstream, daemon=True).start()
+                # v54: 后台线程读上游（含 stream_chat_completion 调用）
+                chunk_queue, sentinel, close_upstream = self._start_stream_background(payload)
 
                 sent_done = False
                 collected_chunks: list[bytes] = []
@@ -1283,12 +1270,9 @@ class GLM2APIServer:
                             queued = chunk_queue.get(timeout=CHAT_HEARTBEAT_INTERVAL)
                         except queue.Empty:
                             # v47: 超时未收到 chunk → 发 SSE 注释心跳保活
-                            # OpenAI SSE 规范允许 : 开头的注释行（客户端忽略）
-                            try:
-                                self.wfile.write(b": keep-alive\n\n")
-                                self.wfile.flush()
-                            except _CLIENT_DISCONNECTED:
+                            if not self._write_heartbeat(b": keep-alive\n\n"):
                                 logger.warning("客户端在心跳阶段断开 model=%s", model)
+                                close_upstream()
                                 return
                             continue
 
@@ -1324,19 +1308,27 @@ class GLM2APIServer:
                             except Exception:
                                 pass
                         else:
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
+                            try:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在流式响应过程中断开 model=%s", model)
+                                close_upstream()
+                                return
                             if b"data: [DONE]\n\n" in chunk_bytes:
                                 sent_done = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
                     self._write_sse_error(str(exc), "upstream_error")
+                    sent_done = True  # v54: 防止 finally 重复发 [DONE]
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在流式响应过程中断开 model=%s error=%s", model, exc)
+                    close_upstream()
                     return
                 except Exception as exc:
                     logger.error("流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
                     self._write_sse_error(str(exc), exc.__class__.__name__)
+                    sent_done = True
                 finally:
                     if not sent_done and not is_json_mode:
                         try:
@@ -1715,33 +1707,54 @@ class GLM2APIServer:
                 self._write_json(HTTPStatus.OK, legacy_response)
 
             def _stream_legacy_completion(self, chat_payload: dict[str, object], model_id: str) -> None:
-                """Stream a legacy /v1/completions response, translating chat SSE -> completion SSE."""
+                """Stream a legacy /v1/completions response, translating chat SSE -> completion SSE.
+
+                v54: 加心跳保活（与 _stream_completion 一致），修复 GLM 思考时客户端超时
+                """
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
                 self.end_headers()
 
+                # v54: 后台线程读上游（含 stream_chat_completion 调用）
+                chunk_queue, sentinel, close_upstream = self._start_stream_background(chat_payload)
+
                 sent_done = False
-                # 收集原始 chunks 以便流结束后提取 usage
                 collected_chunks: list[bytes] = []
+                LEGACY_HEARTBEAT_INTERVAL = 2.0
                 try:
-                    for chunk in glm_client.stream_chat_completion(chat_payload):
+                    while True:
+                        try:
+                            chunk = chunk_queue.get(timeout=LEGACY_HEARTBEAT_INTERVAL)
+                        except queue.Empty:
+                            if not self._write_heartbeat(b": keep-alive\n\n"):
+                                logger.warning("客户端在 legacy completion 心跳阶段断开 model=%s", model_id)
+                                close_upstream()
+                                return
+                            continue
+                        if chunk is sentinel:
+                            break
+                        if isinstance(chunk, BaseException):
+                            raise chunk
                         if not chunk:
                             continue
                         collected_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
                         text = chunk.decode("utf-8", errors="ignore")
-                        # Each chunk is `data: {...}\n\n` with chat.completion.chunk shape
-                        # Convert to text_completion chunk shape
                         for line in text.split("\n\n"):
                             line = line.strip()
                             if not line.startswith("data: "):
                                 continue
                             data_str = line[6:]
                             if data_str == "[DONE]":
-                                self.wfile.write(b"data: [DONE]\n\n")
-                                self.wfile.flush()
+                                try:
+                                    self.wfile.write(b"data: [DONE]\n\n")
+                                    self.wfile.flush()
+                                except _CLIENT_DISCONNECTED:
+                                    close_upstream()
+                                    return
                                 sent_done = True
                                 continue
                             try:
@@ -1771,10 +1784,16 @@ class GLM2APIServer:
                             }
                             if "usage" in data:
                                 legacy_chunk["usage"] = data["usage"]
-                            self.wfile.write(f"data: {json.dumps(legacy_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
-                            self.wfile.flush()
+                            try:
+                                self.wfile.write(f"data: {json.dumps(legacy_chunk, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8"))
+                                self.wfile.flush()
+                            except _CLIENT_DISCONNECTED:
+                                logger.warning("客户端在 legacy completion 流式响应过程中断开 model=%s", model_id)
+                                close_upstream()
+                                return
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在 legacy completion 流式响应过程中断开 model=%s error=%s", model_id, exc)
+                    close_upstream()
                     return
                 except Exception as exc:
                     logger.error("legacy completion 流式请求失败 model=%s error=%s\n%s", model_id, exc, traceback.format_exc())
@@ -1905,6 +1924,55 @@ class GLM2APIServer:
                     self.wfile.flush()
                 except _CLIENT_DISCONNECTED:
                     logger.warning("客户端在 SSE 错误写回前断开 path=%s", self.path)
+
+            def _start_stream_background(self, openai_payload: dict[str, object]):
+                """v54: 启动后台线程读上游 SSE，返回 (chunk_queue, sentinel, close_upstream)。
+
+                修复三个 Critical 问题：
+                1. C2（首 chunk 等待无心跳）：stream_chat_completion 在后台线程调用，
+                   主线程不再阻塞，可立即发心跳
+                2. C1（客户端断连后上游不关闭）：close_upstream() 让主线程在断连时
+                   调用 stream_iter.close()，触发 generator finally 释放 lease + 关闭连接
+                3. H1（except BaseException 吞掉 KeyboardInterrupt）：改为 except Exception
+                """
+                chunk_queue: queue.Queue[object] = queue.Queue()
+                sentinel = object()
+                stream_holder: dict[str, object] = {"iter": None}
+
+                def read_upstream() -> None:
+                    try:
+                        # stream_chat_completion 是普通函数（非 generator），
+                        # 调用时同步打开上游连接 — 放后台线程避免主线程阻塞
+                        stream_holder["iter"] = glm_client.stream_chat_completion(openai_payload)
+                        for upstream_chunk in stream_holder["iter"]:
+                            chunk_queue.put(upstream_chunk)
+                    except Exception as exc:
+                        # v54: 不用 BaseException，避免吞掉 KeyboardInterrupt / SystemExit
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                threading.Thread(target=read_upstream, daemon=True).start()
+
+                def close_upstream() -> None:
+                    """主线程客户端断连时调用，关闭上游 generator 触发 lease 释放。"""
+                    it = stream_holder.get("iter")
+                    if it is not None:
+                        try:
+                            it.close()  # 触发 generator finally（释放 lease + close response）
+                        except Exception:
+                            pass
+
+                return chunk_queue, sentinel, close_upstream
+
+            def _write_heartbeat(self, data: bytes) -> bool:
+                """v54: 写心跳数据，返回是否成功。失败表示客户端已断连。"""
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                    return True
+                except _CLIENT_DISCONNECTED:
+                    return False
 
             def _safe_http_status(self, value: int, fallback: HTTPStatus) -> HTTPStatus:
                 try:
