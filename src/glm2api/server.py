@@ -234,8 +234,11 @@ class GLM2APIServer:
                 修复 v33 审计 P2-1：之前未实现 do_HEAD，curl -I / SDK 健康探测
                 会触发 501 Unsupported method ('HEAD')，破坏 keep-alive 连接复用。
 
+                v49: HEAD / 也返回 200（Claude Code 等客户端用 HEAD / 做健康探测，
+                返回 405 会被当作 endpoint 不可用）
+
                 支持的 HEAD 路径：
-                - /health → 200 OK（无 body）
+                - / 或 /health → 200 OK（无 body）
                 - /v1/models → 200 OK（无 body，需要 API key 认证）
                 - /admin/* → 转发到 admin handler
                 - 其他 → 405 Method Not Allowed
@@ -245,7 +248,8 @@ class GLM2APIServer:
                     if handle_admin_request(self, config, glm_client, logger):
                         return
                     path = self._path_without_query()
-                    if path == "/health":
+                    # v49: HEAD / 返回 200（Claude Code 健康探测）
+                    if path == "/" or path == "/health":
                         self.send_response(HTTPStatus.OK)
                         self._send_common_headers()
                         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -285,6 +289,16 @@ class GLM2APIServer:
                         return
                     if path == f"{config.api_prefix}/models":
                         if not self._authorize():
+                            # v49 BUG1: 之前只 return 不发响应，客户端收到空响应报 501
+                            self._write_json(
+                                HTTPStatus.UNAUTHORIZED,
+                                make_error(
+                                    "Incorrect API key provided. You can find your API key at https://platform.openai.com/account/api-keys.",
+                                    error_type=ERROR_AUTHENTICATION,
+                                    code="invalid_api_key",
+                                    request_id=gen_request_id(),
+                                ),
+                            )
                             return
                         self.send_response(HTTPStatus.OK)
                         self._send_common_headers()
@@ -510,6 +524,96 @@ class GLM2APIServer:
                     if payload.get("stream"):
                         self._admin_stream = True
 
+                    # v49 BUG2/3/4 + WARN: 统一输入校验
+                    # 适用于所有 chat-like 端点（messages/responses/responses_v2/chat/completions/completions）
+                    chat_like_endpoints = {
+                        f"{config.api_prefix}/messages",
+                        f"{config.api_prefix}/responses",
+                        f"{config.api_prefix}/responses_v2",
+                        "/v2/responses",
+                        f"{config.api_prefix}/chat/completions",
+                        f"{config.api_prefix}/completions",
+                    }
+                    if path in chat_like_endpoints:
+                        # BUG3: 空 messages 数组校验
+                        msgs = payload.get("messages")
+                        # Responses v2 用 input 而非 messages
+                        if "input" in payload and "messages" not in payload:
+                            msgs = payload.get("input")
+                        if isinstance(msgs, list) and len(msgs) == 0:
+                            self._write_json(
+                                HTTPStatus.BAD_REQUEST,
+                                make_error(
+                                    "messages array must not be empty",
+                                    error_type=ERROR_INVALID_REQUEST,
+                                    param="messages",
+                                    code="invalid_request",
+                                    request_id=gen_request_id(),
+                                ),
+                            )
+                            return
+
+                        # BUG4: max_tokens 非法值校验（0/负数）
+                        # Anthropic 用 max_tokens，OpenAI 用 max_tokens，Responses 用 max_output_tokens
+                        mt_keys = ("max_tokens", "max_output_tokens")
+                        for mt_key in mt_keys:
+                            mt_val = payload.get(mt_key)
+                            if mt_val is not None:
+                                try:
+                                    mt_int = int(mt_val)
+                                    if mt_int <= 0:
+                                        self._write_json(
+                                            HTTPStatus.BAD_REQUEST,
+                                            make_error(
+                                                f"{mt_key} must be a positive integer (got {mt_int})",
+                                                error_type=ERROR_INVALID_REQUEST,
+                                                param=mt_key,
+                                                code="invalid_request",
+                                                request_id=gen_request_id(),
+                                            ),
+                                        )
+                                        return
+                                except (ValueError, TypeError):
+                                    self._write_json(
+                                        HTTPStatus.BAD_REQUEST,
+                                        make_error(
+                                            f"{mt_key} must be an integer (got {mt_val!r})",
+                                            error_type=ERROR_INVALID_REQUEST,
+                                            param=mt_key,
+                                            code="invalid_request",
+                                            request_id=gen_request_id(),
+                                        ),
+                                    )
+                                    return
+
+                        # WARN: 无 model 字段 fallback 改为 glm-5.2-flash（之前是 glm-4 旧模型）
+                        if not payload.get("model"):
+                            payload["model"] = "glm-5.2-flash"
+                            logger.info("请求未指定 model，fallback 到 glm-5.2-flash")
+
+                        # BUG2: 不存在的模型校验
+                        # 默认宽松模式：未知模型 fallback 到 glm-5.2-flash（Claude Code 友好）
+                        # STRICT_MODEL_VALIDATION=true 时严格 404
+                        model_id_check = str(payload.get("model", ""))
+                        strict_model_validation = os.environ.get("STRICT_MODEL_VALIDATION", "").lower() in ("true", "1", "yes")
+                        if model_id_check and model_id_check not in self._get_effective_exposed_models():
+                            if strict_model_validation:
+                                self._write_json(
+                                    HTTPStatus.NOT_FOUND,
+                                    make_error(
+                                        f"The model '{model_id_check}' does not exist",
+                                        error_type=ERROR_INVALID_REQUEST,
+                                        param="model",
+                                        code="model_not_found",
+                                        request_id=gen_request_id(),
+                                    ),
+                                )
+                                return
+                            else:
+                                # 宽松模式：fallback 到 glm-5.2-flash 并记录
+                                logger.info("未知 model=%s fallback 到 glm-5.2-flash", model_id_check)
+                                payload["model"] = "glm-5.2-flash"
+
                     # --- Anthropic Messages API ---
                     if path == f"{config.api_prefix}/messages":
                         logger.info("收到 Anthropic 请求 model=%s stream=%s", payload.get("model"), payload.get("stream"))
@@ -646,42 +750,16 @@ class GLM2APIServer:
                         return
 
                     # --- Chat completions ---
-                    # v19 修复 P2：空 messages 数组早期校验，避免发到上游导致挂起
+                    # v49: 校验已在上面的 chat_like_endpoints 统一处理（messages/model/max_tokens）
+                    # 这里只做 chat completions 特有的 messages 必填校验（兼容老逻辑）
                     messages = payload.get("messages")
-                    if not isinstance(messages, list) or not payload.get("model"):
+                    if not isinstance(messages, list):
                         self._write_json(
                             HTTPStatus.BAD_REQUEST,
                             make_error(
-                                "you must provide a model and messages parameter",
-                                error_type=ERROR_INVALID_REQUEST,
-                                param="messages" if not messages else "model",
-                                request_id=gen_request_id(),
-                            ),
-                        )
-                        return
-                    # v19 P2: messages 是空数组时返回错误（避免上游 GLM 挂起）
-                    if len(messages) == 0:
-                        self._write_json(
-                            HTTPStatus.BAD_REQUEST,
-                            make_error(
-                                "messages array must not be empty",
+                                "you must provide a messages parameter as an array",
                                 error_type=ERROR_INVALID_REQUEST,
                                 param="messages",
-                                request_id=gen_request_id(),
-                            ),
-                        )
-                        return
-
-                    # Validate model exists
-                    model_id = str(payload.get("model", ""))
-                    if model_id not in self._get_effective_exposed_models():
-                        self._write_json(
-                            HTTPStatus.NOT_FOUND,
-                            make_error(
-                                f"The model '{model_id}' does not exist",
-                                error_type=ERROR_INVALID_REQUEST,
-                                param="model",
-                                code="model_not_found",
                                 request_id=gen_request_id(),
                             ),
                         )
@@ -890,26 +968,10 @@ class GLM2APIServer:
                                    code="count_tokens_error", request_id=gen_request_id()))
 
             def _handle_anthropic_messages(self, payload: dict[str, object]) -> None:
-                model = str(payload.get("model", "glm-4"))
+                model = str(payload.get("model", "glm-5.2-flash"))
                 openai_payload = anthropic_to_openai(payload)
 
-                # v20 P2-2: strict_model_validation 模式下校验模型是否存在
-                # 默认宽松模式（容错 fallback 到默认模型），符合 Claude Code 客户端友好设计
-                # 设置环境变量 STRICT_MODEL_VALIDATION=true 启用严格模式
-                strict_model_validation = os.environ.get("STRICT_MODEL_VALIDATION", "").lower() in ("true", "1", "yes")
-                if strict_model_validation and model not in self._get_effective_exposed_models():
-                    self._write_json(
-                        HTTPStatus.NOT_FOUND,
-                        make_error(
-                            f"The model '{model}' does not exist",
-                            error_type="invalid_request_error",
-                            param="model",
-                            code="model_not_found",
-                            request_id=gen_request_id(),
-                        ),
-                    )
-                    return
-
+                # v49: model 校验已在上层 chat_like_endpoints 统一处理
                 if payload.get("stream"):
                     self._stream_anthropic(openai_payload, model)
                     return
