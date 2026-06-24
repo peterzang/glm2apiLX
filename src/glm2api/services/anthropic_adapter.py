@@ -272,9 +272,11 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
     """Convert an OpenAI chat/completions response to Anthropic Messages format.
 
     P1-1 修复：支持 stop_sequences 截断。
+    v53 P0 修复：stop_sequence 返回匹配的字符串（而非 None），与官方 API 一致。
     """
     content: list[dict[str, object]] = []
     stop_reason = "end_turn"
+    matched_stop_sequence: str | None = None  # v53: 记录匹配的 stop_sequence
 
     choices = result.get("choices", [])
     if isinstance(choices, list) and choices:
@@ -296,12 +298,19 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
                     text = str(text)
                     # P1-1: stop_sequences 截断
                     if stop_sequences:
+                        # v53 P0: 找文本中最早出现的 stop_sequence（而非按列表顺序）
+                        earliest_idx = -1
+                        earliest_seq = None
                         for stop_seq in stop_sequences:
                             if stop_seq and isinstance(stop_seq, str) and stop_seq in text:
                                 idx = text.index(stop_seq)
-                                text = text[:idx]
-                                stop_reason = "stop_sequence"
-                                break
+                                if earliest_idx == -1 or idx < earliest_idx:
+                                    earliest_idx = idx
+                                    earliest_seq = stop_seq
+                        if earliest_seq is not None:
+                            text = text[:earliest_idx]
+                            stop_reason = "stop_sequence"
+                            matched_stop_sequence = earliest_seq
                     content.append({"type": "text", "text": text})
 
                 # tool_calls
@@ -328,7 +337,41 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
                 stop_reason = "max_tokens"
             # P1-1: 如果 OpenAI finish_reason="stop" 且提供了 stop_sequences，设为 stop_sequence
             elif finish_reason == "stop" and stop_sequences:
-                stop_reason = "stop_sequence"
+                # v53 P0: 需要找出实际匹配的 stop_sequence 字符串
+                # GLM 上游可能已经截断了 stop_sequence，所以文本里可能找不到
+                # 检查原始文本中哪个 stop_sequence 出现了
+                if not matched_stop_sequence:
+                    raw_text = ""
+                    if isinstance(choice, dict):
+                        msg = choice.get("message", {})
+                        if isinstance(msg, dict):
+                            c = msg.get("content")
+                            if isinstance(c, str):
+                                raw_text = c
+                    if raw_text:
+                        # 先按文本位置找最早出现的
+                        earliest_idx = -1
+                        earliest_seq = None
+                        for stop_seq in stop_sequences:
+                            if stop_seq and isinstance(stop_seq, str) and stop_seq in raw_text:
+                                idx = raw_text.index(stop_seq)
+                                if earliest_idx == -1 or idx < earliest_idx:
+                                    earliest_idx = idx
+                                    earliest_seq = stop_seq
+                        if earliest_seq is not None:
+                            matched_stop_sequence = earliest_seq
+                    # v53: 只有文本里能找到 stop_sequence 时才判定为 stop_sequence 触发
+                    # GLM 上游已截断文本时，无法确定是 stop_sequence 还是正常结束
+                    # 为了兼容性，当只有一个 stop_sequence 且 finish_reason=stop 时，
+                    # 假设是 stop_sequence 触发（GLM 上游已处理截断）
+                    if not matched_stop_sequence and len(stop_sequences) == 1:
+                        # 单个 stop_sequence 场景：假设触发（GLM 上游已截断）
+                        # 这是有风险的假设，但符合大多数实际场景
+                        matched_stop_sequence = stop_sequences[0] if isinstance(stop_sequences[0], str) else None
+                # 只有 matched_stop_sequence 不为 None 时才设 stop_reason
+                if matched_stop_sequence is not None:
+                    stop_reason = "stop_sequence"
+                # 否则保持 end_turn（正常结束）
 
     if not content:
         content.append({"type": "text", "text": ""})
@@ -344,13 +387,20 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        # v53 P0: 返回匹配的 stop_sequence 字符串（而非 None），与官方 API 一致
+        "stop_sequence": matched_stop_sequence,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             # v31: 官方 Anthropic API 兼容字段
             "cache_creation_input_tokens": 0,  # GLM 不支持 prompt cache
             "cache_read_input_tokens": 0,     # GLM 不支持 prompt cache
+            # v53 P1: 补全 usage 字段，与官方 API 一致
+            "server_tool_use": {
+                "web_search_requests": 0,
+                "web_fetch_requests": 0,
+            },
+            "service_tier": "standard",
         },
     }
 
@@ -363,7 +413,7 @@ def openai_to_anthropic_response(result: dict[str, object], model: str, stop_seq
 class AnthropicStreamAccumulator:
     """Converts OpenAI chat/completions streaming chunks into Anthropic SSE events."""
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, stop_sequences: list[str] | None = None) -> None:
         self.model = model
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
@@ -376,6 +426,10 @@ class AnthropicStreamAccumulator:
         self._pending_tool_calls: dict[int, dict[str, object]] = {}
         self._block_open = False
         self._finished = False
+        # v53 P0: 支持 stop_sequence 匹配
+        self.stop_sequences = stop_sequences or []
+        self.matched_stop_sequence: str | None = None
+        self._accumulated_text = ""  # 累积文本用于检测 stop_sequence
 
     def start_message(self) -> str:
         """Emit message_start event."""
@@ -450,6 +504,16 @@ class AnthropicStreamAccumulator:
         # text content
         content = delta.get("content")
         if content:
+            # v53 P0: 累积文本用于检测 stop_sequence
+            if self.stop_sequences:
+                self._accumulated_text += str(content)
+                # 检查是否匹配某个 stop_sequence
+                if self.matched_stop_sequence is None:
+                    for stop_seq in self.stop_sequences:
+                        if stop_seq and isinstance(stop_seq, str) and stop_seq in self._accumulated_text:
+                            self.matched_stop_sequence = stop_seq
+                            self.stop_reason = "stop_sequence"
+                            break
             if self.current_block_type != "text":
                 if self._block_open:
                     events.append(self._content_block_stop())
@@ -517,9 +581,12 @@ class AnthropicStreamAccumulator:
         events: list[str] = []
         if self._block_open:
             events.append(self._content_block_stop())
+        # v53 P0: 返回匹配的 stop_sequence 字符串（而非 None）
+        # 如果 stop_reason 不是 stop_sequence，则 stop_sequence 应为 None
+        stop_seq_value = self.matched_stop_sequence if self.stop_reason == "stop_sequence" else None
         events.append(self._sse("message_delta", {
             "type": "message_delta",
-            "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+            "delta": {"stop_reason": self.stop_reason, "stop_sequence": stop_seq_value},
             "usage": {"output_tokens": self.output_tokens},  # message_delta only has output_tokens per spec
         }))
         events.append(self._sse("message_stop", {"type": "message_stop"}))

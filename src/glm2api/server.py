@@ -1239,7 +1239,11 @@ class GLM2APIServer:
                 3. 主线程周期性发 ping 心跳（2s 间隔，与 Responses v2 一致）
                 """
                 openai_payload["stream"] = True
-                accumulator = AnthropicStreamAccumulator(model=model)
+                # v53 P0: 传入 stop_sequences 给流式 accumulator，支持匹配 stop_sequence 字符串
+                stream_stop_seqs = payload.get("stop_sequences") if isinstance(payload, dict) else None
+                if isinstance(stream_stop_seqs, str):
+                    stream_stop_seqs = [stream_stop_seqs]
+                accumulator = AnthropicStreamAccumulator(model=model, stop_sequences=stream_stop_seqs if isinstance(stream_stop_seqs, list) else None)
 
                 self.send_response(HTTPStatus.OK)
                 self._send_common_headers()
@@ -2177,9 +2181,12 @@ class GLM2APIServer:
                 # 2. 覆盖 x-render-origin-server（Render 平台自动添加，暴露 Python 版本）
                 #    官方 OpenAI 不返回此 header，我们覆盖为空值或 openai-api
                 self.send_header("x-render-origin-server", "openai-api")
-                # 3. 添加 X-Request-ID（官方 OpenAI 每个响应都有，用于请求追踪）
+                # 3. 添加 X-Request-ID（官方 OpenAI/Anthropic 每个响应都有，用于请求追踪）
                 #    格式：req_<32 hex>，与官方一致
-                self.send_header("X-Request-ID", f"req_{uuid.uuid4().hex[:24]}")
+                request_id = f"req_{uuid.uuid4().hex[:24]}"
+                self.send_header("X-Request-ID", request_id)
+                # v53 P2: 添加 request-id header（官方 Anthropic API 同时有 X-Request-ID 和 request-id）
+                self.send_header("request-id", request_id)
                 # 4. 添加 CF-Ray（官方 OpenAI 通过 cloudflare 返回此 header，模拟真实 CDN）
                 self.send_header("CF-Ray", f"{uuid.uuid4().hex[:16]}-LAX")
                 # v35 修复：API 端点（/v1/*）完全不发 CORS header（与官方 OpenAI 一致）
@@ -2198,6 +2205,15 @@ class GLM2APIServer:
                 else:
                     # API 端点：模拟官方 cloudflare 的 Access-Control-Expose-Headers
                     self.send_header("Access-Control-Expose-Headers", "CF-Ray")
+                    # v53 P2: Anthropic 端点添加 ratelimit header（官方 API 有这些）
+                    # 设大值表示未限流（我们用自己的 _RateLimiter，不依赖这些 header）
+                    if path == f"{config.api_prefix}/messages" or path == f"{config.api_prefix}/messages/count_tokens":
+                        self.send_header("anthropic-ratelimit-requests-limit", "1000")
+                        self.send_header("anthropic-ratelimit-requests-remaining", "999")
+                        self.send_header("anthropic-ratelimit-requests-reset", "2025-01-01T00:00:00Z")
+                        self.send_header("anthropic-ratelimit-tokens-limit", "1000000")
+                        self.send_header("anthropic-ratelimit-tokens-remaining", "999999")
+                        self.send_header("anthropic-ratelimit-tokens-reset", "2025-01-01T00:00:00Z")
 
             def _safe_write_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
                 try:
