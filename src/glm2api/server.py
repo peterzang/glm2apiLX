@@ -159,6 +159,90 @@ def _apply_json_response_format_stripping(result: dict, payload: dict) -> dict:
     return result
 
 
+def _safe_error_message(exc: Exception, default: str = "Internal server error") -> str:
+    """v52 P1: 生成安全的对外错误消息，避免泄漏内部实现细节。
+
+    - UpstreamAPIError / ValueError：业务/参数错误，返回简化消息（客户端需要知道）
+    - 其他 Exception：返回通用消息，str(exc) 只记日志
+
+    安全过滤：移除可能包含的文件路径、Python 内部信息、stack trace 片段。
+    """
+    # 业务错误（上游 GLM 返回的错误）— 客户端需要知道状态码和简短消息
+    if isinstance(exc, UpstreamAPIError):
+        # exc.message 已经过 _build_error_message 格式化，相对安全
+        # 但仍要截断防止过长
+        msg = str(exc.message) if hasattr(exc, 'message') else str(exc)
+        return msg[:500] if len(msg) > 500 else msg
+    # 参数错误 — 客户端需要知道哪个参数错了
+    if isinstance(exc, ValueError):
+        msg = str(exc)
+        # 过滤掉可能的文件路径（/home/... /app/... 等）
+        import re
+        msg = re.sub(r'/[^\s]+\.(py|json|txt|env)\S*', '<file>', msg)
+        return msg[:500] if len(msg) > 500 else msg
+    # 其他异常（KeyError/TypeError/AttributeError 等）— 屏蔽，返回通用消息
+    return default
+
+
+class _RateLimiter:
+    """v52 P2: 简单的滑动窗口 rate limiter（per-key 限流）。
+
+    - 默认 60 req/min，可通过环境变量 API_RATE_LIMIT_PER_MINUTE 配置（0=关闭）
+    - 线程安全，用 threading.Lock 保护
+    - 内存效率：每个 key 只保留最近 60s 的请求时间戳列表
+    """
+    _instance: _RateLimiter | None = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # key_hash -> list of timestamps
+        self._windows: dict[str, list[float]] = {}
+        try:
+            self._limit = int(os.environ.get("API_RATE_LIMIT_PER_MINUTE", "60"))
+        except (ValueError, TypeError):
+            self._limit = 60
+        self._window_seconds = 60.0  # 1 分钟窗口
+
+    @classmethod
+    def get_instance(cls) -> _RateLimiter:
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = _RateLimiter()
+        return cls._instance
+
+    def check(self, key: str) -> tuple[bool, int]:
+        """检查 key 是否超限。返回 (allowed, retry_after_seconds)。
+
+        allowed=True 时 retry_after=0
+        allowed=False 时 retry_after=距最早请求过期的时间（秒）
+        """
+        if self._limit <= 0:
+            return True, 0  # 限流关闭
+
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
+        now = time.time()
+        cutoff = now - self._window_seconds
+
+        with self._lock:
+            # 清理过期时间戳
+            window = self._windows.get(key_hash, [])
+            # 移除超过窗口的时间戳
+            window = [ts for ts in window if ts > cutoff]
+            self._windows[key_hash] = window
+
+            if len(window) >= self._limit:
+                # 超限，计算最早请求何时过期
+                oldest = window[0] if window else now
+                retry_after = int(oldest + self._window_seconds - now) + 1
+                return False, max(1, retry_after)
+
+            # 未超限，记录当前请求
+            window.append(now)
+            return True, 0
+
+
 # v35: WAF bypass — 递归还原请求体中的 ˋ (U+02CB) → ` (U+0060)
 _BACKTICK_SAFE_CHAR = '\u02cb'  # ˋ MODIFIER LETTER GRAVE ACCENT
 _BACKTICK_REAL_CHAR = '\x60'    # ` GRAVE ACCENT
@@ -319,7 +403,8 @@ class GLM2APIServer:
                 except Exception as exc:
                     logger.error("HEAD 请求处理失败 path=%s error=%s\n%s", self.path, exc, traceback.format_exc())
                     try:
-                        self._safe_write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": str(exc), "type": "server_error"}})
+                        # v52 P1: 不泄漏 str(exc)，返回通用消息
+                        self._safe_write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": {"message": "Internal server error", "type": "server_error"}})
                     except Exception:
                         pass
 
@@ -461,6 +546,25 @@ class GLM2APIServer:
                         )
                         return
 
+                    # v52 P2: per-key rate limiting（防 DoS，默认 60 req/min）
+                    # 用认证时记录的 _admin_api_key 作为限流 key
+                    rate_key = self._admin_api_key or self.client_address[0]
+                    rate_limiter = _RateLimiter.get_instance()
+                    allowed, retry_after = rate_limiter.check(rate_key)
+                    if not allowed:
+                        logger.warning("API 限流触发 key=%s... retry_after=%ss", rate_key[:8], retry_after)
+                        self._write_json_with_retry(
+                            HTTPStatus.TOO_MANY_REQUESTS,
+                            make_error(
+                                f"Rate limit exceeded. Please retry after {retry_after} seconds.",
+                                error_type=ERROR_SERVER,
+                                code="rate_limit_exceeded",
+                                request_id=gen_request_id(),
+                            ),
+                            retry_after=retry_after,
+                        )
+                        return
+
                     content_length = self._parse_content_length()
                     if content_length < 0:
                         self._write_json(
@@ -470,6 +574,25 @@ class GLM2APIServer:
                                 error_type=ERROR_INVALID_REQUEST,
                                 param="content_length",
                                 code="invalid_content_length",
+                                request_id=gen_request_id(),
+                            ),
+                        )
+                        return
+                    # v52 P1: 请求体大小限制（防 DoS / OOM）
+                    # 默认 10MB，可通过环境变量 MAX_BODY_SIZE_MB 配置（0=不限制）
+                    try:
+                        max_body_mb = int(os.environ.get("MAX_BODY_SIZE_MB", "10"))
+                    except (ValueError, TypeError):
+                        max_body_mb = 10
+                    if max_body_mb > 0 and content_length > max_body_mb * 1024 * 1024:
+                        logger.warning("请求体过大 path=%s size=%s limit=%sMB", self.path, content_length, max_body_mb)
+                        self._write_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            make_error(
+                                f"Request body too large (max {max_body_mb}MB)",
+                                error_type=ERROR_INVALID_REQUEST,
+                                param="content_length",
+                                code="request_too_large",
                                 request_id=gen_request_id(),
                             ),
                         )
@@ -911,7 +1034,7 @@ class GLM2APIServer:
                     self._write_json(
                         status,
                         make_error(
-                            str(exc),
+                            _safe_error_message(exc, "Upstream service error"),
                             error_type=ERROR_UPSTREAM,
                             code="upstream_error",
                             request_id=gen_request_id(),
@@ -926,7 +1049,7 @@ class GLM2APIServer:
                         self._write_json_with_retry(
                             HTTPStatus.SERVICE_UNAVAILABLE,
                             make_error(
-                                f"All accounts unavailable: {exc}",
+                                "All accounts unavailable. Please retry later.",
                                 error_type=ERROR_SERVER,
                                 code="no_available_account",
                                 request_id=gen_request_id(),
@@ -940,7 +1063,7 @@ class GLM2APIServer:
                     self._write_json(
                         HTTPStatus.BAD_REQUEST,
                         make_error(
-                            str(exc),
+                            _safe_error_message(exc, "Invalid request parameter"),
                             error_type=ERROR_INVALID_REQUEST,
                             code="invalid_request",
                             request_id=gen_request_id(),
@@ -959,7 +1082,7 @@ class GLM2APIServer:
                             self._write_json_with_retry(
                                 HTTPStatus.SERVICE_UNAVAILABLE,
                                 make_error(
-                                    f"All accounts unavailable: {exc}",
+                                    "All accounts unavailable. Please retry later.",
                                     error_type=ERROR_SERVER,
                                     code="no_available_account",
                                     request_id=gen_request_id(),
@@ -970,12 +1093,13 @@ class GLM2APIServer:
                             pass
                     else:
                         logger.error("处理请求失败 error=%s\n%s", exc, traceback.format_exc())
+                        # v52 P1: 不泄漏 str(exc) 和 Python 类名，返回通用消息
                         self._safe_write_json(
                             HTTPStatus.BAD_GATEWAY,
                             make_error(
-                                f"Upstream error: {exc}",
+                                "Upstream service error. Please retry later.",
                                 error_type=ERROR_UPSTREAM,
-                                code=exc.__class__.__name__.lower(),
+                                code="upstream_error",
                                 request_id=gen_request_id(),
                             ),
                         )
@@ -1494,7 +1618,8 @@ class GLM2APIServer:
                                 sent_done = True
                 except UpstreamAPIError as exc:
                     logger.warning("流式请求中途收到上游错误 status=%s error=%s", exc.status_code, exc)
-                    self._write_sse_error(str(exc), "upstream_error")
+                    # v52 P1: 不泄漏 str(exc)，返回安全消息
+                    self._write_sse_error(_safe_error_message(exc, "Upstream service error"), "upstream_error")
                     sent_done = True  # v54: 防止 finally 重复发 [DONE]
                 except _CLIENT_DISCONNECTED as exc:
                     logger.warning("客户端在流式响应过程中断开 model=%s error=%s", model, exc)
@@ -1502,7 +1627,8 @@ class GLM2APIServer:
                     return
                 except Exception as exc:
                     logger.error("流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
-                    self._write_sse_error(str(exc), exc.__class__.__name__)
+                    # v52 P1: 不泄漏 str(exc) 和 Python 类名，返回通用消息
+                    self._write_sse_error("Internal server error. Please retry.", "internal_error")
                     sent_done = True
                 finally:
                     if not sent_done and not is_json_mode:
