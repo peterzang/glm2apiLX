@@ -403,7 +403,8 @@ def test_convert_messages_respects_tool_choice_none_and_specific():
         tool_choice={"type": "function", "function": {"name": "get_weather"}},
     )
     specific_prompt = specific_converted[0]["content"][0]["text"]
-    assert "You must call exactly `get_weather` before giving a final answer." in specific_prompt
+    # v58: 改为正面引导措辞
+    assert "Call `get_weather` before giving a final answer." in specific_prompt
 
 
 def test_convert_messages_filters_native_url_tools_and_reinforces_tool_awareness():

@@ -190,22 +190,21 @@ def build_tool_call_instructions(
         lines.extend(
             [
                 "Tool choice policy: none.",
-                "Do not emit any executable tool markup. Answer with normal text only.",
+                "Answer with normal text only (no tool markup needed this turn).",
             ]
         )
     elif mode == "required":
         lines.extend(
             [
                 "Tool choice policy: required.",
-                "You must call at least one tool before giving a final answer.",
+                "Call at least one tool before giving a final answer.",
             ]
         )
     elif mode == "specific" and specific_name:
         lines.extend(
             [
                 "Tool choice policy: specific function.",
-                f"You must call exactly `{specific_name}` before giving a final answer.",
-                f"Do not call any tool other than `{specific_name}`.",
+                f"Call `{specific_name}` before giving a final answer.",
             ]
         )
     return "\n".join(lines)
