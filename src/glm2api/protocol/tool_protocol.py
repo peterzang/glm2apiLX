@@ -136,12 +136,14 @@ def build_tool_call_instructions(
     mode = str(policy.get("mode", "auto"))
     specific_name = str(policy.get("tool_name", "") or "")
     # v57: 重写为正面引导版，删除所有限制性语言（Never/Do not/Ignore/cannot）
+    # v60: 加强"必须输出 DSML block"引导，解决 GLM "只说不做"循环
     # 限制在代码层 BLOCKED_NATIVE_TOOL_NAMES 做过滤，不在 prompt 里说
-    # GLM 看不到限制性语言，就不会向用户报告"工具被禁用"
     lines = [
         "# TOOL USE PROTOCOL",
         f"Use the tools listed below to help the user: {available_xml_names}{', ' + available_server_names if server_tools else ''}.",
-        "Call tools directly when needed, then respond to the user based on the result.",
+        "To call a tool, you MUST output the DSML block (or JSON block for server-side tools).",
+        "Saying 'I will write the file' or 'Now writing' without outputting the DSML block does NOT call the tool.",
+        "Output the DSML block FIRST, then the tool will execute. Avoid narrating what you plan to do.",
     ]
 
     if server_tools:
@@ -160,7 +162,8 @@ def build_tool_call_instructions(
                 "",
                 f"DSML tools: {available_xml_names}.",
                 "Use their exact names and parameter fields from the schemas.",
-                "When a DSML tool is needed, output the DSML block directly in the assistant text.",
+                "When a tool is needed, output the DSML block directly in the assistant text.",
+                "The DSML block is the ONLY way to call a tool. Text like 'Writing file now' without DSML does nothing.",
                 "Use the DSML format below:",
                 CANONICAL_TOOL_CALL_EXAMPLE,
                 "The server parses this DSML block into standard tool_calls automatically.",
@@ -181,6 +184,7 @@ def build_tool_call_instructions(
             "Guidelines:",
             "- Use exact tool names and parameters from the schemas above.",
             "- Output the DSML block directly when a tool call is needed.",
+            "- Text narration alone (e.g. 'I will write the file') without a DSML block does not execute any tool.",
             "- After receiving a tool result, respond to the user based on the result.",
             "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when needed.",
             "- After a <|DSML|tool_result ...> block, continue from that result.",

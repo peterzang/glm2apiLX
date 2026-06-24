@@ -444,7 +444,8 @@ def test_convert_messages_filters_native_url_tools_and_reinforces_tool_awareness
     assert "Never output tool-call display" not in prompt
     # 应有正面引导
     assert "Use the tools listed below" in prompt
-    assert "Call tools directly" in prompt
+    # v60: 改为强调必须输出 DSML block
+    assert "MUST output the DSML block" in prompt or "must output" in prompt.lower()
 
 
 def test_convert_messages_drops_blocked_tool_call_history():

@@ -66,7 +66,8 @@ def test_prompt_has_positive_guidance():
         server_side_tool_names=set(),
     )
     assert "Use the tools listed below" in prompt
-    assert "Call tools directly" in prompt
+    # v60: 改为强调必须输出 DSML block
+    assert "MUST output the DSML block" in prompt or "must output" in prompt.lower()
 
 
 def test_prompt_lists_available_tools():

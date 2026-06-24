@@ -1455,9 +1455,26 @@ class GLMEventAccumulator:
 
         codex 长任务后期 GLM 可能生成 "All files created successfully" 这类总结，
         不是描述性文本，不应该被检测拦截。
+
+        v60: 检测"只说不做"循环 — 如果文本包含 "writing"/"now"/"file" 但也包含
+        "stop calling tools"/"directly write"/"now writing" 等循环短语，不判为总结，
+        让描述性检测拦截它返回 error 让客户端重试。
         """
         text = (self._cached_full_text or "").strip().lower()
         if not text or len(text) < 10:
+            return False
+        # v60: 检测"只说不做"循环短语 — 这些是 GLM 陷入循环的标志
+        loop_phrases = [
+            "now writing", "writing the", "writing the file",
+            "stop calling tools", "stop searching", "directly write",
+            "directly now", "i'll stop", "i will stop",
+            "creating the file now", "write the file now",
+            "现在直接", "直接编写", "直接写", "停止调用工具",
+            "现在使用 write", "现在我将直接",
+        ]
+        loop_count = sum(1 for phrase in loop_phrases if phrase in text)
+        if loop_count >= 2:
+            # 多个循环短语 = GLM 陷入"只说不做"循环，不判为总结
             return False
         # 完成类关键词
         completion_keywords = [
