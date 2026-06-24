@@ -1440,6 +1440,7 @@ class GLMWebClient:
         # 熔断触发条件：连续 3 次请求/刷新失败 → 熔断 60 秒
         now = time.time()
         any_account_usable = False
+        usable_count = 0
         for idx in range(account_count):
             acc = self.auth._accounts[idx]
             # 熔断期内 → 跳过
@@ -1447,7 +1448,14 @@ class GLMWebClient:
                 continue
             # 未熔断 → 可用（即使 cached_token 过期，也可以尝试刷新）
             any_account_usable = True
-            break
+            usable_count += 1
+
+        # v56 P1: 可用账号低水位告警（< 2 时 warning）
+        if 0 < usable_count < 2:
+            self.logger.warning(
+                "账号池低水位 request=%s usable=%s/%s（建议检查账号状态）",
+                request_name, usable_count, account_count,
+            )
 
         if not any_account_usable:
             # 所有账号都在熔断期 → 快速失败

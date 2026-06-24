@@ -1305,8 +1305,30 @@ class GLM2APIServer:
                     logger.warning("客户端在 Anthropic 流式响应过程中断开 model=%s error=%s", model, exc)
                     close_upstream()
                     return
+                except QueueTimeoutError as exc:
+                    # v56 P0: 等账号超时（60s），发 SSE error + message_stop 让客户端重试
+                    logger.warning("等账号超时 model=%s error=%s", model, exc)
+                    try:
+                        err_event = (
+                            'event: error\n'
+                            f'data: {{"type":"error","error":{{"type":"overloaded_error","message":"Service temporarily unavailable. Please retry."}}}}\n\n'
+                        )
+                        self.wfile.write(err_event.encode("utf-8"))
+                        self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
                 except Exception as exc:
                     logger.error("Anthropic 流式请求失败 model=%s error=%s\n%s", model, exc, traceback.format_exc())
+                    # v56: 发 SSE error event 让客户端知道出错了
+                    try:
+                        err_event = (
+                            'event: error\n'
+                            f'data: {{"type":"error","error":{{"type":"api_error","message":"Internal server error. Please retry."}}}}\n\n'
+                        )
+                        self.wfile.write(err_event.encode("utf-8"))
+                        self.wfile.flush()
+                    except _CLIENT_DISCONNECTED:
+                        pass
 
                 # Ensure message_stop is always sent (idempotent via _finished flag)
                 if accumulator.started:
