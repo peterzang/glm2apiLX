@@ -1210,7 +1210,7 @@ class GLM2APIServer:
 
                 # v49: model 校验已在上层 chat_like_endpoints 统一处理
                 if payload.get("stream"):
-                    self._stream_anthropic(openai_payload, model)
+                    self._stream_anthropic(openai_payload, model, payload)
                     return
 
                 result, _ = glm_client.chat_completion(openai_payload)
@@ -1223,7 +1223,7 @@ class GLM2APIServer:
                 self._discover_dynamic_model(result)
                 self._write_json(HTTPStatus.OK, response)
 
-            def _stream_anthropic(self, openai_payload: dict[str, object], model: str) -> None:
+            def _stream_anthropic(self, openai_payload: dict[str, object], model: str, payload: dict[str, object] | None = None) -> None:
                 """v34 修复：Anthropic 流式响应完整重写，解决长任务断开问题。
 
                 之前的问题（v36-v40 审计未发现的根因）：
