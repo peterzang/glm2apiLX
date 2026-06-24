@@ -1138,6 +1138,45 @@ class GLMEventAccumulator:
         # "successfully"/"file" 等完成类关键词，不触发检测。
         # v54 H3: 阈值从 30 提到 200 — 30 字符太低，误杀 "I'll explain..." / "Sure, the answer is..."
         # 等正常短回复。200 字符确保只对明显的"描述性废话"触发。
+        # v61 P0: 新增"工具名提及但无 DSML"检测 — 解决 GLM "只说不做"循环
+        # 当 GLM 提及了工具名 + 动作动词但没有输出 DSML block 时，判定为"只说不做"
+        # 返回 error 让客户端重试，打破循环
+        if (
+            not all_tool_calls
+            and self.allowed_tool_names is not None
+            and len(self.allowed_tool_names) > 0
+            and len(self._cached_full_text) > 30
+            and self._is_tool_mentioned_but_not_called()
+        ):
+            if self.logger:
+                self.logger.warning(
+                    "检测到 GLM 提及工具但未输出 DSML block（只说不做循环）text_len=%d model=%s text=%s",
+                    len(self._cached_full_text),
+                    self.model,
+                    (self._cached_full_text or "")[:200],
+                )
+            try:
+                from ..admin.store import get_store as _get_admin_store
+                _get_admin_store().record_repetition_event(
+                    model=str(self.model),
+                    path="tool_mentioned_no_dsml",
+                )
+            except Exception:
+                pass
+            error_chunk = self._chunk_json({
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+                "error": {
+                    "message": "Model mentioned a tool but did not output the DSML block. Please retry.",
+                    "type": "upstream_error",
+                    "code": "tool_mentioned_no_dsml",
+                },
+            })
+            return [error_chunk, "data: [DONE]\n\n"]
+
         DESCRIPTIVE_MIN_LEN = 200
         if (
             not all_tool_calls
@@ -1449,6 +1488,72 @@ class GLMEventAccumulator:
             )
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
+
+    def _is_tool_mentioned_but_not_called(self) -> bool:
+        """v61 P0: 检测 GLM "只说不做"循环 — 提及工具/动作但没输出 DSML block。
+
+        用户现象：GLM 反复说"Writing the game file now"但从不输出 DSML block。
+        检测模式（任一匹配即触发）：
+        1. 英文：tool name + "now"/"writing"/"creating" 等即时动作词
+        2. 中文："现在" + "创建"/"编写"/"写入" + "文件"
+        3. 英文循环：多次出现 "writing"/"now"/"research"/"file" 组合
+
+        不触发条件：
+        - 有 DSML block（<|DSML| 或 <ml_tool）→ GLM 在尝试调用
+        - 有代码块（```）→ GLM 在展示代码
+        - 纯工具描述（"is used for"）→ 不是"只说不做"
+        """
+        text = (self._cached_full_text or "").strip()
+        if not text or len(text) < 8:
+            return False
+        lower = text.lower()
+
+        # 必须有工具提供才检测
+        if not self.allowed_tool_names:
+            return False
+
+        # 有 DSML block → 不是"只说不做"
+        if "<|dsml|" in lower or "<ml_tool" in lower:
+            return False
+
+        # 有代码块 → 在展示代码，不是"只说不做"
+        if "```" in text[:500]:
+            return False
+
+        # 纯工具描述（第三人称）→ 不是"只说不做"
+        if "is used for" in lower or "is used to" in lower or "takes a" in lower:
+            return False
+
+        # 模式 1: 中文"现在" + 动作 + "文件"
+        if "现在" in text and any(v in text for v in ("创建", "编写", "写入", "制作", "生成")):
+            return True
+
+        # 模式 2: 英文 "now" + "writing"/"creating"/"file" 组合
+        now_patterns = [
+            ("now" in lower and "writing" in lower),
+            ("now" in lower and "creating" in lower),
+            ("now" in lower and "file" in lower and "write" in lower),
+            ("writing the" in lower and "file" in lower),
+            ("writing the" in lower and "game" in lower),
+            ("i have" in lower and "research" in lower and "writing" in lower),
+            ("i have" in lower and "research" in lower and "now" in lower),
+        ]
+        if any(now_patterns):
+            return True
+
+        # 模式 3: 提及工具名 + "now"/"directly"/"will write"
+        if self.allowed_tool_names:
+            tool_mentioned = any(
+                tn and tn.lower() in lower for tn in self.allowed_tool_names
+            )
+            if tool_mentioned:
+                action_indicators = ["now", "directly", "will write", "will create",
+                                     "i'll write", "i'll create", "let me write",
+                                     "let me create", "going to write", "going to create"]
+                if any(ind in lower for ind in action_indicators):
+                    return True
+
+        return False
 
     def _is_completion_summary(self) -> bool:
         """P17 修复：检测是否是多轮对话后期的正常总结性文本。

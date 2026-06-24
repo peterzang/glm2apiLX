@@ -144,6 +144,12 @@ def build_tool_call_instructions(
         "To call a tool, you MUST output the DSML block (or JSON block for server-side tools).",
         "Saying 'I will write the file' or 'Now writing' without outputting the DSML block does NOT call the tool.",
         "Output the DSML block FIRST, then the tool will execute. Avoid narrating what you plan to do.",
+        "",
+        "EXAMPLE - BAD (text only, no tool call):",
+        "  'Writing the game file now with Write.'  <- This does NOTHING. No tool is called.",
+        "EXAMPLE - GOOD (DSML block = actual tool call):",
+        "  <|DSML|tool_calls><|DSML|invoke name=\"Write\"><|DSML|parameter name=\"path\"><![CDATA[game.html]]></|DSML|parameter><|DSML|parameter name=\"content\"><![CDATA[...]]></|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+        "The GOOD example calls the tool. The BAD example does nothing. Always use the GOOD pattern.",
     ]
 
     if server_tools:
