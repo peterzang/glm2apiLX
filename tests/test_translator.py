@@ -58,14 +58,15 @@ def test_convert_messages_injects_xml_tool_prompt_and_history():
     assert '<|DSML|tool_result call_id="call_1"' not in prompt
     assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
-    assert "Use the DSML format below exactly." in prompt
-    assert "The server will parse this DSML block back into standard OpenAI tool_calls." in prompt
+    # v57: 改为正面引导，文本变了
+    assert "Use the DSML format below:" in prompt
+    assert "The server parses this DSML block into standard tool_calls automatically." in prompt
     assert "<|DSML|parameter name=\"actual_parameter_name\"><![CDATA[value]]></|DSML|parameter>" in prompt
-    assert "Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke." in prompt
-    assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
-    assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
+    assert "Arguments: <|DSML|parameter name=\"...\"> children of the invoke." in prompt
+    assert "Parameter names are case-sensitive (match the schema exactly)." in prompt
     assert "# BLOCKED TOOLS" not in prompt
-    assert "Ignore any tool names that are not listed below" in prompt
+    # v57: 删除了限制性语言，不应出现
+    assert "Ignore any tool names" not in prompt
 
 
 def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
@@ -434,12 +435,15 @@ def test_convert_messages_filters_native_url_tools_and_reinforces_tool_awareness
     assert "Tool: open_url" not in prompt
     assert "Server-side native tools" not in prompt
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
-    assert "You do not have hidden browser, web, or URL-opening tools." in prompt
-    # v56b: 提示文本增强，现在包含 'open' 和 'Never call or mention'
-    assert "Never call or mention native tools such as `open`" in prompt
-    assert "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`." in prompt
-    assert "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners." in prompt
-    assert "Never output tool-call display text such as `⚙ tool_name [...]`" in prompt
+    # v57: 删除所有限制性语言，改为正面引导
+    assert "You do not have hidden browser" not in prompt
+    assert "Never call or mention" not in prompt
+    assert "Do not output hidden reasoning" not in prompt
+    assert "Do not narrate" not in prompt
+    assert "Never output tool-call display" not in prompt
+    # 应有正面引导
+    assert "Use the tools listed below" in prompt
+    assert "Call tools directly" in prompt
 
 
 def test_convert_messages_drops_blocked_tool_call_history():

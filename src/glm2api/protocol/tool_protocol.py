@@ -135,28 +135,22 @@ def build_tool_call_instructions(
     policy = tool_choice_policy or {"mode": "auto", "tool_name": None}
     mode = str(policy.get("mode", "auto"))
     specific_name = str(policy.get("tool_name", "") or "")
+    # v57: 重写为正面引导版，删除所有限制性语言（Never/Do not/Ignore/cannot）
+    # 限制在代码层 BLOCKED_NATIVE_TOOL_NAMES 做过滤，不在 prompt 里说
+    # GLM 看不到限制性语言，就不会向用户报告"工具被禁用"
     lines = [
         "# TOOL USE PROTOCOL",
-        "The following tool schemas are the only executable tool definitions for this turn.",
-        f"Your available tools are: {available_xml_names}{', ' + available_server_names if server_tools else ''}.",
-        "You MUST ONLY call tools from this list. Any other tool name is invalid and will fail.",
-        "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
-        "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
-        "Never call or mention native tools such as `open`, `open_url`, `open_ul`, `web.search`, `web.run`, `web.open`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
-        "If a task seems to require a tool not in your available list, use the closest available tool instead (e.g., use Read for file reading, Write for file writing, Bash for shell commands).",
-        "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
-        "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
+        f"Use the tools listed below to help the user: {available_xml_names}{', ' + available_server_names if server_tools else ''}.",
+        "Call tools directly when needed, then respond to the user based on the result.",
     ]
 
     if server_tools:
         lines.extend(
             [
                 "",
-                f"Server-side native tools (executed by backend automatically): {available_server_names}.",
-                "When you need to call a server-side native tool, output a single structured JSON block with type 'tool_calls' in the assistant content.",
-                'Format: {"type":"tool_calls","tool_calls":{"id":"call_<random_hex>","name":"TOOL_NAME","arguments":"<JSON_STRING>"}}',
-                "The arguments field must be a JSON string (not a raw object). The server will intercept this block, execute the tool, and inject the result back into the stream as a tool message.",
-                "Do not wrap server-side tool calls in DSML. Do not mix prose and the tool_calls JSON block in the same response.",
+                f"Server-side tools: {available_server_names}.",
+                "To call a server-side tool, output a JSON block: {\"type\":\"tool_calls\",\"tool_calls\":{\"id\":\"call_<random_hex>\",\"name\":\"TOOL_NAME\",\"arguments\":\"<JSON_STRING>\"}}",
+                "The server executes the tool and returns the result as a tool message.",
             ]
         )
 
@@ -164,37 +158,32 @@ def build_tool_call_instructions(
         lines.extend(
             [
                 "",
-                f"DSML tools (parsed by this server): {available_xml_names}.",
-                "Only these DSML tools are available. Use their exact names and exact parameter fields from the schemas.",
-                "If a DSML tool is needed, output one executable DSML block only. Do not add prose, apologies, analysis, or progress text in the same assistant answer.",
-                "Executable DSML must appear in the final assistant text channel, not in Thinking/reasoning. Do not hide tool calls inside reasoning.",
-                "Use the DSML format below exactly.",
+                f"DSML tools: {available_xml_names}.",
+                "Use their exact names and parameter fields from the schemas.",
+                "When a DSML tool is needed, output the DSML block directly in the assistant text.",
+                "Use the DSML format below:",
                 CANONICAL_TOOL_CALL_EXAMPLE,
-                "The server will parse this DSML block back into standard OpenAI tool_calls.",
-                "Parameter rules:",
-                "- The root executable block must be <|DSML|tool_calls> and each call must be a <|DSML|invoke name=\"...\"> child.",
-                "- Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke.",
-                "- Parameter names are case-sensitive and must exactly match the schema. For example, use `filePath` only when the schema says `filePath`; never change it to `filepath`, `file_path`, or `FilePath`.",
-                "- Encode nested objects with nested <|DSML|parameter name=\"...\"> tags.",
-                "- Use repeated <item> tags to represent arrays.",
-                "- JSON literals are allowed as parameter values when the schema expects an object, array, number, boolean, or null.",
-                "- Prefer <![CDATA[...]]> for arbitrary strings.",
+                "The server parses this DSML block into standard tool_calls automatically.",
+                "Parameter format:",
+                "- Root block: <|DSML|tool_calls>, each call: <|DSML|invoke name=\"...\">",
+                "- Arguments: <|DSML|parameter name=\"...\"> children of the invoke.",
+                "- Parameter names are case-sensitive (match the schema exactly).",
+                "- Nested objects: nested <|DSML|parameter> tags.",
+                "- Arrays: repeated <item> tags.",
+                "- JSON literals allowed for object/array/number/boolean/null values.",
+                "- Use <![CDATA[...]]> for arbitrary strings.",
             ]
         )
 
     lines.extend(
         [
             "",
-            "Rules:",
-            "- Do not invent tool names outside the declared list.",
-            "- If a URL, browsing, or search action is needed, use only an explicitly listed client tool. If none is listed, explain that no such tool is available. Never use bare tool names `search` or `find` unless they are explicitly listed above.",
-            "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
-            "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable DSML block.",
-            "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
-            "- For DSML tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-DSML tool syntax.",
-            "- Do not mix normal explanation text with executable DSML.",
-            "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when you truly need multiple calls in one turn.",
-            "- After a <|DSML|tool_result ...> block, continue from that result and call another tool only when necessary.",
+            "Guidelines:",
+            "- Use exact tool names and parameters from the schemas above.",
+            "- Output the DSML block directly when a tool call is needed.",
+            "- After receiving a tool result, respond to the user based on the result.",
+            "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when needed.",
+            "- After a <|DSML|tool_result ...> block, continue from that result.",
         ]
     )
     if mode == "none":
