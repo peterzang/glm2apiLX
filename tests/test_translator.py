@@ -435,7 +435,8 @@ def test_convert_messages_filters_native_url_tools_and_reinforces_tool_awareness
     assert "Server-side native tools" not in prompt
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
     assert "You do not have hidden browser, web, or URL-opening tools." in prompt
-    assert "Never call native tools such as `open_url`" in prompt
+    # v56b: 提示文本增强，现在包含 'open' 和 'Never call or mention'
+    assert "Never call or mention native tools such as `open`" in prompt
     assert "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`." in prompt
     assert "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners." in prompt
     assert "Never output tool-call display text such as `⚙ tool_name [...]`" in prompt

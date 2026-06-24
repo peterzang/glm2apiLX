@@ -138,9 +138,12 @@ def build_tool_call_instructions(
     lines = [
         "# TOOL USE PROTOCOL",
         "The following tool schemas are the only executable tool definitions for this turn.",
+        f"Your available tools are: {available_xml_names}{', ' + available_server_names if server_tools else ''}.",
+        "You MUST ONLY call tools from this list. Any other tool name is invalid and will fail.",
         "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
         "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
-        "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
+        "Never call or mention native tools such as `open`, `open_url`, `open_ul`, `web.search`, `web.run`, `web.open`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
+        "If a task seems to require a tool not in your available list, use the closest available tool instead (e.g., use Read for file reading, Write for file writing, Bash for shell commands).",
         "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
         "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
     ]
